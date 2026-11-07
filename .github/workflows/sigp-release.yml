@@ -1,0 +1,94 @@
+# sigp/centaur only. Builds what this fork changes from upstream: the api-rs
+# image and the chart. A deployment runs upstream's own images for every other
+# component, at the upstream commit this fork is based on (tag sha-<commit>).
+# Upstream's publish-images.yml and release-chart.yml need Paradigm's Depot
+# builders and its ghcr.io namespace, so they can't run here.
+name: sigp release
+
+"on":
+  push:
+    branches: [main, "sigp/**"]
+    paths:
+      - .github/workflows/sigp-release.yml
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - services/api-rs/**
+      - contrib/chart/**
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sigp-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  NAMESPACE: sigp/centaur
+
+jobs:
+  api-rs:
+    if: github.repository == 'sigp/centaur'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tagged with the full commit SHA, which is how a deployment pins it.
+      - name: Build and push centaur-api-rs
+        run: |
+          set -euo pipefail
+          image="$REGISTRY/$NAMESPACE/centaur-api-rs"
+          docker buildx build . \
+            --file services/api-rs/Dockerfile \
+            --platform linux/amd64 \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --cache-from "type=registry,ref=$image:buildcache" \
+            --cache-to "type=registry,ref=$image:buildcache,mode=max" \
+            --tag "$image:$GITHUB_SHA" \
+            --push
+
+  chart:
+    if: github.repository == 'sigp/centaur'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.1.1
+
+      # Published as <upstream chart version>-sigp-<commit>: it names exactly
+      # what was built, and never collides with upstream's release of a version.
+      - name: Package and push the chart
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          helm repo add onepassword https://1password.github.io/connect-helm-charts
+          helm dependency build contrib/chart
+          helm lint contrib/chart
+          version="$(awk '$1 == "version:" { print $2; exit }' contrib/chart/Chart.yaml)-sigp-${GITHUB_SHA::7}"
+          helm package contrib/chart --version "$version" --destination "$RUNNER_TEMP"
+          printf '%s' "$GHCR_TOKEN" | helm registry login "$REGISTRY" --username "$GITHUB_ACTOR" --password-stdin
+          helm push "$RUNNER_TEMP/centaur-$version.tgz" "oci://$REGISTRY/$NAMESPACE/charts"
