@@ -30,6 +30,7 @@ updates:
       - /services/iron-proxy
       - /services/linearbot
       - /services/proxy-sync
+      - /services/mattermostbot
       - /services/sandbox
       - /services/slackbotv2
       - /services/teamsbot
@@ -121,6 +122,7 @@ updates:
       - /services/linearbot
       - /services/slackbotv2
       - /services/discordbot
+      - /services/mattermostbot
       - /services/teamsbot
       - /services/githubbot
     schedule:

@@ -1,0 +1,154 @@
+---
+title: Mattermost
+description: Configure the Mattermost chat ingress for Centaur.
+---
+
+# Mattermost
+
+Centaur's Mattermost ingress connects to Mattermost over its websocket API and
+forwards allowed channel messages to `api-rs`. It creates one Centaur principal
+per Mattermost channel, including direct-message channels (although the bot
+does not accept DMs).
+
+## Create the Mattermost bot account
+
+A Mattermost administrator must create the bot account:
+
+1. Open **System Console → Integrations → Bot Accounts**.
+2. Choose **Add Bot Account**, set the username to the value used by
+   `mattermostbot.userName` (normally `centaur`), and save it.
+3. Copy the bot token when Mattermost displays it. If it is no longer
+   available, regenerate the token and update the Kubernetes Secret.
+4. Add the bot account to every public or private channel where it should
+   operate. It must have permission to read posts and post replies.
+
+The allowlist uses Mattermost **team IDs**, not team names. As an administrator
+or with a suitable Mattermost token, list teams with the Mattermost API:
+
+```sh
+curl -sS -H "Authorization: Bearer $MATTERMOST_BOT_TOKEN" \
+  "$MATTERMOST_BASE_URL/api/v4/teams" | jq -r '.[] | [.id, .name] | @tsv'
+```
+
+Use the IDs for the teams that Centaur may serve. The bot ignores all messages
+until at least one team ID is present in the allowlist.
+
+## Configure the chart
+
+Mattermost is off by default. Add a values overlay such as:
+
+```yaml
+mattermostbot:
+  enabled: true
+  userName: centaur
+  serverUrl: https://mattermost.example.com
+  teamAllowlist: "TEAM_ID_1 TEAM_ID_2"
+  serverEgress:
+    port: 443
+    # Optional: restrict the server destination. NetworkPolicy cannot match
+    # hostnames, so use the server's stable CIDR(s).
+    cidrs:
+      - 203.0.113.10/32
+```
+
+`serverUrl` is required when `mattermostbot.enabled` is true. The default
+`serverEgress` permits TCP 443 to any destination, like the Discord ingress.
+Set `serverEgress.port` for a Mattermost server on another port. For an
+in-cluster Mattermost deployment, select its pods instead:
+
+```yaml
+mattermostbot:
+  serverEgress:
+    port: 8065
+    podSelector:
+      app.kubernetes.io/name: mattermost
+    namespace: mattermost
+```
+
+Use either destination CIDRs or an in-cluster pod selector when you need to
+restrict egress. The chart-wide NetworkPolicy already permits DNS. The
+Mattermost policy also permits the api-rs service and the configured Postgres
+state store, and admits only health probes on port 3001.
+
+## Provide secrets and deploy
+
+The bootstrap script accepts the token directly from the shell. It overwrites
+`MATTERMOST_BOT_TOKEN` on every run so rotation is explicit, and generates
+`MATTERMOSTBOT_API_KEY` once when that key is absent:
+
+```sh
+export MATTERMOST_BOT_TOKEN='paste-the-token-in-your-shell'
+CENTAUR_NAMESPACE=centaur just bootstrap-secrets
+```
+
+Do not commit the token or put it in a values file. Production deployments can
+provide these keys in the Secret named by `secretManager.existingSecretName`:
+
+- `MATTERMOST_BOT_TOKEN`
+- `MATTERMOSTBOT_API_KEY`
+- `DATABASE_URL` (the Chat SDK state store is rendered as
+  `MATTERMOSTBOT_DATABASE_URL`)
+
+For the `sigp/centaur` fork, the fork release workflow publishes the chart to
+`oci://ghcr.io/sigp/centaur/charts/centaur:<version>-sigp-<sha7>`. It publishes
+the changed images at these immutable references:
+
+- `ghcr.io/sigp/centaur/centaur-api-rs:<commit sha>`
+- `ghcr.io/sigp/centaur/centaur-console:<commit sha>`
+- `ghcr.io/sigp/centaur/centaur-mattermostbot:<commit sha>`
+
+The other components remain upstream images at the fork's base commit. Deploy a
+fork release by selecting the OCI chart version and overriding only the three
+fork-built images:
+
+```sh
+COMMIT_SHA=0123456789abcdef0123456789abcdef01234567
+CHART_VERSION=0.1.205
+helm upgrade --install centaur \
+  oci://ghcr.io/sigp/centaur/charts/centaur \
+  --version "${CHART_VERSION}-sigp-${COMMIT_SHA::7}" \
+  --namespace centaur --create-namespace \
+  -f mattermost-values.yaml \
+  --set apiRs.image.repository=ghcr.io/sigp/centaur/centaur-api-rs \
+  --set apiRs.image.tag="$COMMIT_SHA" \
+  --set console.image.repository=ghcr.io/sigp/centaur/centaur-console \
+  --set console.image.tag="$COMMIT_SHA" \
+  --set mattermostbot.image.repository=ghcr.io/sigp/centaur/centaur-mattermostbot \
+  --set mattermostbot.image.tag="$COMMIT_SHA"
+```
+
+For an upstream checkout, the local chart command below is sufficient.
+
+Then deploy the chart with the Mattermost values overlay:
+
+```sh
+helm upgrade --install centaur contrib/chart \
+  --namespace centaur --create-namespace \
+  -f contrib/chart/values.yaml \
+  -f mattermost-values.yaml
+```
+
+Check the singleton and its connection health with the commands below. The pod
+is ready only while its Mattermost websocket is connected (`/health`).
+
+```sh
+kubectl -n centaur get deployment,service,pod -l app.kubernetes.io/component=mattermostbot
+kubectl -n centaur logs -l app.kubernetes.io/component=mattermostbot --tail=50
+```
+
+The deployment has exactly one replica and uses `Recreate`. Two pods using the
+same Mattermost bot token would each receive every websocket event.
+
+## Supported surface
+
+The first Mattermost integration deliberately has a narrow surface:
+
+- Channel posts and thread replies in allowlisted teams are supported.
+- Centaur uses the channel ID (and, for a thread, the root post ID) as the
+  thread identity, so replies stay in the originating Mattermost thread.
+- Direct messages and group-message channels are denied, even if the bot is
+  added to them.
+- Slash commands are not supported.
+- Interactive buttons and callbacks are not supported; no callback URL or
+  callback secret is needed.
+- There is one bot replica by design. Do not add an HPA or a second pod.

@@ -1007,6 +1007,41 @@ discordbot:
   extraEnv: {}
   resources: {}
 
+# Mattermost chat ingress. Forwards Mattermost posts to the api-rs control plane (:8080) over a
+# persistent Mattermost websocket and renders session events back to the thread. Off by default;
+# needs a Mattermost bot account + token (MATTERMOST_BOT_TOKEN in the infra secret), serverUrl and a
+# team allowlist. Always exactly one replica (singleton websocket session).
+mattermostbot:
+  enabled: false
+  image:
+    repository: centaur-mattermostbot
+    tag: latest
+    pullPolicy: Always
+  userName: centaur
+  # Base URL of the Mattermost server (MATTERMOST_BASE_URL), e.g. https://mattermost.example.com.
+  # Required when enabled.
+  serverUrl: ""
+  # Comma/space-separated Mattermost team IDs. The bot is INERT (ignores all posts) until set;
+  # DMs and group messages are always denied.
+  teamAllowlist: ""
+  # NetworkPolicy egress to the Mattermost server (used when networkPolicy.enabled=true). With
+  # neither cidrs nor podSelector set, the bot may reach TCP `port` on any address, like discordbot.
+  serverEgress:
+    # TCP port of the Mattermost server. Defaults to HTTPS 443; set it when a proxy or in-cluster
+    # Service listens on another port (under an enforcing CNI the Service port is DNAT'd to the pod).
+    port: 443
+    # Restrict egress to these address ranges. NetworkPolicy cannot match hostnames.
+    cidrs: []
+    #   - 203.0.113.10/32
+    # Labels of the server's pods, for a Mattermost running in the cluster. Use instead of cidrs:
+    # ipBlock rules may not match pod traffic.
+    podSelector: {}
+    #   app.kubernetes.io/name: mattermost
+    # Namespace of those pods; requires podSelector. Empty means the release namespace.
+    namespace: ""
+  extraEnv: {}
+  resources: {}
+
 # Microsoft Teams chat ingress. Forwards Teams Bot Framework activities to the
 # api-rs control plane (:8080) and renders session events back to Teams. Off by
 # default; needs a Teams app registration and Bot Framework endpoint routing.

@@ -23,6 +23,10 @@ Use these as the main extension points:
 | `postgres.nodeSelector`, `postgres.affinity`, `postgres.tolerations` | Controls scheduling for the bundled PostgreSQL pod. Ensure selected nodes can mount its persistent storage. |
 | `postgres.enabled`, `externalDatabase.*` | Replaces the bundled PostgreSQL with an external server such as RDS or Cloud SQL, scopes NetworkPolicy egress to it, and selects the company-context text-search backend. See [Use an External PostgreSQL](/deploying-in-production#use-an-external-postgresql). |
 | `slackbot.extraEnv` | Slackbot HTTP, Slack, feedback, and cross-org behavior. |
+| `mattermostbot.enabled`, `mattermostbot.image.*`, `mattermostbot.userName` | Helm values enable and configure the singleton Mattermost websocket ingress. |
+| `mattermostbot.serverUrl`, `mattermostbot.teamAllowlist` | Helm values set the Mattermost base URL and comma/space-separated team IDs; both are required for useful Mattermost ingress operation. |
+| `mattermostbot.serverEgress.*` | Helm values scope Mattermost NetworkPolicy egress by TCP port, CIDRs, or an in-cluster pod selector; default is TCP 443 to any address. |
+| `mattermostbot.extraEnv` | Helm values provide optional Mattermostbot environment overrides, including `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST` and `MATTERMOSTBOT_STATE_KEY_PREFIX`. |
 | `sandbox.extraEnv` | Extra variables copied into every sandbox pod through `KUBERNETES_SANDBOX_EXTRA_ENV`. |
 | `overlays.sources` | Ordered repo-cache-backed overlay repos for tools, workflows, and skills; subdirs default to `tools`, `workflows`, and `.agents/skills`. |
 | `overlay.systemPrompt` | Small inline prompt overlay escape hatch. |
@@ -54,6 +58,8 @@ Optional required-by-mode variables:
 | `OP_CONNECT_TOKEN` | Secret or local bootstrap shell env. | Token used by iron-proxy when `ironProxy.secretSource=onepassword-connect`. |
 | `TEAMS_BOT_APP_ID`, `TEAMS_BOT_APP_PASSWORD`, `TEAMS_BOT_APP_TENANT_ID` | Local shell before `just bootstrap-secrets`; production Secret. | Required by Teamsbot when `teamsbot.enabled=true`. |
 | `TEAMSBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it when Teams credentials are present and it is omitted. | Static API key used by Teamsbot. |
+| `MATTERMOST_BOT_TOKEN` | Local shell before `just bootstrap-secrets`; production Secret. | Mattermost bot account token; when supplied to the bootstrap script it is overwritten on each run. |
+| `MATTERMOSTBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it when Mattermost credentials are present and it is omitted. | Static API key accepted by api-rs for Mattermost sessions. |
 | `CENTAUR_APIRS_ADMIN_API_KEY` | `secretManager.existingSecretName` or the api-rs environment. | Optional static bearer token with every api-rs capability. Generate a distinct value with `openssl rand -hex 32`. |
 
 ## Console and Permission Control Plane
@@ -193,6 +199,31 @@ Execution tuning:
 | `SLACKBOTV2_CHANNEL_DEFAULTS` | `slackbotv2.channelDefaults`. | Per-channel default persona / harness / model / provider / reasoning as a JSON object keyed by Slack conversation id, where each value is an object of optional `persona`/`harness`/`model`/`provider`/`reasoning` fields (same vocabulary as the inline flags, so `harness: claude`, `provider: bedrock`, and Claude model aliases like `opus` all work), e.g. `{"C0ENG":{"harness":"claude","model":"opus","reasoning":"high"},"C0TRIAGE":{"reasoning":"low"}}`. A model is only meaningful within a harness, so name the harness alongside it. Applied when a message in that channel carries no explicit/sticky per-thread flag (below such a flag, above the deployment/baked default) and forwarded onto the harness input line so it takes effect; setting the harness restarts a thread onto it like a `--claude`/`--codex` flag. `reasoning` affects the Codex, Nanocodex, Claude Code, and Pi harnesses. `persona` names a deployed persona and, like `--persona`, applies only when the thread's session is created. Malformed JSON and unrecognized field values are logged and ignored. |
 | `SLACK_TEAM_ID` | `slackbot.extraEnv`. | Workspace team ID (e.g. `T01ABCD2EFG`) used to rewrite `https://*.slack.com/archives/...` URLs in final-delivery messages into native `slack://channel?team=...` deep links that open in the Slack app. Leave unset to keep archive URLs unchanged. |
 | `COMMIT_SHA` | Build/deploy env. | Commit shown in Slackbot metadata. |
+
+## Mattermostbot
+
+| Env var or value | Set from | Controls |
+| --- | --- | --- |
+| `PORT` | Chart-rendered (`3001`). | Mattermostbot HTTP port used by `/health` probes. |
+| `CENTAUR_API_URL` | Chart-rendered API service URL. | API base URL used by Mattermostbot. |
+| `MATTERMOST_BASE_URL` | `mattermostbot.serverUrl`. | Base URL of the Mattermost server. |
+| `MATTERMOST_BOT_TOKEN` | `secretManager.existingSecretName`. | Mattermost bot account token used for the websocket connection. |
+| `MATTERMOSTBOT_API_KEY` | `secretManager.existingSecretName`. | Dedicated bearer key used by Mattermostbot to call api-rs. |
+| `MATTERMOSTBOT_DATABASE_URL` | `DATABASE_URL` in `secretManager.existingSecretName`. | Chat SDK Postgres state store. |
+| `MATTERMOSTBOT_USER_NAME` | `mattermostbot.userName`. | Bot username used for Mattermost adapter setup; defaults to `centaur`. |
+| `MATTERMOSTBOT_TEAM_ALLOWLIST` | `mattermostbot.teamAllowlist`. | Comma/space-separated Mattermost team IDs. The bot remains inert until this is set; direct messages and group messages are denied. |
+| `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST`, `MATTERMOSTBOT_STATE_KEY_PREFIX` | `mattermostbot.extraEnv`. | Optional trigger-bot allowlist and Postgres state namespace overrides. |
+| `mattermostbot.serverEgress.port` | Helm value, default `443`. | Mattermost server TCP port allowed by the bot NetworkPolicy. Set it for a non-HTTPS or nonstandard server port. |
+| `mattermostbot.serverEgress.cidrs` | Helm value. | Optional destination address ranges. Empty permits the configured port to any address. |
+| `mattermostbot.serverEgress.podSelector`, `mattermostbot.serverEgress.namespace` | Helm values. | Optional in-cluster Mattermost pod labels and namespace. Use this for a Mattermost Service/pod instead of CIDRs. |
+| `mattermostbot.extraEnv`, `mattermostbot.resources` | Helm values. | Additional container environment and resource requests/limits. |
+
+Mattermostbot is a singleton deployment with a `Recreate` strategy: two pods
+using one Mattermost bot token would both consume every websocket event. The
+NetworkPolicy admits only `/health` probes, permits api-rs and Postgres, and
+relies on the chart-wide DNS policy for DNS. Its Mattermost egress defaults to
+TCP 443 anywhere, and can be restricted with `serverEgress.cidrs` or an
+in-cluster `serverEgress.podSelector`.
 
 ## Teamsbot
 

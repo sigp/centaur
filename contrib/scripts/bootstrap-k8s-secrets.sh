@@ -68,6 +68,11 @@ Optional Teams ingress bootstrap (consumed when teamsbot.enabled=true):
   TEAMS_BOT_APP_TENANT_ID      Microsoft Entra tenant id for the Teams app
   TEAMSBOT_API_KEY             bearer the bot sends to api-rs; auto-generated
                                once when absent (never rotated in place)
+Optional Mattermost ingress bootstrap (consumed when mattermostbot.enabled=true):
+  MATTERMOST_BOT_TOKEN       when set, seeds the mattermostbot bot token; overwritten
+                             on every run so token rotation works
+  MATTERMOSTBOT_API_KEY      bearer the bot sends to api-rs; auto-generated once when
+                             absent (never rotated in place)
 
 Console bootstrap:
   IRON_CONTROL_DATABASE_URL    overrides the derived DSN (default points at the
@@ -226,6 +231,14 @@ if secret_exists centaur-infra-env; then
       patch_data+=("\"TEAMSBOT_API_KEY\":\"$(printf '%s' "${TEAMSBOT_API_KEY:-$(rand_hex)}" | base64 | tr -d '\n')\"")
     fi
   fi
+  # Mattermost ingress (mattermostbot) keys: added when MATTERMOST_BOT_TOKEN is in the env.
+  # The bot token is overwritten on each run; MATTERMOSTBOT_API_KEY is generated once if absent.
+  if [[ -n "${MATTERMOST_BOT_TOKEN:-}" ]]; then
+    patch_data+=("\"MATTERMOST_BOT_TOKEN\":\"$(printf '%s' "$MATTERMOST_BOT_TOKEN" | base64 | tr -d '\n')\"")
+    if ! secret_key_present MATTERMOSTBOT_API_KEY; then
+      patch_data+=("\"MATTERMOSTBOT_API_KEY\":\"$(printf '%s' "${MATTERMOSTBOT_API_KEY:-$(rand_hex)}" | base64 | tr -d '\n')\"")
+    fi
+  fi
   # iron-control keys: top up only when absent so we never rotate them out from
   # under a running pod (its ActiveRecord-encrypted data would become
   # undecryptable). Generated values mirror the create path.
@@ -338,6 +351,12 @@ else
       --from-literal=TEAMS_BOT_APP_PASSWORD="$TEAMS_BOT_APP_PASSWORD"
       --from-literal=TEAMS_BOT_APP_TENANT_ID="$TEAMS_BOT_APP_TENANT_ID"
       --from-literal=TEAMSBOT_API_KEY="${TEAMSBOT_API_KEY:-$(rand_hex)}"
+    )
+  fi
+  if [[ -n "${MATTERMOST_BOT_TOKEN:-}" ]]; then
+    secret_args+=(
+      --from-literal=MATTERMOST_BOT_TOKEN="$MATTERMOST_BOT_TOKEN"
+      --from-literal=MATTERMOSTBOT_API_KEY="${MATTERMOSTBOT_API_KEY:-$(rand_hex)}"
     )
   fi
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then

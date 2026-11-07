@@ -1,0 +1,107 @@
+{{- if .Values.mattermostbot.enabled }}
+{{- if not .Values.mattermostbot.serverUrl }}
+{{- fail "mattermostbot.serverUrl is required when mattermostbot.enabled=true" }}
+{{- end }}
+{{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "mattermostbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "mattermostbot") | nindent 4 }}
+spec:
+  # Exactly one replica: two pods on one bot token both receive every websocket event.
+  # Recreate tears the old pod down before the new one logs in. Do NOT add an HPA.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "mattermostbot") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+      labels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "mattermostbot") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 35
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: mattermostbot
+          image: {{ printf "%s:%s" .Values.mattermostbot.image.repository .Values.mattermostbot.image.tag | quote }}
+          imagePullPolicy: {{ .Values.mattermostbot.image.pullPolicy }}
+          env:
+            - name: PORT
+              value: "3001"
+            - name: CENTAUR_API_URL
+              value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
+            - name: MATTERMOST_BASE_URL
+              value: {{ .Values.mattermostbot.serverUrl | quote }}
+            - name: MATTERMOST_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sMATTERMOST_BOT_TOKEN" .Values.secretManager.envPrefix }}
+            - name: MATTERMOSTBOT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sMATTERMOSTBOT_API_KEY" .Values.secretManager.envPrefix }}
+            - name: MATTERMOSTBOT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
+            - name: MATTERMOSTBOT_USER_NAME
+              value: {{ .Values.mattermostbot.userName | quote }}
+            - name: MATTERMOSTBOT_TEAM_ALLOWLIST
+              value: {{ .Values.mattermostbot.teamAllowlist | quote }}
+{{- range $name, $value := .Values.mattermostbot.extraEnv }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+{{- end }}
+          ports:
+            - containerPort: 3001
+              name: http
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            periodSeconds: 15
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          resources:
+{{ toYaml .Values.mattermostbot.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "mattermostbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "mattermostbot") | nindent 4 }}
+spec:
+  selector:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "mattermostbot") | nindent 4 }}
+  ports:
+    - name: http
+      port: 3001
+      targetPort: 3001
+{{- end }}

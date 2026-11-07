@@ -86,6 +86,11 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "teamsbot") | nindent 14 }}
 {{- end }}
+{{- if .Values.mattermostbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "mattermostbot") | nindent 14 }}
+{{- end }}
         - podSelector:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "console") | nindent 14 }}
@@ -182,6 +187,11 @@ spec:
         - podSelector:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "teamsbot") | nindent 14 }}
+{{- end }}
+{{- if .Values.mattermostbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "mattermostbot") | nindent 14 }}
 {{- end }}
         # Console pages call api-rs for admin-backed views such as ETLs.
         - podSelector:
@@ -514,6 +524,76 @@ spec:
     - ports:
         - protocol: TCP
           port: 443
+---
+{{- end }}
+{{- if .Values.mattermostbot.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "mattermostbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "mattermostbot") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "mattermostbot") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only health probes reach mattermostbot; the websocket connection is outbound.
+    - from:
+{{- range $ingressSourceNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: 3001
+  egress:
+{{- if .Values.apiRs.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiRs.port }}
+{{- end }}
+    {{- include "centaur.postgresEgress" . | nindent 4 }}
+{{- with .Values.mattermostbot.serverEgress.cidrs }}
+    # Direct Mattermost server egress. NetworkPolicy cannot match hostnames.
+    - to:
+{{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.mattermostbot.serverEgress.port }}
+{{- end }}
+{{- with .Values.mattermostbot.serverEgress.podSelector }}
+    # In-cluster Mattermost server egress.
+    - to:
+        - podSelector:
+            matchLabels:
+{{ toYaml . | nindent 14 }}
+{{- with $.Values.mattermostbot.serverEgress.namespace }}
+          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.mattermostbot.serverEgress.port }}
+{{- end }}
+{{- if and (not .Values.mattermostbot.serverEgress.cidrs) (not .Values.mattermostbot.serverEgress.podSelector) }}
+    # Default: direct Mattermost HTTPS egress anywhere, like discordbot.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.mattermostbot.serverEgress.port }}
+{{- end }}
 ---
 {{- end }}
 {{- if .Values.teamsbot.enabled }}
