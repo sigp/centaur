@@ -1369,6 +1369,9 @@ describe("Mattermost proactive replies", () => {
     expect(appendedIds(h)).toEqual(
       expect.arrayContaining(["burst-one", "burst-two"]),
     );
+    // Debounce applies to idle threads only: while the burst's turn runs, an
+    // unmentioned post is classified at once so it can steer that turn.
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
 
     const before = h.decisionRequests.length;
     h.sendPosted(makePost("debounced-old", "old part", ROOT_ID));
