@@ -53,6 +53,11 @@ import {
   sessionStreamError,
   startingStreamNotification,
 } from "./session-api";
+import { proactiveThreadMessage } from "./proactive-classifier";
+import {
+  resolveProactivityRules,
+  type ProactivityRule,
+} from "./proactivity-rules";
 import type {
   ForwardSessionInput,
   Mattermostbot,
@@ -93,8 +98,13 @@ export type {
   MattermostbotExecuteSessionResponse,
   MattermostbotFetch,
   MattermostbotOptions,
+  MattermostbotProactivityOptions,
   MattermostbotSessionMessage,
   MattermostbotSessionMessageRole,
+  ProactiveClassifier,
+  ProactiveClassifierInput,
+  ProactiveDecision,
+  ProactiveThreadMessage,
 } from "./types";
 
 export {
@@ -125,6 +135,18 @@ const RENDER_RETRY_INITIAL_DELAY_MS = 250;
 const RENDER_RETRY_MAX_DELAY_MS = 5_000;
 const RENDER_RETRY_MAX_ATTEMPTS = 10;
 const FORWARD_RETRY_DELAYS_MS = [1_000, 3_000] as const;
+const PROACTIVE_CLASSIFIER_TIMEOUT_MS = 2_000;
+const PROACTIVE_HISTORY_MESSAGES = 20;
+const PROACTIVE_CLAIM_TTL_MS = 60_000;
+const PROACTIVE_CLAIM_WAIT_MS = 30_000;
+const PROACTIVE_CLAIM_POLL_MS = 250;
+const PROACTIVE_PENDING_GRACE_MS = 60_000;
+const PROACTIVE_PENDING_MAX = 50;
+const PROACTIVE_MENTION_TTL_MS = 60_000;
+const PROACTIVE_PENDING_KEY_PREFIX = "mattermostbot:proactive:pending:";
+const PROACTIVE_BURST_END_KEY_PREFIX = "mattermostbot:proactive:burst-end:";
+const PROACTIVE_MENTION_KEY_PREFIX = "mattermostbot:proactive:mention:";
+const PROACTIVE_CLAIM_KEY_PREFIX = "mattermostbot:proactive:claim:";
 const DEFAULT_MESSAGE_OVERRIDES_STRATEGY = createFlagMessageOverridesStrategy();
 
 export async function messageOverridesForText(
@@ -271,9 +293,34 @@ export function createMattermostbot(
       DEFAULT_MAX_CONCURRENT_EXECUTIONS_PER_TEAM,
   );
 
+  const scheduleProactiveMessage = (
+    thread: Thread<MattermostbotThreadState>,
+    message: ChatMessage,
+  ): void => {
+    if (!options.proactivity) return;
+    backgroundWaitUntil(
+      handleProactiveMessage(thread, message, {
+        executionLimiter,
+        options,
+        reactions,
+        state,
+      }).catch((error) => {
+        traceLog(options, "mattermostbot_proactive_failed", {
+          includeContext: false,
+          messageId: message.id,
+          mode: "execute",
+          openStream: false,
+          startedAtMs: nowMs(),
+          threadId: thread.id,
+        }, { error: errorMessage(error) });
+      }),
+    );
+  };
+
   chat.onNewMention(async (thread, message) => {
     if (!(await isAllowedMattermostMessage(message, options, logger))) return;
     if (await handleStopCommand(thread, message, options)) return;
+    await markProactiveMention(thread, message, options, state);
     await thread.subscribe();
     await syncThreadMessageToSession(thread, message, {
       mode: "execute",
@@ -287,10 +334,16 @@ export function createMattermostbot(
   chat.onSubscribedMessage(async (thread, message) => {
     if (!(await isAllowedMattermostMessage(message, options, logger))) return;
     if (message.isMention !== true) {
-      await handleUnmentionedMessage(thread, message, options);
+      await handleUnmentionedMessage(
+        thread,
+        message,
+        options,
+        scheduleProactiveMessage,
+      );
       return;
     }
     if (await handleStopCommand(thread, message, options)) return;
+    await markProactiveMention(thread, message, options, state);
     await syncThreadMessageToSession(thread, message, {
       mode: "execute",
       executionLimiter,
@@ -298,6 +351,14 @@ export function createMattermostbot(
       reactions,
       state,
     });
+  });
+
+  // Pattern routing receives unmentioned, unsubscribed, non-DM messages.
+  // Operator rules only start threads from top-level posts.
+  chat.onNewMessage(/^.*$/s, async (thread, message) => {
+    if (!(await isAllowedMattermostMessage(message, options, logger))) return;
+    if (isMattermostThreadReply(message)) return;
+    scheduleProactiveMessage(thread, message);
   });
 
   const app = new Hono();
@@ -356,24 +417,73 @@ function createDefaultState(
   });
 }
 
+type ProactiveScheduler = (
+  thread: Thread<MattermostbotThreadState>,
+  message: ChatMessage,
+) => void;
+
+type PendingProactiveMessage = {
+  id: string;
+  timestamp: number;
+};
+
 /**
- * Single hook for an unmentioned subscribed-thread post. Mention gating keeps
- * it out of the session for now; the proactive classifier can decide here in
- * a later slice whether to hand it to the normal mention flow.
+ * Single hook for an unmentioned subscribed-thread post. Classification runs
+ * in the background because Chat SDK concurrency is configured to drop.
  */
 async function handleUnmentionedMessage(
   thread: Thread<MattermostbotThreadState>,
   message: ChatMessage,
   options: MattermostbotOptions,
+  schedule: ProactiveScheduler,
 ): Promise<void> {
-  traceLog(options, "mattermostbot_subscribed_message_without_mention_ignored", {
-    includeContext: false,
-    messageId: message.id,
-    mode: "append",
-    openStream: false,
-    startedAtMs: nowMs(),
-    threadId: thread.id,
-  });
+  if (!options.proactivity) {
+    traceLog(options, "mattermostbot_subscribed_message_without_mention_ignored", {
+      includeContext: false,
+      messageId: message.id,
+      mode: "append",
+      openStream: false,
+      startedAtMs: nowMs(),
+      threadId: thread.id,
+    });
+    return;
+  }
+  schedule(thread, message);
+}
+
+async function markProactiveMention(
+  thread: Thread<MattermostbotThreadState>,
+  message: ChatMessage,
+  options: MattermostbotOptions,
+  state: StateAdapter,
+): Promise<void> {
+  if (!options.proactivity) return;
+  await thread.setState({ proactiveEligible: true });
+  await state.set(
+    `${PROACTIVE_MENTION_KEY_PREFIX}${thread.id}`,
+    pendingProactiveMessage(message),
+    PROACTIVE_MENTION_TTL_MS,
+  );
+}
+
+function pendingProactiveMessage(message: ChatMessage): PendingProactiveMessage {
+  return {
+    id: message.id,
+    timestamp: message.metadata.dateSent.getTime(),
+  };
+}
+
+function isMattermostThreadReply(message: ChatMessage): boolean {
+  const raw = message.raw as { root_id?: unknown } | null | undefined;
+  return typeof raw?.root_id === "string" && raw.root_id.length > 0;
+}
+
+function compareProactiveMessages(
+  left: PendingProactiveMessage,
+  right: PendingProactiveMessage,
+): number {
+  if (left.timestamp !== right.timestamp) return left.timestamp - right.timestamp;
+  return left.id.localeCompare(right.id);
 }
 
 async function handleStopCommand(
@@ -439,6 +549,10 @@ async function syncThreadMessageToSession(
     executionLimiter: TeamExecutionLimiter;
     mode: MattermostbotMessageMode;
     options: MattermostbotOptions;
+    /** An unmentioned message accepted by the proactive classifier. */
+    proactive?: boolean;
+    /** Operator rule matched by this proactive message, if any. */
+    proactiveRule?: ProactivityRule;
     reactionAck?: ReactionAck;
     reactions: ReactionController;
     retryAttempt?: number;
@@ -448,7 +562,11 @@ async function syncThreadMessageToSession(
   const traceStartedAtMs = nowMs();
   const options = input.options;
   const logger = options.logger ?? noopLogger;
-  const state = (await thread.state) ?? {};
+  let state = (await thread.state) ?? {};
+  if (input.proactive === true && options.proactivity) {
+    await thread.setState({ proactiveEligible: true });
+    state = { ...state, proactiveEligible: true };
+  }
   const forwardedIds = new Set(state.forwardedMessageIds ?? []);
   const executedIds = new Set(state.executedMessageIds ?? []);
   let shouldStartExecution =
@@ -487,7 +605,8 @@ async function syncThreadMessageToSession(
     const includeContext =
       shouldStartExecution && state.historyForwarded !== true;
     const refreshContext =
-      message.isMention === true && state.historyForwarded === true;
+      (message.isMention === true || input.proactive === true) &&
+      state.historyForwarded === true;
     const trace: MattermostbotTrace = {
       includeContext,
       messageId: message.id,
@@ -656,12 +775,26 @@ async function syncThreadMessageToSession(
       Boolean(explicitOverrides.harnessType) &&
       Boolean(pinnedHarness) &&
       pinnedHarness !== effectiveHarnessType;
+    if (harnessRestart) {
+      await thread.setState({ proactiveRulesSent: [] });
+      state = { ...state, proactiveRulesSent: [] };
+    }
+    const proactiveRule =
+      shouldStartExecution &&
+      input.proactiveRule &&
+      (harnessRestart ||
+        !(state.proactiveRulesSent ?? []).includes(input.proactiveRule.name))
+        ? input.proactiveRule
+        : undefined;
+    const proactiveContext = proactiveRule
+      ? proactiveRuleContext(proactiveRule)
+      : undefined;
     const messagesToAppend = messages.filter(
       (item) => harnessRestart || !forwardedIds.has(item.id),
     );
     if (
       !shouldStartExecution &&
-      message.isMention === true &&
+      (message.isMention === true || input.proactive === true) &&
       messagesToAppend.some((item) => item.id === message.id) &&
       !reactionAck
     ) {
@@ -687,6 +820,7 @@ async function syncThreadMessageToSession(
       metadataModel: shouldStartExecution ? effectiveModel : undefined,
       model: shouldStartExecution ? resolvedModel : undefined,
       personaId: shouldStartExecution ? resolvedPersonaId : undefined,
+      proactiveContext,
       provider: shouldStartExecution ? resolvedProvider : undefined,
       reasoning: effectiveReasoning,
       messages: messagesToAppend,
@@ -731,10 +865,21 @@ async function syncThreadMessageToSession(
       }
       await thread.setState({
         ...(stickyOverridesUpdate ?? {}),
+        ...(harnessRestart || proactiveRule
+          ? {
+              proactiveRulesSent: proactiveRule
+                ? Array.from(
+                    new Set([
+                      ...(latest.proactiveRulesSent ?? []),
+                      proactiveRule.name,
+                    ]),
+                  )
+                : [],
+            }
+          : {}),
         activeExecution: true,
         activeExecutionStartedAt: Date.now(),
         executedMessageIds: Array.from(latestExecutedIds).slice(-1000),
-        lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
         renderObligation: {
           afterEventId: lastEventId,
           executionId: execution.execution_id,
@@ -893,6 +1038,326 @@ async function syncThreadMessageToSession(
     if (!handoffStarted) releaseExecutionSlot?.();
   }
 }
+type ProactiveLayer = "mentioned" | "rules";
+
+async function handleProactiveMessage(
+  thread: Thread<MattermostbotThreadState>,
+  message: ChatMessage,
+  input: {
+    executionLimiter: TeamExecutionLimiter;
+    options: MattermostbotOptions;
+    reactions: ReactionController;
+    state: StateAdapter;
+  },
+): Promise<void> {
+  const { options, state } = input;
+  const proactivity = options.proactivity;
+  if (!proactivity) return;
+  const rules = resolveProactivityRules(proactivity.rules, thread.id);
+  let threadState = (await thread.state) ?? {};
+  let skipReason = proactiveSkipReason(rules, threadState, message);
+  if (skipReason) {
+    traceLog(
+      options,
+      "mattermostbot_proactive_decision",
+      proactiveTrace(thread, message),
+      { outcome: `skip_${skipReason}` },
+    );
+    return;
+  }
+
+  const debounceMs =
+    hasLiveActiveExecution(
+      threadState,
+      options.activeExecutionTtlMs ?? DEFAULT_ACTIVE_EXECUTION_TTL_MS,
+    )
+      ? 0
+      : proactivity.debounceMs ?? 0;
+  let burstIds = new Set<string>();
+  if (debounceMs > 0) {
+    const earlierBurstIds = await waitForProactiveBurstEnd(
+      thread,
+      message,
+      state,
+      debounceMs,
+    );
+    if (!earlierBurstIds) {
+      traceLog(
+        options,
+        "mattermostbot_proactive_decision",
+        proactiveTrace(thread, message),
+        { outcome: "skip_superseded" },
+      );
+      return;
+    }
+    const mention = await state.get<PendingProactiveMessage>(
+      `${PROACTIVE_MENTION_KEY_PREFIX}${thread.id}`,
+    );
+    if (
+      mention &&
+      compareProactiveMessages(mention, pendingProactiveMessage(message)) > 0
+    ) {
+      traceLog(
+        options,
+        "mattermostbot_proactive_decision",
+        proactiveTrace(thread, message),
+        { outcome: "skip_mentioned" },
+      );
+      return;
+    }
+    threadState = (await thread.state) ?? {};
+    const forwarded = new Set(threadState.forwardedMessageIds ?? []);
+    if (forwarded.has(message.id)) {
+      traceLog(
+        options,
+        "mattermostbot_proactive_decision",
+        proactiveTrace(thread, message),
+        { outcome: "skip_forwarded" },
+      );
+      return;
+    }
+    skipReason = proactiveSkipReason(rules, threadState, message);
+    if (skipReason) {
+      traceLog(
+        options,
+        "mattermostbot_proactive_decision",
+        proactiveTrace(thread, message),
+        { outcome: `skip_${skipReason}` },
+      );
+      return;
+    }
+    burstIds = new Set(earlierBurstIds);
+  }
+
+  const layers = proactiveLayers(rules, threadState);
+  const earlier = isMattermostThreadReply(message)
+    ? await proactiveThreadHistory(thread, message)
+    : [];
+  const history = earlier
+    .filter((item) => !burstIds.has(item.id))
+    .map(proactiveThreadMessage);
+  const burst = earlier
+    .filter((item) => burstIds.has(item.id))
+    .map(proactiveThreadMessage);
+  const signal = AbortSignal.timeout(
+    proactivity.timeoutMs ?? PROACTIVE_CLASSIFIER_TIMEOUT_MS,
+  );
+  const aborted = new Promise<never>((_, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason), {
+      once: true,
+    });
+  });
+  const decisions = await Promise.allSettled(
+    layers.map((layer) =>
+      Promise.race([
+        proactivity.classifier(
+          {
+            botName: options.userName ?? "centaur",
+            ...(layer === "rules" ? { rules } : {}),
+            ...(burst.length > 0 ? { burst } : {}),
+            history,
+            message: proactiveThreadMessage(message),
+          },
+          signal,
+        ),
+        aborted,
+      ]),
+    ),
+  );
+  const respondingLayer = layers.find((_, index) => {
+    const decision = decisions[index];
+    return decision?.status === "fulfilled" && decision.value.respond;
+  });
+  if (!respondingLayer) {
+    const failure = decisions.find((decision) => decision.status === "rejected");
+    traceLog(
+      options,
+      "mattermostbot_proactive_decision",
+      proactiveTrace(thread, message),
+      { outcome: failure ? "error" : "decline" },
+    );
+    return;
+  }
+  const rulesDecision = decisions[layers.indexOf("rules")];
+  const matchedRule =
+    rulesDecision?.status === "fulfilled" && rulesDecision.value.respond
+      ? rules?.find((rule) => rule.name === rulesDecision.value.rule)
+      : undefined;
+  const releaseClaim = await claimProactiveHandoff(thread, state);
+  if (!releaseClaim) {
+    traceLog(
+      options,
+      "mattermostbot_proactive_decision",
+      proactiveTrace(thread, message),
+      { outcome: "skip_claimed" },
+    );
+    return;
+  }
+  try {
+    const lateState = (await thread.state) ?? {};
+    const lateSkipReason = proactiveSkipReason(rules, lateState, message);
+    if (lateSkipReason) {
+      traceLog(
+        options,
+        "mattermostbot_proactive_decision",
+        proactiveTrace(thread, message),
+        { outcome: `skip_${lateSkipReason}` },
+      );
+      return;
+    }
+    await thread.subscribe();
+    traceLog(
+      options,
+      "mattermostbot_proactive_decision",
+      proactiveTrace(thread, message),
+      { outcome: "respond", layer: respondingLayer, rule: matchedRule?.name },
+    );
+    await syncThreadMessageToSession(thread, message, {
+      executionLimiter: input.executionLimiter,
+      mode: "execute",
+      options,
+      proactive: true,
+      proactiveRule: matchedRule,
+      reactions: input.reactions,
+      state,
+    });
+  } finally {
+    await releaseClaim();
+  }
+}
+
+function proactiveTrace(
+  thread: Thread<MattermostbotThreadState>,
+  message: ChatMessage,
+): MattermostbotTrace {
+  return {
+    includeContext: false,
+    messageId: message.id,
+    mode: "execute",
+    openStream: false,
+    startedAtMs: nowMs(),
+    threadId: thread.id,
+  };
+}
+
+function proactiveLayers(
+  rules: ProactivityRule[] | undefined,
+  state: MattermostbotThreadState,
+): ProactiveLayer[] {
+  const layers: ProactiveLayer[] = [];
+  if (state.proactiveEligible === true) layers.push("mentioned");
+  if (rules !== undefined && state.proactiveEligible !== false) {
+    layers.push("rules");
+  }
+  return layers;
+}
+
+function proactiveSkipReason(
+  rules: ProactivityRule[] | undefined,
+  state: MattermostbotThreadState,
+  message: ChatMessage,
+): string | undefined {
+  if (proactiveLayers(rules, state).length === 0) return "not_eligible";
+  if (!message.text.trim()) return "empty";
+  return undefined;
+}
+
+function proactiveRuleContext(rule: ProactivityRule): string {
+  const reason =
+    `You were not mentioned. This message matched the operators' proactive reply rule "${rule.name}".`;
+  return rule.context
+    ? `${reason} Their instructions for responding:\n${rule.context}`
+    : reason;
+}
+
+async function proactiveThreadHistory(
+  thread: Thread<MattermostbotThreadState>,
+  current: ChatMessage,
+): Promise<ChatMessage[]> {
+  const currentTimestamp = current.metadata.dateSent.getTime();
+  const history: ChatMessage[] = [];
+  for await (const item of thread.allMessages) {
+    if (item.id === current.id) continue;
+    if (item.metadata.dateSent.getTime() > currentTimestamp) continue;
+    history.push(item);
+  }
+  history.sort((left, right) =>
+    compareProactiveMessages(
+      pendingProactiveMessage(left),
+      pendingProactiveMessage(right),
+    ),
+  );
+  return history.slice(-PROACTIVE_HISTORY_MESSAGES);
+}
+
+async function waitForProactiveBurstEnd(
+  thread: Thread<MattermostbotThreadState>,
+  message: ChatMessage,
+  state: StateAdapter,
+  debounceMs: number,
+): Promise<string[] | undefined> {
+  const pendingKey = `${PROACTIVE_PENDING_KEY_PREFIX}${thread.id}`;
+  const endKey = `${PROACTIVE_BURST_END_KEY_PREFIX}${thread.id}`;
+  const ttlMs = debounceMs + PROACTIVE_PENDING_GRACE_MS;
+  const current = pendingProactiveMessage(message);
+  await state.appendToList(pendingKey, current, {
+    maxLength: PROACTIVE_PENDING_MAX,
+    ttlMs,
+  });
+  await sleep(debounceMs);
+  const pending = await state.getList<PendingProactiveMessage>(pendingKey);
+  if (
+    pending.some(
+      (item) =>
+        item &&
+        compareProactiveMessages(item, current) > 0,
+    )
+  ) {
+    return undefined;
+  }
+  const lastEnd = await state.get<PendingProactiveMessage>(endKey);
+  if (lastEnd && compareProactiveMessages(lastEnd, current) >= 0) {
+    return undefined;
+  }
+  await state.set(endKey, current, ttlMs);
+  const oldestTimestamp = current.timestamp - ttlMs;
+  return pending
+    .filter(
+      (item) =>
+        item &&
+        compareProactiveMessages(item, current) < 0 &&
+        item.timestamp >= oldestTimestamp &&
+        (!lastEnd || compareProactiveMessages(item, lastEnd) > 0),
+    )
+    .map((item) => item.id);
+}
+
+async function claimProactiveHandoff(
+  thread: Thread<MattermostbotThreadState>,
+  state: StateAdapter,
+): Promise<(() => Promise<void>) | undefined> {
+  const key = `${PROACTIVE_CLAIM_KEY_PREFIX}${thread.id}`;
+  const token = randomUUID();
+  const deadline = Date.now() + PROACTIVE_CLAIM_WAIT_MS;
+  while (true) {
+    if (await state.setIfNotExists(key, token, PROACTIVE_CLAIM_TTL_MS)) {
+      return async () => {
+        if ((await state.get(key)) === token) await state.delete(key);
+      };
+    }
+    if (
+      hasLiveActiveExecution(
+        (await thread.state) ?? {},
+        DEFAULT_ACTIVE_EXECUTION_TTL_MS,
+      )
+    ) {
+      return async () => {};
+    }
+    if (Date.now() >= deadline) return undefined;
+    await sleep(PROACTIVE_CLAIM_POLL_MS);
+  }
+}
+
 
 function scheduleExecutionRender(
   thread: Thread<MattermostbotThreadState>,

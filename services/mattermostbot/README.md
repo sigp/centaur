@@ -7,9 +7,15 @@ Mattermost chat ingress for the Centaur agent. The service uses Chat SDK's `chat
 - A mentioned stop command (`stop`, `cancel`, `kill`, or `end`, with common
   polite variants) interrupts the api-rs execution and never starts a new turn.
 
-- Unmentioned posts in a subscribed thread are not forwarded or used to steer a
-  running turn. The next mention refreshes the thread context and includes every
-  post since the last forwarded one. Proactive replies are the later exception.
+- Unmentioned posts in a subscribed thread are classified when the thread became
+  eligible through a mention. Operator rules can also classify unmentioned
+  top-level channel posts and start a reply thread; the first matching rule
+  wins. A rule's `context` is sent only on the first execution in a harness.
+  Proactivity is the exception to mention gating, and a stop silences it until
+  the next mention.
+- Proactive decisions use the OpenAI Decisions API after the debounce quiet
+  period (idle threads only). A burst is judged as one message; a mention takes
+  over the burst, and classifier failures or timeouts do not reply.
 - A turn-starting mention gets the configured acknowledgement reaction. A
   mentioned follow-up can get the optional steering reaction; each reaction is
   removed after the response (or a failure) is posted.
@@ -51,6 +57,14 @@ Run one replica per bot token. Two consumers on one Mattermost token receive the
 | `MATTERMOSTBOT_ACK_REACTION` | No | Mattermost emoji name; defaults to `eyes`. |
 | `MATTERMOSTBOT_STEERING_REACTION_ENABLED` | No | Mentioned follow-up acknowledgement; defaults to `false`. |
 | `MATTERMOSTBOT_STEERING_REACTION` | No | Mattermost emoji name; defaults to `hourglass_flowing_sand`. |
+| `MATTERMOSTBOT_PROACTIVITY_ENABLED` | No | Enable proactive replies; defaults to `false`. |
+| `MATTERMOSTBOT_PROACTIVITY_CLASSIFIER` | No | Classifier backend; defaults to `openai`. |
+| `MATTERMOSTBOT_PROACTIVITY_MODEL` | No | Decisions model; defaults to `gpt-6-luna`. |
+| `MATTERMOSTBOT_PROACTIVITY_OPENAI_BASE_URL` | No | OpenAI-compatible Decisions API base URL. |
+| `MATTERMOSTBOT_PROACTIVITY_OPENAI_API_KEY` | No | Decisions API key; falls back to `OPENAI_API_KEY`. |
+| `MATTERMOSTBOT_PROACTIVITY_TIMEOUT_MS` | No | One decision timeout; defaults to `2000` ms. |
+| `MATTERMOSTBOT_PROACTIVITY_DEBOUNCE_MS` | No | Idle-thread burst quiet period; unset means no debounce. |
+| `MATTERMOSTBOT_PROACTIVITY_RULES_DIR` | No | Directory containing `default.json` and optional `<channelId>.json` rule arrays. |
 | `CLAUDE_MODEL` / `CODEX_MODEL` | No | Deployment-configured default model metadata. |
 | `CODEX_MODEL_REASONING_EFFORT` | No | Deployment-configured Codex/Nanocodex reasoning default. |
 | `CENTAUR_PI_MODEL` / `CENTAUR_OMP_MODEL` | No | Deployment-configured Pi/OMP default model metadata. |

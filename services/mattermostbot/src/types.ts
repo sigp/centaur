@@ -5,6 +5,7 @@ import type { MattermostAdapter } from "chat-adapter-mattermost";
 import type { Hono } from "hono";
 import type { HarnessOverrides } from "./overrides";
 import type { ChannelDefaults } from "./channel-defaults";
+import type { ProactivityRule, ProactivityRules } from "./proactivity-rules";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
@@ -108,6 +109,46 @@ export type MattermostbotFetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+export type ProactiveThreadMessage = {
+  author: string;
+  /** Whether this bot wrote the message. */
+  fromBot: boolean;
+  text: string;
+};
+
+export type ProactiveClassifierInput = {
+  botName: string;
+  /** Operator rules, in order; absent means built-in mentioned-thread rules. */
+  rules?: ProactivityRule[];
+  /** Earlier thread messages, oldest first. */
+  history: ProactiveThreadMessage[];
+  /** Messages sent in quick succession just before `message`. */
+  burst?: ProactiveThreadMessage[];
+  message: ProactiveThreadMessage;
+};
+
+export type ProactiveDecision = {
+  respond: boolean;
+  /** Backend probability that the bot should reply, when it reports one. */
+  probability?: number;
+  /** With rules, the name of the first rule the message meets. */
+  rule?: string;
+};
+
+export type ProactiveClassifier = (
+  input: ProactiveClassifierInput,
+  signal: AbortSignal,
+) => Promise<ProactiveDecision>;
+
+export type MattermostbotProactivityOptions = {
+  classifier: ProactiveClassifier;
+  /** Quiet period an idle thread waits before classifying. */
+  debounceMs?: number;
+  /** Rules that remove the need for a mention. */
+  rules?: ProactivityRules;
+  /** Deadline for one classifier decision; defaults to 2 seconds. */
+  timeoutMs?: number;
+};
 export type MattermostbotOptions = {
   /**
    * TTL after which a persisted `activeExecution` flag is treated as stale (a
@@ -144,6 +185,8 @@ export type MattermostbotOptions = {
   harnessDefaultReasoning?: Record<string, string>;
   /** Strategy for resolving message-level harness/model/provider/reasoning overrides. */
   messageOverridesStrategy?: MessageOverridesStrategy;
+  /** Proactive replies for eligible threads and configured channel rules. */
+  proactivity?: MattermostbotProactivityOptions;
   /** React to mentions that start a turn. */
   ackReactionEnabled?: boolean;
   /** Mattermost emoji name used for turn-start acknowledgements. */
@@ -205,6 +248,8 @@ export type MattermostbotThreadState = {
   provider?: string | null;
   /** Timestamp of the most recent stop command; used to suppress its run. */
   stopRequestedAt?: number | null;
+  /** Rules whose context has already been sent in this harness session. */
+  proactiveRulesSent?: string[];
   /** Set once a mention makes the thread eligible for proactive replies. */
   proactiveEligible?: boolean;
   executedMessageIds?: string[];
@@ -249,6 +294,8 @@ export type ForwardSessionInput = {
   personaId?: string;
   provider?: string;
   reasoning?: string;
+  /** Added before the execute message when an operator rule starts a turn. */
+  proactiveContext?: string;
   contextPreamble?: string;
   executionId?: string;
   executeMessage?: MattermostbotApiMessage;

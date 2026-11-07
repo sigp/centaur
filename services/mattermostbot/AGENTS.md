@@ -9,7 +9,14 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
 - The adapter's thread ID is the Centaur thread key verbatim: `mattermost:<base64url channel id>[:<base64url root post id>]`. Do not invent a second key format.
 - The service ignores its own posts and ignores other bot/webhook posts unless the author ID is in `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST`.
 - `/health` is 200 only while the adapter's websocket is open. REST/API failures do not make the service appear healthy.
-- Mattermost uses background post-and-edit streaming. The handler only performs the session create/append handoff, so mentioned follow-ups are appended while an execution is active instead of being dropped by the thread lock. Unmentioned subscribed-thread posts are ignored and collected by the next mention; the single unmentioned-message handler is the hook for the later proactive classifier.
+- Mattermost uses background post-and-edit streaming. The handler only performs
+  the session create/append handoff, so mentioned follow-ups are appended while
+  an execution is active instead of being dropped by the thread lock.
+  Unmentioned subscribed-thread posts are classified only after a mention makes
+  the thread eligible. Operator rules are the exception to mention gating:
+  they can match unmentioned top-level posts and start a reply thread. A rule's
+  context is sent once per harness, and a stop silences proactive replies until
+  the next mention.
 - Transient session create/append failures retry. Render retries are bounded; exhaustion posts an in-thread failure, clears `activeExecution`, and leaves the obligation for a later recovery.
 - Render obligations are indexed in persistent state, leased per thread, and recovered at startup. Keep the state adapter persistent so subscriptions, locks, dedupe state, and render progress survive restarts.
 - A mentioned stop command is handled before session sync: it records
@@ -51,6 +58,14 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
 | `MATTERMOSTBOT_ACK_REACTION` | No | Mattermost emoji name; defaults to `eyes`. |
 | `MATTERMOSTBOT_STEERING_REACTION_ENABLED` | No | Mentioned follow-up acknowledgement; defaults to `false`. |
 | `MATTERMOSTBOT_STEERING_REACTION` | No | Mattermost emoji name; defaults to `hourglass_flowing_sand`. |
+| `MATTERMOSTBOT_PROACTIVITY_ENABLED` | No | Enable proactive replies; defaults to `false`. |
+| `MATTERMOSTBOT_PROACTIVITY_CLASSIFIER` | No | Classifier backend; defaults to `openai`. |
+| `MATTERMOSTBOT_PROACTIVITY_MODEL` | No | Decisions model; defaults to `gpt-6-luna`. |
+| `MATTERMOSTBOT_PROACTIVITY_OPENAI_BASE_URL` | No | OpenAI-compatible Decisions API base URL. |
+| `MATTERMOSTBOT_PROACTIVITY_OPENAI_API_KEY` | No | Decisions API key; falls back to `OPENAI_API_KEY`. |
+| `MATTERMOSTBOT_PROACTIVITY_TIMEOUT_MS` | No | One decision timeout; defaults to `2000` ms. |
+| `MATTERMOSTBOT_PROACTIVITY_DEBOUNCE_MS` | No | Idle-thread burst quiet period; unset means no debounce. |
+| `MATTERMOSTBOT_PROACTIVITY_RULES_DIR` | No | Directory containing `default.json` and optional `<channelId>.json` rule arrays. |
 | `CLAUDE_MODEL`, `CODEX_MODEL` | No | Deployment model defaults. |
 | `CODEX_MODEL_REASONING_EFFORT` | No | Codex/Nanocodex default reasoning. |
 | `CENTAUR_PI_MODEL`, `CENTAUR_OMP_MODEL` | No | Pi/OMP deployment model defaults. |

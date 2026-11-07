@@ -228,6 +228,7 @@ export async function forwardToSessionApi(
     input.metadataModel,
     input.metadataHarnessType,
     input.contextPreamble,
+    input.proactiveContext,
   );
   traceLog(options, "mattermostbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -262,6 +263,7 @@ export async function executeSessionTurn(
     input.metadataModel,
     input.metadataHarnessType,
     input.contextPreamble,
+    input.proactiveContext,
   );
   traceLog(options, "mattermostbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -618,6 +620,7 @@ async function executeSession(
   metadataModel?: string,
   metadataHarnessType?: string,
   contextPreamble?: string,
+  proactiveContext?: string,
 ): Promise<MattermostbotExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch;
   const recordedModel = metadataModel ?? model;
@@ -635,6 +638,7 @@ async function executeSession(
       reasoning,
       provider,
       contextPreamble,
+      proactiveContext,
     ),
     ...(options.idleTimeoutMs === undefined
       ? {}
@@ -801,6 +805,7 @@ export function toCodexInputLines(
   reasoning?: string,
   provider?: string,
   contextPreamble?: string,
+  proactiveContext?: string,
 ): string[] {
   const staged = new Map<MattermostbotApiAttachment, string>();
   const lines: string[] = [];
@@ -814,6 +819,7 @@ export function toCodexInputLines(
       reasoning,
       provider,
       contextPreamble,
+      proactiveContext,
     );
     if (
       inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS &&
@@ -834,6 +840,7 @@ export function toCodexInputLines(
       reasoning,
       provider,
       contextPreamble,
+      proactiveContext,
     ),
   );
   return lines;
@@ -847,10 +854,14 @@ function toCodexInputLineWithStaged(
   reasoning?: string,
   provider?: string,
   contextPreamble?: string,
+  proactiveContext?: string,
 ): string {
   const content: JsonValue[] = [];
   if (contextPreamble?.trim()) {
     content.push({ type: "text", text: contextPreamble });
+  }
+  if (proactiveContext?.trim()) {
+    content.push({ type: "text", text: proactiveContext });
   }
   content.push(...codexInputContent(message, staged));
   return JSON.stringify({

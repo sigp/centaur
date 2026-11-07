@@ -12,6 +12,7 @@ import {
   type MattermostbotApiMessage,
   type MattermostbotOptions,
 } from "../src/index";
+import { createOpenAiProactiveClassifier } from "../src/proactive-classifier";
 
 const CHANNEL_ID = "channelallowed";
 const ROOT_ID = "rootallowed";
@@ -95,6 +96,10 @@ type Harness = {
   edits: Record<string, unknown>[];
   eventRequests: Array<{ executionId: string | null; threadKey: string }>;
   executes: Record<string, unknown>[];
+  decisionRequests: Record<string, unknown>[];
+  decisionResponses: Record<string, unknown>[];
+  decisionFail: number;
+  decisionHold: { promise: Promise<void>; release(): void } | null;
   reactions: Array<{
     emoji: string;
     method: "add" | "remove";
@@ -148,6 +153,10 @@ function startHarness(): Harness {
     refuseReactionAdds: 0,
     refuseReactionRemoves: 0,
     failAppends: 0,
+    decisionFail: 0,
+    decisionHold: null,
+    decisionRequests: [],
+    decisionResponses: [],
     failEvents: false,
     failHistory: 0,
     fileRequests: [],
@@ -179,6 +188,25 @@ function startHarness(): Harness {
         if (srv.upgrade(request)) return undefined;
         return new Response("upgrade failed", { status: 400 });
       }
+      if (url.pathname === "/decisions" && request.method === "POST") {
+        harness.decisionRequests.push(
+          (await request.json()) as Record<string, unknown>,
+        );
+        if (harness.decisionHold) await harness.decisionHold.promise;
+        if (harness.decisionFail > 0) {
+          harness.decisionFail -= 1;
+          return new Response("decision unavailable", {
+            status: 503,
+            statusText: "Service Unavailable",
+          });
+        }
+        return Response.json(
+          harness.decisionResponses.shift() ?? {
+            answers: [{ name: "respond", probability: 0 }],
+          },
+        );
+      }
+
 
       if (url.pathname.startsWith("/api/session/")) {
         const pieces = url.pathname.split("/").filter(Boolean);
@@ -419,6 +447,31 @@ async function startBotAndConnect(
   await waitFor(() => (harness?.sockets.length ?? 0) === 1);
   return bot;
 }
+function fakeProactivity(
+  h: Harness,
+  options: {
+    debounceMs?: number;
+    rules?: {
+      default?: Array<{ name: string; when: string; context?: string }>;
+      channels?: Record<
+        string,
+        Array<{ name: string; when: string; context?: string }>
+      >;
+    };
+  } = {},
+) {
+  return {
+    classifier: createOpenAiProactiveClassifier({
+      apiKey: "OPENAI_API_KEY",
+      baseUrl: h.baseUrl,
+      model: "test-proactivity-model",
+    }),
+    debounceMs: options.debounceMs,
+    rules: options.rules,
+    timeoutMs: 100,
+  };
+}
+
 
 function threadState(
   state: StateAdapter,
@@ -993,5 +1046,270 @@ describe("Mattermost reliability", () => {
     await waitFor(async () => (await threadState(state))?.activeExecution === false);
     await waitFor(() => h.botPostTexts().join("\n").includes("first streamed reply"));
     expect(h.executes).toHaveLength(1);
+  });
+});
+
+function respondDecision(probability = 1): Record<string, unknown> {
+  return { answers: [{ name: "respond", probability }] };
+}
+
+function ruleDecision(
+  probabilities: number[],
+): Record<string, unknown> {
+  return {
+    answers: probabilities.map((probability, index) => ({
+      name: `rule_${index + 1}`,
+      probability,
+    })),
+  };
+}
+
+describe("Mattermost proactive replies", () => {
+  it("classifies only eligible unmentioned follow-ups and accepts person-directed replies", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({
+      proactivity: fakeProactivity(h),
+      state,
+    });
+
+    h.sendPosted(makePost(ROOT_ID, "not eligible yet"));
+    await sleep(50);
+    expect(h.decisionRequests).toHaveLength(0);
+    expect(h.executes).toHaveLength(0);
+
+    h.sendPosted(makePost("eligible-mention", "@centaur start a thread", ROOT_ID));
+    await waitFor(() => h.executes.length === 1);
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+
+    h.decisionResponses.push(respondDecision());
+    h.sendPosted(makePost("unmentioned-followup", "@alice please check this", ROOT_ID));
+    await waitFor(() => h.executes.length === 2);
+    expect(h.decisionRequests).toHaveLength(1);
+    expect(appendedIds(h)).toContain("unmentioned-followup");
+  });
+
+  it("answers a rule-matched top-level post in a new thread and then treats it as mentioned", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    const rules = {
+      default: [
+        {
+          name: "incident",
+          when: "The message reports an incident.",
+          context: "Use the incident workflow.",
+        },
+        {
+          name: "fallback",
+          when: "The message asks for ordinary help.",
+          context: "Use the fallback workflow.",
+        },
+      ],
+    };
+    const proactivity = fakeProactivity(h, { rules });
+    await startBotAndConnect({ proactivity, state });
+
+    h.decisionResponses.push(ruleDecision([0.9, 0.9]));
+    h.sendPosted(makePost(ROOT_ID, "database is down"));
+    await waitFor(() => h.executes.length === 1);
+    await waitFor(() => h.posts.length === 1);
+    expect(h.posts[0]).toMatchObject({ root_id: ROOT_ID });
+    expect(JSON.stringify(h.executes[0])).toContain("incident workflow");
+    expect(JSON.stringify(h.executes[0])).not.toContain("fallback workflow");
+
+    // Remove the operator layer after the first answer; the thread must still
+    // be eligible through the mention-equivalent proactive handoff.
+    rules.default = [];
+    h.decisionResponses.push(respondDecision());
+    h.sendPosted(makePost("rule-followup", "what should we check next?", ROOT_ID));
+    await waitFor(() => h.executes.length === 2);
+    expect(h.decisionRequests).toHaveLength(2);
+  });
+
+  it("sends operator context once per harness and again after a harness restart", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    const proactivity = fakeProactivity(h, {
+      rules: {
+        default: [{
+          name: "incident",
+          when: "The message reports an incident.",
+          context: "Include the incident commander and the current impact.",
+        }],
+      },
+    });
+    await startBotAndConnect({ proactivity, state });
+
+    h.decisionResponses.push(ruleDecision([1]));
+    h.sendPosted(makePost(ROOT_ID, "--codex database is down"));
+    await waitFor(() => h.executes.length === 1);
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    expect(JSON.stringify(h.executes[0])).toContain("current impact");
+
+    h.decisionResponses.push(respondDecision(), ruleDecision([1]));
+    h.sendPosted(makePost("rule-second", "the outage continues", ROOT_ID));
+    await waitFor(() => h.executes.length === 2);
+    expect(JSON.stringify(h.executes[1])).not.toContain("current impact");
+
+    h.decisionResponses.push(respondDecision(), ruleDecision([1]));
+    h.sendPosted(makePost("rule-restart", "--claude investigate the outage", ROOT_ID));
+    await waitFor(() => h.executes.length === 3);
+    expect(h.creates[1]).toMatchObject({ on_harness_conflict: "restart" });
+    expect(JSON.stringify(h.executes[2])).toContain("current impact");
+  });
+
+  it("debounces a burst into one decision and lets a mention take over the burst", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({
+      proactivity: fakeProactivity(h, { debounceMs: 40 }),
+      state,
+    });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur start"));
+    await waitFor(() => h.executes.length === 1);
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+
+    h.decisionResponses.push(respondDecision());
+    h.sendPosted(makePost("burst-one", "first part", ROOT_ID));
+    h.sendPosted(makePost("burst-two", "second part", ROOT_ID));
+    await waitFor(() => h.executes.length === 2);
+    expect(JSON.stringify(h.decisionRequests[0])).toContain("first part");
+    expect(JSON.stringify(h.decisionRequests[0])).toContain("second part");
+    expect(appendedIds(h)).toEqual(
+      expect.arrayContaining(["burst-one", "burst-two"]),
+    );
+
+    const before = h.decisionRequests.length;
+    h.sendPosted(makePost("debounced-old", "old part", ROOT_ID));
+    await sleep(5);
+    h.sendPosted(makePost("debounced-mention", "@centaur take over", ROOT_ID));
+    await waitFor(() => h.executes.length === 3);
+    await sleep(60);
+    expect(h.decisionRequests).toHaveLength(before);
+  });
+
+  it("does not classify top-level posts in a channel whose rule list is empty", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({
+      proactivity: fakeProactivity(h, {
+        rules: {
+          default: [{ name: "incident", when: "Any incident." }],
+          channels: { [CHANNEL_ID]: [] },
+        },
+      }),
+      state,
+    });
+
+    h.sendPosted(makePost(ROOT_ID, "database is down"));
+    await sleep(50);
+    expect(h.decisionRequests).toHaveLength(0);
+    expect(h.executes).toHaveLength(0);
+  });
+
+  it("fails closed for failed and timed-out decisions", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({
+      proactivity: fakeProactivity(h),
+      state,
+    });
+    h.sendPosted(makePost(ROOT_ID, "@centaur start"));
+    await waitFor(() => h.executes.length === 1);
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+
+    h.decisionFail = 1;
+    h.sendPosted(makePost("failed-decision", "please decide", ROOT_ID));
+    await sleep(60);
+    expect(h.executes).toHaveLength(1);
+
+    h.decisionHold = newGate();
+    h.sendPosted(makePost("timed-out-decision", "please decide again", ROOT_ID));
+    await waitFor(() => h.decisionRequests.length === 2);
+    await sleep(150);
+    h.decisionHold.release();
+    await sleep(30);
+    expect(h.executes).toHaveLength(1);
+  });
+
+  it("steers a turn that starts while classifying instead of doubling it", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({
+      proactivity: fakeProactivity(h),
+      state,
+    });
+    h.sendPosted(makePost(ROOT_ID, "@centaur start"));
+    await waitFor(() => h.executes.length === 1);
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+
+    h.decisionHold = newGate();
+    h.decisionResponses.push(respondDecision());
+    h.sendPosted(makePost("classifying", "continue this", ROOT_ID));
+    await waitFor(() => h.decisionRequests.length === 1);
+    h.sendPosted(makePost("mention-takeover", "@centaur continue now", ROOT_ID));
+    await waitFor(() => h.executes.length === 2);
+    h.decisionHold.release();
+    await waitFor(() => appendedIds(h).includes("classifying"));
+    expect(h.executes).toHaveLength(2);
+  });
+
+  it("steers two accepted unmentioned replies into one active execution", async () => {
+    harness = startHarness();
+    const h = harness;
+    h.hold = newGate();
+    const state = createMemoryState();
+    await startBotAndConnect({
+      proactivity: fakeProactivity(h),
+      state,
+    });
+    h.sendPosted(makePost(ROOT_ID, "@centaur start"));
+    await waitFor(() => h.eventRequests.length === 1);
+    h.decisionResponses.push(respondDecision(), respondDecision());
+    h.sendPosted(makePost("accepted-one", "one", ROOT_ID));
+    h.sendPosted(makePost("accepted-two", "two", ROOT_ID));
+    await waitFor(() => appendedIds(h).includes("accepted-one"));
+    await waitFor(() => appendedIds(h).includes("accepted-two"));
+    expect(h.executes).toHaveLength(1);
+    expect(h.interrupts).toHaveLength(0);
+    h.hold.release();
+  });
+
+  it("treats an accepted unmentioned stop phrase as a steer, while a mentioned stop silences proactivity", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({
+      proactivity: fakeProactivity(h),
+      state,
+    });
+    h.sendPosted(makePost(ROOT_ID, "@centaur start"));
+    await waitFor(() => h.executes.length === 1);
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+
+    h.decisionResponses.push(respondDecision());
+    h.sendPosted(makePost("accepted-stop", "stop", ROOT_ID));
+    await waitFor(() => appendedIds(h).includes("accepted-stop"));
+    expect(h.interrupts).toHaveLength(0);
+
+    h.sendPosted(makePost("real-stop", "@centaur stop", ROOT_ID));
+    await waitFor(() => h.interrupts.length === 1);
+    h.sendPosted(makePost("silenced", "continue without mention", ROOT_ID));
+    await sleep(60);
+    expect(h.decisionRequests).toHaveLength(1);
+
+    h.sendPosted(makePost("resume", "@centaur resume", ROOT_ID));
+    await waitFor(() => h.executes.length === 2);
+    h.decisionResponses.push(respondDecision());
+    h.sendPosted(makePost("after-resume", "continue now", ROOT_ID));
+    await waitFor(() => h.executes.length === 3);
   });
 });

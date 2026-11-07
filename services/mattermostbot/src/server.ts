@@ -6,6 +6,8 @@ import {
   createFlagMessageOverridesStrategy,
   createOpenAiMessageOverridesStrategy,
 } from "./message-overrides-strategy";
+import { createOpenAiProactiveClassifier } from "./proactive-classifier";
+import { loadProactivityRules } from "./proactivity-rules";
 import { isHarnessEnabled, parseEnabledHarnesses } from "./overrides";
 
 const port = numberEnv("PORT", 3001);
@@ -73,6 +75,7 @@ const options: MattermostbotOptions = {
         nanocodex: optionalEnv("CODEX_MODEL_REASONING_EFFORT")!,
       }
     : {},
+  proactivity: createProactivityOptions(),
   messageOverridesStrategy: createMessageOverridesStrategy(),
   ackReactionEnabled: booleanEnv("MATTERMOSTBOT_ACK_REACTION_ENABLED", true),
   ackReactionName: stringEnv("MATTERMOSTBOT_ACK_REACTION", "eyes"),
@@ -143,6 +146,64 @@ function createMessageOverridesStrategy(): MattermostbotOptions["messageOverride
       "MATTERMOSTBOT_MESSAGE_OVERRIDES_TIMEOUT_MS",
     ),
   });
+}
+
+function proactivityClassifierBackend(): string {
+  return stringEnv("MATTERMOSTBOT_PROACTIVITY_CLASSIFIER", "openai").toLowerCase();
+}
+
+function createProactivityOptions(): MattermostbotOptions["proactivity"] {
+  if (!booleanEnv("MATTERMOSTBOT_PROACTIVITY_ENABLED", false)) return undefined;
+  return {
+    classifier: createProactiveClassifier(proactivityClassifierBackend()),
+    debounceMs: optionalNumberEnv("MATTERMOSTBOT_PROACTIVITY_DEBOUNCE_MS"),
+    rules: proactivityRules(),
+    timeoutMs: optionalNumberEnv("MATTERMOSTBOT_PROACTIVITY_TIMEOUT_MS"),
+  };
+}
+
+function proactivityRules(): NonNullable<
+  MattermostbotOptions["proactivity"]
+>["rules"] {
+  const dir = optionalEnv("MATTERMOSTBOT_PROACTIVITY_RULES_DIR");
+  if (!dir) return undefined;
+  try {
+    return loadProactivityRules(dir);
+  } catch (error) {
+    // Run without any rules rather than a partial set: a missing empty
+    // channel file would otherwise let the default rules apply there.
+    logger.warn("mattermostbot_proactivity_rules_unreadable", {
+      dir,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+}
+
+function createProactiveClassifier(
+  backend: string,
+): NonNullable<MattermostbotOptions["proactivity"]>["classifier"] {
+  switch (backend) {
+    case "openai": {
+      const apiKey =
+        optionalEnv("MATTERMOSTBOT_PROACTIVITY_OPENAI_API_KEY") ??
+        optionalEnv("OPENAI_API_KEY");
+      if (!apiKey) {
+        throw new Error(
+          "MATTERMOSTBOT_PROACTIVITY_OPENAI_API_KEY or OPENAI_API_KEY is required for the openai proactivity classifier",
+        );
+      }
+      return createOpenAiProactiveClassifier({
+        apiKey,
+        baseUrl: optionalEnv("MATTERMOSTBOT_PROACTIVITY_OPENAI_BASE_URL"),
+        model: stringEnv("MATTERMOSTBOT_PROACTIVITY_MODEL", "gpt-6-luna"),
+      });
+    }
+    default:
+      throw new Error(
+        `MATTERMOSTBOT_PROACTIVITY_CLASSIFIER must be "openai" (got "${backend}")`,
+      );
+  }
 }
 
 function optionalEnv(name: string): string | undefined {
