@@ -386,6 +386,16 @@ export const mattermostbotMetrics = {
     labelNames: ["outcome"],
     name: "mattermostbot_stop_commands_total",
   }),
+  slashCommands: counter({
+    help: "Mattermost slash commands by subcommand and outcome.",
+    labelNames: ["subcommand", "outcome"],
+    name: "mattermostbot_slash_commands_total",
+  }),
+  workflowActions: counter({
+    help: "Mattermost workflow button actions by outcome.",
+    labelNames: ["outcome"],
+    name: "mattermostbot_workflow_actions_total",
+  }),
   websocketConnected: gauge({
     help: "1 when the Mattermost websocket is connected, else 0. Sampled on each scrape.",
     name: "mattermostbot_websocket_connected",

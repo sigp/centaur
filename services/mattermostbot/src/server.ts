@@ -101,6 +101,8 @@ const options: MattermostbotOptions = {
   maxPostChars: optionalNumberEnv("MATTERMOSTBOT_MAX_POST_CHARS"),
   postgresUrl,
   stateKeyPrefix: optionalEnv("MATTERMOSTBOT_STATE_KEY_PREFIX"),
+  slashCommandTokens: optionalList("MATTERMOSTBOT_SLASH_COMMAND_TOKENS"),
+  slashWorkflows: optionalList("MATTERMOSTBOT_SLASH_WORKFLOWS"),
   teamAllowlist: optionalList("MATTERMOSTBOT_TEAM_ALLOWLIST"),
   triggerBotAllowlist: optionalList("MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST"),
   userName: stringEnv("MATTERMOSTBOT_USER_NAME", "centaur"),

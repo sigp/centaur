@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   harnessToChatSdkStream,
   type CodexAppServerToChatStreamOptions,
@@ -6,6 +6,7 @@ import {
 import { createPostgresState } from "@chat-adapter/state-pg";
 import {
   Chat,
+  Message as ChatSdkMessage,
   type Adapter,
   type Logger,
   type Message as ChatMessage,
@@ -19,10 +20,12 @@ import {
 import { Hono } from "hono";
 import pg from "pg";
 import {
+  encodeMattermostThreadKey,
   fetchMattermostChannel,
   isAllowedMattermostMessage,
   isMattermostAllowlistEmpty,
   resolveMattermostConversationName,
+  resolveMattermostTeamAllowlist,
 } from "./mattermost-allowlist";
 import { resolveChannelDefault } from "./channel-defaults";
 import {
@@ -79,6 +82,8 @@ import type {
 import {
   AsyncTextQueue,
   errorMessage,
+  isJsonObject,
+  stringValue,
   TeamExecutionLimiter,
   noopLogger,
   nowMs,
@@ -401,11 +406,643 @@ export function createMattermostbot(
     });
   });
 
+  app.post("/api/mattermost/actions", async (context) => {
+    const body = await context.req.raw
+      .json()
+      .catch(() => undefined) as unknown;
+    if (!isJsonObject(body)) {
+      mattermostbotMetrics.workflowActions.inc({ outcome: "malformed" });
+      return context.json({ error: "Invalid workflow action context." }, 400);
+    }
+    const actionContext = isJsonObject(body.context) ? body.context : undefined;
+    const actionValue =
+      typeof actionContext?.centaur_workflow_action === "string"
+        ? actionContext.centaur_workflow_action
+        : undefined;
+    const button =
+      typeof actionContext?.button === "string" ? actionContext.button : undefined;
+    const actionMatch = actionValue?.match(
+      /^centaur\.workflow\.action:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}):([a-zA-Z0-9_-]{1,64})$/,
+    );
+    const userId = stringValue(body.user_id);
+    const userName = stringValue(body.user_name);
+    const channelId = stringValue(body.channel_id);
+    const teamId = stringValue(body.team_id);
+    const postId = stringValue(body.post_id);
+    const triggerId = stringValue(body.trigger_id) ?? "";
+    if (
+      !actionMatch ||
+      !button ||
+      !userId ||
+      !userName ||
+      !channelId ||
+      !teamId ||
+      !postId
+    ) {
+      mattermostbotMetrics.workflowActions.inc({ outcome: "malformed" });
+      return context.json({ error: "Invalid workflow action context." }, 400);
+    }
+    const actionId = actionMatch[2]!;
+    const groupId = actionMatch[1]!;
+    const channel = await authorizedMattermostChannel(
+      options,
+      channelId,
+      teamId,
+    );
+    if (!channel) {
+      mattermostbotMetrics.workflowActions.inc({ outcome: "rejected" });
+      return context.json(
+        { ephemeral_text: "This request is no longer available." },
+        200,
+      );
+    }
+    const postResponse = await mattermostRequest(
+      options,
+      `/api/v4/posts/${encodeURIComponent(postId)}`,
+      { method: "GET" },
+    ).catch(() => undefined);
+    if (!postResponse || !postResponse.ok) {
+      const unavailable =
+        postResponse !== undefined &&
+        [400, 401, 403, 404].includes(postResponse.status);
+      mattermostbotMetrics.workflowActions.inc({
+        outcome: unavailable ? "unavailable" : "error",
+      });
+      return context.json(
+        {
+          ephemeral_text: unavailable
+            ? "This request is no longer available."
+            : "Centaur couldn't start this right now. Try again.",
+        },
+        200,
+      );
+    }
+    const post = await postResponse.json().catch(() => undefined) as unknown;
+    if (!isJsonObject(post) || post.channel_id !== channelId) {
+      mattermostbotMetrics.workflowActions.inc({ outcome: "rejected" });
+      return context.json(
+        { ephemeral_text: "This request is no longer available." },
+        200,
+      );
+    }
+    const idempotencyKey =
+      "mattermost.button:" +
+      sha256Hex(
+        JSON.stringify([
+          teamId,
+          channelId,
+          userId,
+          postId,
+          actionId,
+          triggerId,
+        ]),
+      );
+    const invokeResponse = await apiRequest(
+      options,
+      "/api/workflows/actions/invoke",
+      {
+        platform: "mattermost",
+        button,
+        idempotency_key: idempotencyKey,
+        click: {
+          id: groupId,
+          action: actionId,
+          channel_id: channelId,
+          post_id: postId,
+          team_id: teamId,
+          user_id: userId,
+          user_name: userName,
+          trigger_id: triggerId,
+        },
+      },
+    ).catch(() => undefined);
+    if (!invokeResponse || !invokeResponse.ok) {
+      const unavailable =
+        invokeResponse !== undefined &&
+        [400, 401, 403, 404].includes(invokeResponse.status);
+      mattermostbotMetrics.workflowActions.inc({
+        outcome: unavailable ? "unavailable" : "error",
+      });
+      return context.json(
+        {
+          ephemeral_text: unavailable
+            ? "This request is no longer available."
+            : "Centaur couldn't start this right now. Try again.",
+        },
+        200,
+      );
+    }
+    const invokeResult = await invokeResponse.json().catch(() => undefined) as unknown;
+    if (!isJsonObject(invokeResult) || typeof invokeResult.created !== "boolean") {
+      mattermostbotMetrics.workflowActions.inc({ outcome: "error" });
+      return context.json(
+        { ephemeral_text: "Centaur couldn't start this right now. Try again." },
+        200,
+      );
+    }
+    if (!invokeResult.created) {
+      mattermostbotMetrics.workflowActions.inc({ outcome: "duplicate" });
+      return context.json(
+        { ephemeral_text: "This action is already being processed." },
+        200,
+      );
+    }
+    const label =
+      typeof actionContext?.label === "string" ? actionContext.label : actionId;
+    mattermostbotMetrics.workflowActions.inc({ outcome: "created" });
+    const status = `⏳ ${label}: Processing…`;
+    const props = processingActionProps(post.props, groupId, status);
+    // Without a safe update the buttons stay, so tell the clicker instead.
+    return context.json(
+      props
+        ? {
+            update: {
+              message: typeof post.message === "string" ? post.message : "",
+              props,
+            },
+          }
+        : { ephemeral_text: status },
+      200,
+    );
+  });
+
+  app.post("/api/mattermost/commands", async (context) => {
+    const tokens = options.slashCommandTokens ?? [];
+    if (tokens.length === 0) return new Response(null, { status: 404 });
+    const form = await context.req.raw.formData().catch(() => undefined);
+    if (!form) {
+      mattermostbotMetrics.slashCommands.inc({
+        outcome: "malformed",
+        subcommand: "unknown",
+      });
+      return context.json({ response_type: "ephemeral", text: "Invalid slash command request." }, 400);
+    }
+    const suppliedToken = form.get("token");
+    if (
+      typeof suppliedToken !== "string" ||
+      !tokens.some((token) => constantTimeEqual(token, suppliedToken))
+    ) {
+      mattermostbotMetrics.slashCommands.inc({
+        outcome: "unauthorized",
+        subcommand: "unknown",
+      });
+      return new Response(null, { status: 401 });
+    }
+    const formString = (name: string): string | undefined => {
+      const value = form.get(name);
+      return typeof value === "string" && value.length > 0 ? value : undefined;
+    };
+    const teamId = formString("team_id");
+    const channelId = formString("channel_id");
+    const userId = formString("user_id");
+    const userName = formString("user_name");
+    // Mattermost sends the thread's root post id when the command is typed in
+    // a thread's reply box, and an empty value in the channel.
+    const rootId = formString("root_id");
+    const text = (formString("text") ?? "").trim();
+    const commandWord = text.split(/\s+/, 1)[0]?.toLowerCase() ?? "";
+    const finish = (
+      outcome: string,
+      response: Response,
+      subcommand = commandWord || "help",
+    ): Response => {
+      mattermostbotMetrics.slashCommands.inc({ outcome, subcommand });
+      return response;
+    };
+    if (!teamId || !channelId || !userId || !userName) {
+      return finish(
+        "malformed",
+        context.json(
+          { response_type: "ephemeral", text: "This command is not available in this channel." },
+          200,
+        ),
+        commandWord || "unknown",
+      );
+    }
+    const channel = await authorizedMattermostChannel(
+      options,
+      channelId,
+      teamId,
+    );
+    if (!channel) {
+      return finish(
+        "rejected",
+        context.json(
+          { response_type: "ephemeral", text: "This command is not available in this channel." },
+          200,
+        ),
+      );
+    }
+    if (!commandWord || commandWord === "help") {
+      return finish(
+        "help",
+        context.json(
+          {
+            response_type: "ephemeral",
+            text:
+              "Usage: `/centaur run <workflow> [JSON]`, `/centaur stop` inside a thread, or type a prompt.",
+          },
+          200,
+        ),
+        "help",
+      );
+    }
+    if (commandWord === "stop") {
+      if (!rootId) {
+        return finish(
+          "no_thread",
+          context.json(
+            {
+              response_type: "ephemeral",
+              text: "Run `/centaur stop` inside the thread you want to stop.",
+            },
+            200,
+          ),
+        );
+      }
+      const outcome = await stopThreadExecution(
+        chat.thread(encodeMattermostThreadKey(channelId, rootId)),
+        {
+          messageId: formString("trigger_id") ?? rootId,
+          requestedAtMs: Date.now(),
+          userId,
+        },
+        options,
+      );
+      return finish(
+        outcome,
+        context.json(
+          { response_type: "ephemeral", text: SLASH_STOP_REPLIES[outcome] },
+          200,
+        ),
+      );
+    }
+    if (commandWord === "run") {
+      const runMatch = text.match(/^\S+\s+(\S+)(?:\s+([\s\S]*))?$/);
+      const workflowName = runMatch?.[1];
+      if (!workflowName) {
+        return finish(
+          "invalid",
+          context.json(
+            {
+              response_type: "ephemeral",
+              text:
+                "Usage: `/centaur run <workflow> [JSON]`.",
+            },
+            200,
+          ),
+        );
+      }
+      if (!(options.slashWorkflows ?? []).includes(workflowName)) {
+        return finish(
+          "not_allowlisted",
+          context.json(
+            { response_type: "ephemeral", text: `Workflow \`${workflowName}\` is not allowed.` },
+            200,
+          ),
+        );
+      }
+      let input: Record<string, unknown> = {};
+      const inputText = runMatch?.[2]?.trim();
+      if (inputText) {
+        try {
+          const parsed = JSON.parse(inputText) as unknown;
+          if (!isJsonObject(parsed)) throw new Error("object required");
+          input = parsed;
+        } catch {
+          return finish(
+            "invalid",
+            context.json(
+              { response_type: "ephemeral", text: "The workflow input must be a JSON object." },
+              200,
+            ),
+          );
+        }
+      }
+      const noticeText = `@${userName} started workflow \`${workflowName}\``;
+      const notice = await postMattermostMessage(
+        options,
+        channelId,
+        noticeText,
+        rootId,
+      ).catch(() => undefined);
+      if (!notice?.id) {
+        return finish(
+          "error",
+          context.json(
+            { response_type: "ephemeral", text: "Centaur couldn't start this right now. Try again." },
+            200,
+          ),
+        );
+      }
+      const mattermost = {
+        team_id: teamId,
+        channel_id: channelId,
+        user_id: userId,
+        user_name: userName,
+        root_id: rootId ?? notice.id,
+      };
+      const payload: Record<string, unknown> = {
+        workflow_name: workflowName,
+        input: { ...input, mattermost },
+        idempotency_key:
+          "mattermost.command:" +
+          (formString("trigger_id") ||
+            sha256Hex(formPayload(form))),
+      };
+      const runResponse = await apiRequest(
+        options,
+        "/api/workflows/runs",
+        payload,
+      ).catch(() => undefined);
+      if (!runResponse || !runResponse.ok) {
+        await editMattermostPost(
+          options,
+          notice.id,
+          `${noticeText}\n\nCentaur couldn't start this workflow.`,
+        ).catch(() => undefined);
+        return finish(
+          "error",
+          context.json(
+            { response_type: "ephemeral", text: "Centaur couldn't start this right now. Try again." },
+            200,
+          ),
+        );
+      }
+      const runResult = await runResponse.json().catch(() => undefined) as unknown;
+      const runId = isJsonObject(runResult) ? stringValue(runResult.run_id) : undefined;
+      if (!runId) {
+        await editMattermostPost(
+          options,
+          notice.id,
+          `${noticeText}\n\nCentaur couldn't start this workflow.`,
+        ).catch(() => undefined);
+        return finish(
+          "error",
+          context.json(
+            { response_type: "ephemeral", text: "Centaur couldn't start this right now. Try again." },
+            200,
+          ),
+        );
+      }
+      return finish(
+        "started",
+        context.json(
+          { response_type: "ephemeral", text: `Started \`${workflowName}\` (run ${runId}).` },
+          200,
+        ),
+      );
+    }
+
+    const prompt = text;
+    const noticeText = `@${userName} asked: ${prompt}`;
+    const notice = await postMattermostMessage(
+      options,
+      channelId,
+      noticeText,
+      rootId,
+    ).catch(() => undefined);
+    if (!notice?.id) {
+      return finish(
+        "error",
+        context.json(
+          { response_type: "ephemeral", text: "Centaur couldn't start this right now. Try again." },
+          200,
+        ),
+        "prompt",
+      );
+    }
+    // Typed in a thread, the prompt joins that thread's conversation and
+    // steers or follows its turn like a mention there; typed in the channel,
+    // it opens a new thread under the notice.
+    const threadId = encodeMattermostThreadKey(channelId, rootId ?? notice.id);
+    const thread = chat.thread(threadId);
+    try {
+      await thread.subscribe();
+    } catch (error) {
+      logger.warn("mattermostbot_slash_prompt_subscribe_failed", {
+        error: errorMessage(error),
+        message_id: notice.id,
+        thread_id: threadId,
+      });
+      return finish(
+        "error",
+        context.json(
+          { response_type: "ephemeral", text: "Centaur couldn't start this right now. Try again." },
+          200,
+        ),
+        "prompt",
+      );
+    }
+    const syntheticMessage = new ChatSdkMessage({
+      attachments: [],
+      author: {
+        fullName: userName,
+        isBot: false,
+        isMe: false,
+        userId,
+        userName,
+      },
+      formatted: {
+        type: "root",
+        children: [
+          {
+            type: "paragraph",
+            children: [{ type: "text", value: prompt }],
+          },
+        ],
+      } as ChatMessage["formatted"],
+      id: notice.id,
+      isMention: true,
+      metadata: {
+        dateSent: new Date(
+          typeof notice.create_at === "number" ? notice.create_at : Date.now(),
+        ),
+        edited: false,
+      },
+      raw: notice,
+      text: prompt,
+      threadId,
+    });
+    backgroundWaitUntil(
+      syncThreadMessageToSession(thread, syntheticMessage, {
+        executionLimiter,
+        mode: "execute",
+        options,
+        reactions,
+        state,
+      }).catch((error) => {
+        logger.warn("mattermostbot_slash_prompt_failed", {
+          error: errorMessage(error),
+          message_id: notice.id,
+          thread_id: threadId,
+        });
+      }),
+    );
+    return finish("started", context.json({}, 200), "prompt");
+  });
+
   if (options.recoverRenderObligationsOnStart !== false) {
     scheduleRenderObligationRecovery(chat, state, options, reactions);
   }
 
   return { app, chat, adapter };
+}
+
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+  const leftDigest = createHash("sha256").update(left).digest();
+  const rightDigest = createHash("sha256").update(right).digest();
+  return timingSafeEqual(leftDigest, rightDigest);
+}
+
+function formPayload(form: FormData): string {
+  const payload: Record<string, string> = {};
+  for (const [key, value] of form.entries()) {
+    payload[key] = typeof value === "string" ? value : "";
+  }
+  return JSON.stringify(payload);
+}
+
+async function mattermostRequest(
+  options: MattermostbotOptions,
+  path: string,
+  init: RequestInit,
+): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set("authorization", `Bearer ${options.botToken}`);
+  if (init.body !== undefined && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+  return (options.fetch ?? globalThis.fetch)(
+    `${options.baseUrl.replace(/\/$/, "")}${path}`,
+    { ...init, headers },
+  );
+}
+
+async function apiRequest(
+  options: MattermostbotOptions,
+  path: string,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+  };
+  if (options.apiKey) headers.authorization = `Bearer ${options.apiKey}`;
+  return (options.fetch ?? globalThis.fetch)(
+    new URL(path, `${options.apiUrl.replace(/\/$/, "")}/`),
+    {
+      body: JSON.stringify(body),
+      headers,
+      method: "POST",
+    },
+  );
+}
+
+async function authorizedMattermostChannel(
+  options: MattermostbotOptions,
+  channelId: string,
+  requestTeamId?: string,
+): Promise<{ team_id?: string; type?: string } | undefined> {
+  const channel = await fetchMattermostChannel(options, channelId).catch(
+    () => undefined,
+  );
+  if (!channel) return undefined;
+  if (channel.type === "D" || channel.type === "G") return undefined;
+  const allowlist = resolveMattermostTeamAllowlist(options);
+  if (!channel.team_id || !allowlist.includes(channel.team_id)) return undefined;
+  if (requestTeamId !== undefined && channel.team_id !== requestTeamId) {
+    return undefined;
+  }
+  return channel;
+}
+
+type MattermostPostRecord = Record<string, unknown> & {
+  id: string;
+  channel_id: string;
+  message?: string;
+  props?: unknown;
+  create_at?: number;
+};
+
+async function postMattermostMessage(
+  options: MattermostbotOptions,
+  channelId: string,
+  message: string,
+  rootId?: string,
+): Promise<MattermostPostRecord> {
+  const response = await mattermostRequest(options, "/api/v4/posts", {
+    body: JSON.stringify({
+      channel_id: channelId,
+      message,
+      ...(rootId ? { root_id: rootId } : {}),
+    }),
+    method: "POST",
+  });
+  if (!response.ok) throw new Error(`Mattermost post failed: ${response.status}`);
+  const result = await response.json() as unknown;
+  if (!isJsonObject(result) || typeof result.id !== "string") {
+    throw new Error("Mattermost post response was invalid");
+  }
+  return result as MattermostPostRecord;
+}
+
+async function editMattermostPost(
+  options: MattermostbotOptions,
+  postId: string,
+  message: string,
+): Promise<void> {
+  const response = await mattermostRequest(
+    options,
+    `/api/v4/posts/${encodeURIComponent(postId)}`,
+    {
+      body: JSON.stringify({ id: postId, message }),
+      method: "PUT",
+    },
+  );
+  if (!response.ok) throw new Error(`Mattermost post edit failed: ${response.status}`);
+}
+
+/**
+ * Mattermost strips action integrations from posts it returns to clients, so
+ * the copy fetched here cannot be sent back with live buttons. Replace the
+ * clicked group's buttons (ctx.mattermost_buttons ids are "cw" + the group's
+ * hex) with a status line only when no other button shares the post; otherwise
+ * return undefined and leave the post alone.
+ */
+function processingActionProps(
+  props: unknown,
+  groupId: string,
+  status: string,
+): JsonObject | undefined {
+  if (!isJsonObject(props) || !Array.isArray(props.attachments)) return undefined;
+  const idPrefix = `cw${groupId.replaceAll("-", "")}`;
+  let replaced = false;
+  const attachments: unknown[] = [];
+  for (const attachment of props.attachments) {
+    if (
+      !isJsonObject(attachment) ||
+      !Array.isArray(attachment.actions) ||
+      attachment.actions.length === 0
+    ) {
+      attachments.push(attachment);
+      continue;
+    }
+    const allInGroup = attachment.actions.every(
+      (action) =>
+        isJsonObject(action) && stringValue(action.id)?.startsWith(idPrefix) === true,
+    );
+    if (!allInGroup) return undefined;
+    replaced = true;
+    const { actions: _actions, ...rest } = attachment;
+    const text = stringValue(attachment.text) ?? "";
+    attachments.push({ ...rest, text: text ? `${text}\n${status}` : status });
+  }
+  return replaced ? ({ ...props, attachments } as JsonObject) : undefined;
 }
 
 function createMattermostHealthAdapter(config: {
@@ -517,15 +1154,27 @@ function compareProactiveMessages(
   return left.id.localeCompare(right.id);
 }
 
-async function handleStopCommand(
+type StopOutcome = "interrupted" | "nothing_to_interrupt" | "failed";
+
+const SLASH_STOP_REPLIES: Record<StopOutcome, string> = {
+  failed: "Couldn't confirm the stop. The agent may still be working.",
+  interrupted: "Stopped the current turn.",
+  nothing_to_interrupt: "Nothing is running in this thread.",
+};
+
+/**
+ * Records a stop for the thread and interrupts its running api-rs execution.
+ * Shared by a mentioned stop phrase and `/centaur stop` typed in the thread;
+ * posts sent up to `requestedAtMs` no longer start a turn.
+ */
+async function stopThreadExecution(
   thread: Thread<MattermostbotThreadState>,
-  message: ChatMessage,
+  request: { messageId: string; requestedAtMs: number; userId: string },
   options: MattermostbotOptions,
-): Promise<boolean> {
-  if (!isMattermostStopCommand(message)) return false;
+): Promise<StopOutcome> {
   const trace: MattermostbotTrace = {
     includeContext: false,
-    messageId: message.id,
+    messageId: request.messageId,
     mode: "append",
     openStream: false,
     startedAtMs: nowMs(),
@@ -534,13 +1183,13 @@ async function handleStopCommand(
   const latest = (await thread.state) ?? {};
   await thread.setState({
     proactiveEligible: false,
-    stopRequestedAt: message.metadata.dateSent.getTime(),
+    stopRequestedAt: request.requestedAtMs,
   });
   try {
     const response = await interruptSessionExecution(
       options,
       thread.id,
-      `Interrupted from Mattermost by ${message.author.userId}`,
+      `Interrupted from Mattermost by ${request.userId}`,
     );
     if (response.interrupted) {
       await thread.setState({
@@ -551,18 +1200,38 @@ async function handleStopCommand(
         renderObligation: null,
       });
     }
-    mattermostbotMetrics.stopCommands.inc({
-      outcome: response.interrupted ? "interrupted" : "nothing_to_interrupt",
-    });
+    const outcome = response.interrupted ? "interrupted" : "nothing_to_interrupt";
+    mattermostbotMetrics.stopCommands.inc({ outcome });
     traceLog(options, "mattermostbot_stop_command_complete", trace, {
       execution_id: response.execution_id,
       interrupted: response.interrupted,
     });
+    return outcome;
   } catch (error) {
     traceLog(options, "mattermostbot_stop_command_failed", trace, {
       error: errorMessage(error),
     });
     mattermostbotMetrics.stopCommands.inc({ outcome: "failed" });
+    return "failed";
+  }
+}
+
+async function handleStopCommand(
+  thread: Thread<MattermostbotThreadState>,
+  message: ChatMessage,
+  options: MattermostbotOptions,
+): Promise<boolean> {
+  if (!isMattermostStopCommand(message)) return false;
+  const outcome = await stopThreadExecution(
+    thread,
+    {
+      messageId: message.id,
+      requestedAtMs: message.metadata.dateSent.getTime(),
+      userId: message.author.userId,
+    },
+    options,
+  );
+  if (outcome === "failed") {
     await thread
       .post("Couldn't confirm the stop. The agent may still be working.")
       .catch(() => undefined);

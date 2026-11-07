@@ -12,7 +12,26 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
 - Mattermost uses background post-and-edit streaming. The handler only performs
   the session create/append handoff, so mentioned follow-ups are appended while
   an execution is active instead of being dropped by the thread lock.
-  Unmentioned subscribed-thread posts never reach a running turn on their own:
+
+- `POST /api/mattermost/actions` accepts Mattermost interactive workflow
+  actions only after validating the api-rs-signed button context, resolving the
+  channel through Mattermost REST, and checking the clicked post's channel.
+  Mattermost does not sign action requests; never treat the callback body alone
+  as authentication. Posts fetched through REST have their action
+  integrations stripped, so never send a fetched post's props back with live
+  buttons in them: the click update only replaces a post whose every button
+  belongs to the clicked group (ids `cw` + group hex).
+- `POST /api/mattermost/commands` accepts form-encoded `/centaur` requests
+  only with a configured constant-time token match. `run` is restricted to
+  `MATTERMOSTBOT_SLASH_WORKFLOWS`; prompts reuse the normal mention turn flow
+  with a synthetic user-authored message. A command typed in a thread's reply
+  box carries that thread's `root_id`: prompts and `run` notices stay in the
+  thread, and `stop` interrupts its turn through the same
+  `stopThreadExecution` as a mentioned stop. Slash replies use Mattermost's
+  command response (`response_type`, `text`); `ephemeral_text` belongs to
+  action responses only and Mattermost ignores it on a slash command.
+
+- Unmentioned subscribed-thread posts never reach a running turn on their own:
   the next mention collects them as context. With proactivity enabled they are
   classified once a mention makes the thread eligible, and operator rules can
   also match unmentioned top-level posts and start a reply thread. A rule's
@@ -84,6 +103,8 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
 | `CODEX_MODEL_REASONING_EFFORT` | No | Codex/Nanocodex default reasoning. |
 | `CENTAUR_PI_MODEL`, `CENTAUR_OMP_MODEL` | No | Pi/OMP deployment model defaults. |
 | `MATTERMOSTBOT_TEAM_ALLOWLIST` | Yes to do anything | Comma/space-separated Mattermost team IDs. Empty means inert. |
+| `MATTERMOSTBOT_SLASH_COMMAND_TOKENS` | No | Comma/space-separated slash-command tokens. Unset or empty disables `/api/mattermost/commands`; keep secret. |
+| `MATTERMOSTBOT_SLASH_WORKFLOWS` | No | Comma/space-separated workflow names allowed by `/centaur run`; empty disables `run`. |
 | `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST` | No | Comma/space-separated bot author IDs allowed to trigger or append. Empty means all bot posts are ignored. |
 | `MATTERMOSTBOT_MAX_POST_CHARS` | No | Maximum answer post size; defaults to `16000`, below Mattermost's default `16383` limit. |
 | `MATTERMOSTBOT_RESPONSE_METADATA_MODE` | No | Model footer mode: `first` (default), `always`, or `never`. |
@@ -100,7 +121,16 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
 4. Record the team IDs and set `MATTERMOSTBOT_TEAM_ALLOWLIST`; the service intentionally does nothing until this is set.
 5. Give the bot permission to read channel history and create/edit posts.
 
-The service does not use interactive callbacks in this version, so do not configure a callback URL or `MATTERMOST_CALLBACK_SECRET`.
+6. In Mattermost **Product menu → Integrations → Slash Commands**, create
+   `/centaur` with `POST` and request URL
+   `<publicUrl>/api/mattermost/commands`; store its token in
+   `MATTERMOSTBOT_SLASH_COMMAND_TOKENS` and configure workflow names in
+   `MATTERMOSTBOT_SLASH_WORKFLOWS`.
+
+Workflow button callbacks use
+`https://<host>/api/mattermost/actions`. Mattermost does not sign action
+requests; api-rs signs the button context and the bot verifies the clicked post
+and channel before invoking it.
 
 ## Develop and test
 

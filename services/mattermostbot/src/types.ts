@@ -211,6 +211,14 @@ export type MattermostbotOptions = {
   state?: StateAdapter;
   stateKeyPrefix?: string;
   /**
+   * Mattermost slash command tokens. An empty list disables the command route.
+   */
+  slashCommandTokens?: readonly string[];
+  /**
+   * Workflow names allowed by the Mattermost slash command `run` subcommand.
+   */
+  slashWorkflows?: readonly string[];
+  /**
    * Mattermost team ids the bot serves. Fail-closed: empty/unset means the bot
    * ignores every message; DMs and group messages are always denied.
    */
