@@ -47,6 +47,15 @@ spec:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "console") | nindent 8 }}
     spec:
       automountServiceAccountToken: false
+      # Thruster, the image's default command, listens on :80 with every
+      # capability dropped. containerd 2.x and k3s treat every port as
+      # unprivileged, but containerd 1.7 keeps the kernel's 1024 floor and the
+      # console crash-loops on the bind. The sysctl is scoped to the pod's
+      # network namespace and on Kubernetes' safe list, so it grants nothing else.
+      securityContext:
+        sysctls:
+          - name: net.ipv4.ip_unprivileged_port_start
+            value: "0"
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
 {{ toYaml . | nindent 8 }}

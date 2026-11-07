@@ -7,10 +7,11 @@ use centaur_sandbox_core::{
 };
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvFromSource,
-    EnvVar as K8sEnvVar, HTTPGetAction, KeyToPath, Pod, PodSpec, Probe, ProjectedVolumeSource,
-    ResourceClaim as K8sResourceClaim, ResourceRequirements as K8sResourceRequirements,
-    SecretEnvSource, SecretProjection, SecurityContext, Service, ServicePort, ServiceSpec, Volume,
-    VolumeMount, VolumeProjection,
+    EnvVar as K8sEnvVar, HTTPGetAction, KeyToPath, Pod, PodSecurityContext, PodSpec, Probe,
+    ProjectedVolumeSource, ResourceClaim as K8sResourceClaim,
+    ResourceRequirements as K8sResourceRequirements, SecretEnvSource, SecretProjection,
+    SecurityContext, Service, ServicePort, ServiceSpec, Sysctl, Volume, VolumeMount,
+    VolumeProjection,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -52,6 +53,12 @@ const PROXY_TLS_CA_KEY_PATH: &str = "/etc/iron-proxy/ca.key";
 const PROXY_UPSTREAM_RESPONSE_HEADER_TIMEOUT: &str = "120s";
 const PROXY_UPSTREAM_DENY_CIDRS_ENV: &str = "IRON_PROXY_UPSTREAM_DENY_CIDRS";
 const PROXY_LOG_LEVEL: &str = "info";
+// iron-proxy binds ports below 1024 (DNS on PROXY_DNS_LISTEN) with every
+// capability dropped. containerd 2.x and k3s treat every port as unprivileged,
+// but containerd 1.7 keeps the kernel's 1024 floor and the bind fails. The
+// sysctl is scoped to the pod's network namespace and on Kubernetes' safe
+// list, so it grants nothing else and needs no kubelet allowlist.
+const UNPRIVILEGED_PORT_START_SYSCTL: &str = "net.ipv4.ip_unprivileged_port_start";
 // iron-control multiplexes every Postgres upstream through a single listener,
 // routing by database name; the control plane owns each upstream DSN/role/
 // database. api-rs binds one local port (matching the chart's pgPort) and one
@@ -1571,6 +1578,14 @@ fn build_iron_proxy_pod(
         ),
         spec: Some(PodSpec {
             automount_service_account_token: Some(false),
+            // Lets the proxy bind its ports below 1024 (UNPRIVILEGED_PORT_START_SYSCTL).
+            security_context: Some(PodSecurityContext {
+                sysctls: Some(vec![Sysctl {
+                    name: UNPRIVILEGED_PORT_START_SYSCTL.to_owned(),
+                    value: "0".to_owned(),
+                }]),
+                ..Default::default()
+            }),
             // OnFailure so a crashed/OOM-killed proxy container is restarted
             // in place (same pod IP, Service keeps routing) instead of leaving
             // the pod Failed and the sandbox with no egress for the rest of
@@ -2818,6 +2833,29 @@ mod tests {
         let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved(), &sync, no_scheduling());
 
         assert!(pod.spec.as_ref().unwrap().containers[0].resources.is_none());
+    }
+
+    #[test]
+    fn iron_proxy_pod_can_bind_ports_below_1024() {
+        let id = SandboxId::new("asbx-test");
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let sync = ProxySyncEnv {
+            proxy_id: "iprx_test".to_owned(),
+            control_url: "http://console:3000".to_owned(),
+            token: "proxy-token".to_owned(),
+        };
+
+        let pod = build_iron_proxy_pod(&id, &iron_proxy, &resolved(), &sync, no_scheduling());
+
+        // Without it the DNS listener on :53 fails on runtimes that keep the
+        // kernel's 1024 floor (containerd 1.7).
+        assert_eq!(
+            pod.spec.unwrap().security_context.unwrap().sysctls,
+            Some(vec![Sysctl {
+                name: "net.ipv4.ip_unprivileged_port_start".to_owned(),
+                value: "0".to_owned(),
+            }])
+        );
     }
 
     #[test]
