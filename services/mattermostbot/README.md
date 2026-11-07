@@ -6,13 +6,14 @@ Mattermost chat ingress for the Centaur agent. The service uses Chat SDK's `chat
 
 - A mentioned stop command (`stop`, `cancel`, `kill`, or `end`, with common
   polite variants) interrupts the api-rs execution and never starts a new turn.
-
-- Unmentioned posts in a subscribed thread are classified when the thread became
-  eligible through a mention. Operator rules can also classify unmentioned
-  top-level channel posts and start a reply thread; the first matching rule
-  wins. A rule's `context` is sent only on the first execution in a harness.
-  Proactivity is the exception to mention gating, and a stop silences it until
-  the next mention.
+- Mention gating: an unmentioned post in a subscribed thread does not reach the
+  agent on its own; the next mention brings it in as context. With proactivity
+  enabled, such a post in a thread made eligible by a mention goes to the
+  classifier, and an accepted one is handled like a mentioned follow-up.
+  Operator rules can also match unmentioned top-level channel posts and start a
+  reply thread; the first matching rule wins, and its `context` rides only on
+  the first execution it starts in a thread (again after a harness restart). A
+  stop silences proactive replies until the next mention.
 - Proactive decisions use the OpenAI Decisions API after the debounce quiet
   period (idle threads only). A burst is judged as one message; a mention takes
   over the burst, and classifier failures or timeouts do not reply.
@@ -30,7 +31,11 @@ Mattermost chat ingress for the Centaur agent. The service uses Chat SDK's `chat
   defaults.
 - Attachment downloads send the bot token only to the configured Mattermost
   origin. History-fetch failures release the team execution slot and post an
-  in-thread permission/error notice.
+  in-thread error notice.
+- Successful replies can end with a trailing model footer. `first` shows it on
+  the first assistant reply in a thread, `always` on every reply, and `never`
+  suppresses it. If the footer would exceed `MATTERMOSTBOT_MAX_POST_CHARS`, it
+  is posted as a short separate reply. `GET /metrics` serves Prometheus text.
 
 Run one replica per bot token. Two consumers on one Mattermost token receive the same WebSocket events and can execute a turn twice. Deploy with one replica and a `Recreate` strategy.
 
@@ -71,8 +76,46 @@ Run one replica per bot token. Two consumers on one Mattermost token receive the
 | `MATTERMOSTBOT_TEAM_ALLOWLIST` | Yes to do anything | Comma/space-separated team IDs. Empty means inert. |
 | `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST` | No | Comma/space-separated bot author IDs allowed to trigger or append. |
 | `MATTERMOSTBOT_MAX_POST_CHARS` | No | Maximum answer post size; defaults to `16000` (below Mattermost's default `16383` limit). |
+| `MATTERMOSTBOT_RESPONSE_METADATA_MODE` | No | Model footer mode: `first` (default), `always`, or `never`. |
+| `MATTERMOSTBOT_RESPONSE_SERVICE_TIER_ENABLED` | No | Include the configured Codex service tier in the footer; defaults to `false`. |
+| `MATTERMOSTBOT_STATE_KEY_PREFIX` | No | State row prefix; defaults to `centaur-mattermostbot`. |
 | `SESSION_IDLE_TIMEOUT_MS` | No | Forwarded to api-rs execute. |
 | `SESSION_MAX_DURATION_MS` | No | Forwarded to api-rs execute. |
+
+## Metrics
+
+`GET /metrics` on `PORT` returns Prometheus text. All series are always
+registered and use the `mattermostbot_` prefix. Labels are listed in
+parentheses; a dash means no labels:
+
+- `mattermostbot_active_live_renders` (—)
+- `mattermostbot_executions_completed_total` (—)
+- `mattermostbot_executions_failed_total` (`reason`)
+- `mattermostbot_executions_interrupted_total` (—)
+- `mattermostbot_executions_started_total` (—)
+- `mattermostbot_forward_retries_total` (`outcome`)
+- `mattermostbot_info` (—)
+- `mattermostbot_last_successful_render_timestamp_seconds` (`source`)
+- `mattermostbot_message_override_fields_total` (`field`)
+- `mattermostbot_message_overrides_total` (`outcome`)
+- `mattermostbot_message_overrides_duration_seconds` (`outcome`)
+- `mattermostbot_proactive_decisions_total` (`outcome`)
+- `mattermostbot_reaction_kinds_disabled` (`kind`)
+- `mattermostbot_reactions_total` (`kind`, `operation`, `outcome`)
+- `mattermostbot_render_attempt_duration_seconds` (`source`, `outcome`)
+- `mattermostbot_render_attempts_total` (`source`, `outcome`)
+- `mattermostbot_render_obligations_indexed_total` (—)
+- `mattermostbot_render_recovery_obligations` (`state`)
+- `mattermostbot_render_recovery_scan_duration_seconds` (`outcome`)
+- `mattermostbot_render_recovery_scans_total` (`outcome`)
+- `mattermostbot_render_recovery_thread_events_total` (`event`)
+- `mattermostbot_response_footers_total` (`placement`)
+- `mattermostbot_session_api_operation_duration_seconds` (`operation`, `outcome`)
+- `mattermostbot_session_api_operations_total` (`operation`, `outcome`)
+- `mattermostbot_session_event_stream_closures_total` (`reason`)
+- `mattermostbot_session_event_streams_open` (—)
+- `mattermostbot_stop_commands_total` (`outcome`)
+- `mattermostbot_websocket_connected` (—)
 
 ## Mattermost setup
 
@@ -92,7 +135,7 @@ bun run test
 bun run dev
 ```
 
-The health endpoint is `GET /health`. It returns `200` only while the Mattermost WebSocket is connected, otherwise `503`.
+The health endpoint is `GET /health`. It returns `200` only while the Mattermost WebSocket is connected, otherwise `503`. Prometheus scrapes `GET /metrics` on the same port.
 
 Build from the repository root:
 

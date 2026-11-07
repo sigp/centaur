@@ -28,6 +28,9 @@ if (!isHarnessEnabled(defaultHarnessType, enabledHarnesses)) {
 const messageOverridesStrategyMode = messageOverridesStrategyModeEnv(
   "MATTERMOSTBOT_MESSAGE_OVERRIDES_STRATEGY",
 );
+const responseMetadataMode = responseMetadataModeEnv(
+  "MATTERMOSTBOT_RESPONSE_METADATA_MODE",
+);
 const messageOverridesStrategyApiKey =
   optionalEnv("MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_API_KEY") ??
   optionalEnv("OPENAI_API_KEY");
@@ -76,6 +79,11 @@ const options: MattermostbotOptions = {
       }
     : {},
   proactivity: createProactivityOptions(),
+  responseMetadataMode,
+  responseServiceTierEnabled: booleanEnv(
+    "MATTERMOSTBOT_RESPONSE_SERVICE_TIER_ENABLED",
+    false,
+  ),
   messageOverridesStrategy: createMessageOverridesStrategy(),
   ackReactionEnabled: booleanEnv("MATTERMOSTBOT_ACK_REACTION_ENABLED", true),
   ackReactionName: stringEnv("MATTERMOSTBOT_ACK_REACTION", "eyes"),
@@ -206,6 +214,14 @@ function createProactiveClassifier(
   }
 }
 
+function responseMetadataModeEnv(name: string): "first" | "always" | "never" {
+  const value = optionalEnv(name)?.toLowerCase();
+  if (!value) return "first";
+  if (value === "first" || value === "always" || value === "never") {
+    return value;
+  }
+  throw new Error(`${name} must be "first", "always", or "never"`);
+}
 function optionalEnv(name: string): string | undefined {
   const value = process.env[name]?.trim();
   return value ? value : undefined;

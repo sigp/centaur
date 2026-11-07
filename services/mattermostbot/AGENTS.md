@@ -12,11 +12,13 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
 - Mattermost uses background post-and-edit streaming. The handler only performs
   the session create/append handoff, so mentioned follow-ups are appended while
   an execution is active instead of being dropped by the thread lock.
-  Unmentioned subscribed-thread posts are classified only after a mention makes
-  the thread eligible. Operator rules are the exception to mention gating:
-  they can match unmentioned top-level posts and start a reply thread. A rule's
-  context is sent once per harness, and a stop silences proactive replies until
-  the next mention.
+  Unmentioned subscribed-thread posts never reach a running turn on their own:
+  the next mention collects them as context. With proactivity enabled they are
+  classified once a mention makes the thread eligible, and operator rules can
+  also match unmentioned top-level posts and start a reply thread. A rule's
+  context rides only on the first execution it starts in a thread (again after
+  a harness restart), and a stop silences proactive replies until the next
+  mention.
 - Transient session create/append failures retry. Render retries are bounded; exhaustion posts an in-thread failure, clears `activeExecution`, and leaves the obligation for a later recovery.
 - Render obligations are indexed in persistent state, leased per thread, and recovered at startup. Keep the state adapter persistent so subscriptions, locks, dedupe state, and render progress survive restarts.
 - A mentioned stop command is handled before session sync: it records
@@ -33,6 +35,18 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
   History-fetch failures post an in-thread notice instead of silently wedging
   the team cap.
 - Long answers are split into ordered posts below `MATTERMOSTBOT_MAX_POST_CHARS` (default 16000, below Mattermost's default MaxPostSize of 16383).
+- Successful execution replies may carry a trailing markdown response footer.
+  `MATTERMOSTBOT_RESPONSE_METADATA_MODE` defaults to `first` and also accepts
+  `always` and `never`; `MATTERMOSTBOT_RESPONSE_SERVICE_TIER_ENABLED` only
+  adds the Codex tier to an otherwise-selected footer. The footer is appended
+  to the last answer post only when it fits below `maxPostChars`; otherwise it
+  is a separate short reply. `response-context.ts` reads defaults directly
+  from `harness/claude/settings.json` and `harness/codex/config.toml`, and the
+  Docker image must copy `harness/`.
+- `GET /metrics` is Prometheus text on `PORT`; all series use the
+  `mattermostbot_` prefix. Keep metric updates on the corresponding success,
+  failure, recovery, reaction, stop, override, and websocket paths, and keep
+  the registry resettable for tests.
 - Turn-start mentions receive an acknowledgement reaction (`eyes` by default). Mentioned follow-ups may receive the optional steering reaction (`hourglass_flowing_sand`); reactions are best-effort, removed after response/failure, and a refused kind is disabled for the process with one warning.
 
 ## Environment
@@ -72,6 +86,8 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
 | `MATTERMOSTBOT_TEAM_ALLOWLIST` | Yes to do anything | Comma/space-separated Mattermost team IDs. Empty means inert. |
 | `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST` | No | Comma/space-separated bot author IDs allowed to trigger or append. Empty means all bot posts are ignored. |
 | `MATTERMOSTBOT_MAX_POST_CHARS` | No | Maximum answer post size; defaults to `16000`, below Mattermost's default `16383` limit. |
+| `MATTERMOSTBOT_RESPONSE_METADATA_MODE` | No | Model footer mode: `first` (default), `always`, or `never`. |
+| `MATTERMOSTBOT_RESPONSE_SERVICE_TIER_ENABLED` | No | Include the Codex service tier in the footer; defaults to `false`. |
 | `MATTERMOSTBOT_STATE_KEY_PREFIX` | No | State row prefix; defaults to `centaur-mattermostbot`. |
 | `SESSION_IDLE_TIMEOUT_MS` | No | Forwarded to api-rs execute. |
 | `SESSION_MAX_DURATION_MS` | No | Forwarded to api-rs execute. |

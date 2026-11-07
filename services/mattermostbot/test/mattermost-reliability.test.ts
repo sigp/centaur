@@ -3,7 +3,7 @@
 // (same harness style as mattermost-e2e.test.ts): background execution with
 // follow-ups appended mid-turn, transient create/append retry, bounded render
 // retries, render-obligation recovery on startup, and long-answer splitting.
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import type { StateAdapter } from "chat";
 import {
@@ -13,6 +13,7 @@ import {
   type MattermostbotOptions,
 } from "../src/index";
 import { createOpenAiProactiveClassifier } from "../src/proactive-classifier";
+import { resetMattermostbotMetricsForTests } from "../src/metrics";
 
 const CHANNEL_ID = "channelallowed";
 const ROOT_ID = "rootallowed";
@@ -93,6 +94,8 @@ type Harness = {
   appends: Record<string, unknown>[];
   baseUrl: string;
   creates: Record<string, unknown>[];
+  /** Optional api-rs session-create payload for persona reconciliation tests. */
+  createResponse?: Record<string, unknown>;
   edits: Record<string, unknown>[];
   eventRequests: Array<{ executionId: string | null; threadKey: string }>;
   executes: Record<string, unknown>[];
@@ -214,7 +217,7 @@ function startHarness(): Harness {
         const suffix = pieces[3] ?? "";
         if (request.method === "POST" && !suffix) {
           harness.creates.push((await request.json()) as Record<string, unknown>);
-          return Response.json({ ok: true });
+          return Response.json({ ok: true, ...(harness.createResponse ?? {}) });
         }
         if (request.method === "POST" && suffix === "messages") {
           const body = (await request.json()) as Record<string, unknown>;
@@ -263,6 +266,7 @@ function startHarness(): Harness {
           }
           const chunks = harness.answerChunks;
           const hold = harness.hold;
+          const interruptsAtOpen = harness.interrupts.length;
           const encoder = new TextEncoder();
           const body = new ReadableStream<Uint8Array>({
             async start(controller) {
@@ -271,11 +275,12 @@ function startHarness(): Harness {
                 controller.enqueue(encoder.encode(sseOutputLine(id++, chunk)));
                 if (index === 0 && hold) await hold.promise;
               }
-              controller.enqueue(
-                encoder.encode(
-                  `id: ${id}\nevent: session.execution_completed\ndata: {}\n\n`,
-                ),
-              );
+              // api-rs ends a turn interrupted while it ran as cancelled.
+              const terminal =
+                harness.interrupts.length > interruptsAtOpen
+                  ? "session.execution_cancelled"
+                  : "session.execution_completed";
+              controller.enqueue(encoder.encode(`id: ${id}\nevent: ${terminal}\ndata: {}\n\n`));
               controller.close();
             },
           });
@@ -410,6 +415,9 @@ function startHarness(): Harness {
 
 let harness: Harness | undefined;
 const bots: Mattermostbot[] = [];
+beforeEach(() => {
+  resetMattermostbotMetricsForTests();
+});
 
 afterEach(async () => {
   for (const bot of bots.splice(0)) {
@@ -640,7 +648,7 @@ describe("Mattermost reliability", () => {
     const h = harness;
     h.hold = newGate();
     const state = createMemoryState();
-    await startBotAndConnect({ state });
+    const bot = await startBotAndConnect({ state });
 
     h.sendPosted(makePost(ROOT_ID, "@centaur start work"));
     await waitFor(() => h.eventRequests.length === 1);
@@ -654,6 +662,12 @@ describe("Mattermost reliability", () => {
     h.hold.release();
     await waitFor(async () => (await threadState(state))?.activeExecution === false);
     expect((await threadState(state))?.proactiveEligible).toBe(false);
+    const metricsText = async () =>
+      (await bot.app.fetch(new Request("http://mattermost.test/metrics"))).text();
+    await waitFor(async () => /mattermostbot_active_live_renders 0\n/.test(await metricsText()));
+    const metrics = await metricsText();
+    expect(metrics).toMatch(/mattermostbot_executions_interrupted_total 1\n/);
+    expect(metrics).toMatch(/mattermostbot_stop_commands_total\{outcome="interrupted"\} 1/);
   });
   it("does not start execution when a stop is recorded before the execute handoff", async () => {
     harness = startHarness();
@@ -976,7 +990,7 @@ describe("Mattermost reliability", () => {
     const line = `${"x".repeat(78)}\n`;
     h.answerChunks = Array.from({ length: 5 }, () => line.repeat(60));
     const state = createMemoryState();
-    await startBotAndConnect({ state });
+    await startBotAndConnect({ responseMetadataMode: "never", state });
 
     h.sendPosted(makePost(ROOT_ID, "@centaur write a novel"));
     await waitFor(async () => (await threadState(state))?.activeExecution === false);
@@ -1046,6 +1060,178 @@ describe("Mattermost reliability", () => {
     await waitFor(async () => (await threadState(state))?.activeExecution === false);
     await waitFor(() => h.botPostTexts().join("\n").includes("first streamed reply"));
     expect(h.executes).toHaveLength(1);
+  });
+  it("renders the response footer only on the first reply by default", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({ responseMetadataMode: "first", state });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur first"));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    await waitFor(() => h.botPostTexts().length >= 1);
+    h.sendPosted(makePost("second-root", "@centaur second", ROOT_ID));
+    await waitFor(() => h.executes.length === 2);
+    await waitFor(() => h.botPostTexts().length >= 2);
+
+    const texts = h.botPostTexts();
+    expect(texts.filter((text) => text.includes("Sol 5.6"))).toHaveLength(1);
+    expect(texts.filter((text) => text.includes("Codex"))).toHaveLength(1);
+  });
+
+  it("renders the response footer on every reply in always mode", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({ responseMetadataMode: "always", state });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur first"));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    h.sendPosted(makePost("second-root", "@centaur second", ROOT_ID));
+    await waitFor(() => h.executes.length === 2);
+    await waitFor(() => h.botPostTexts().length >= 2);
+
+    expect(h.botPostTexts().filter((text) => text.includes("Sol 5.6"))).toHaveLength(2);
+  });
+
+  it("does not render the response footer in never mode", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({ responseMetadataMode: "never", state });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur first"));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    await waitFor(() => h.botPostTexts().length >= 1);
+
+    expect(h.botPostTexts().join("\n")).not.toContain("Sol 5.6");
+    expect(h.botPostTexts().join("\n")).not.toContain("Codex");
+  });
+
+  it("adds the service tier without changing first-footer eligibility", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({
+      responseMetadataMode: "first",
+      responseServiceTierEnabled: true,
+      state,
+    });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur first"));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    h.sendPosted(makePost("second-root", "@centaur second", ROOT_ID));
+    await waitFor(() => h.executes.length === 2);
+    await waitFor(() => h.botPostTexts().length >= 2);
+
+    expect(h.botPostTexts().filter((text) => text.includes("Fast"))).toHaveLength(1);
+  });
+
+  it("uses the flag model and then a changed channel default in footers", async () => {
+    harness = startHarness();
+    const h = harness;
+    const defaults = { [CHANNEL_ID]: { model: "gpt-5.6-sol" } };
+    const state = createMemoryState();
+    await startBotAndConnect({
+      channelDefaults: defaults,
+      responseMetadataMode: "always",
+      state,
+    });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur --model gpt-6-luna flagged"));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    expect(h.botPostTexts().join("\n")).toContain("Luna 6");
+
+    defaults[CHANNEL_ID] = { model: "gpt-6.1-terra" };
+    h.sendPosted(makePost("rootsecond", "@centaur channel default"));
+    await waitFor(() => h.executes.length === 2);
+    await waitFor(() => h.botPostTexts().join("\n").includes("Terra 6.1"));
+  });
+
+  it("shows a persona-pinned model over model and provider flags", async () => {
+    harness = startHarness();
+    const h = harness;
+    h.createResponse = {
+      harness_type: "codex",
+      persona_id: "eng",
+      persona_model: "gpt-6-ultra",
+    };
+    const state = createMemoryState();
+    await startBotAndConnect({ responseMetadataMode: "always", state });
+
+    h.sendPosted(
+      makePost(
+        ROOT_ID,
+        "@centaur --persona eng --model gpt-5.6-sol --provider openai inspect",
+      ),
+    );
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    await waitFor(() => h.botPostTexts().length >= 1);
+    expect(h.botPostTexts().join("\n")).toContain("GPT 6 Ultra");
+  });
+
+  it("posts a footer separately when the answer post has no room", async () => {
+    harness = startHarness();
+    const h = harness;
+    h.answerChunks = ["ok"];
+    const state = createMemoryState();
+    await startBotAndConnect({
+      maxPostChars: 28,
+      responseMetadataMode: "always",
+      state,
+    });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur short"));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    await waitFor(() => h.botPostTexts().length >= 2);
+
+    const texts = h.botPostTexts();
+    expect(texts).toContain("ok");
+    expect(texts.some((text) => text.includes("Codex"))).toBe(true);
+    expect(texts.every((text) => text.length <= 28)).toBe(true);
+  });
+
+  it("serves key metric series after a completed turn", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    const bot = await startBotAndConnect({
+      responseMetadataMode: "always",
+      state,
+    });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur metrics"));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    await waitFor(() =>
+      h.reactions.some(
+        (reaction) => reaction.method === "remove" && reaction.postId === ROOT_ID,
+      ),
+    );
+
+    const response = await bot.app.fetch(
+      new Request("http://mattermost.test/metrics"),
+    );
+    const text = await response.text();
+    expect(response.status).toBe(200);
+    expect(text).toMatch(/mattermostbot_executions_started_total 1/);
+    expect(text).toMatch(/mattermostbot_executions_completed_total 1/);
+    expect(text).toMatch(
+      /mattermostbot_session_api_operations_total\{operation="create_session",outcome="success"\} 1/,
+    );
+    expect(text).toMatch(
+      /mattermostbot_session_api_operations_total\{operation="execute_session",outcome="success"\} 1/,
+    );
+    expect(text).toMatch(
+      /mattermostbot_reactions_total\{kind="ack",operation="add",outcome="success"\} 1/,
+    );
+    expect(text).toMatch(
+      /mattermostbot_reactions_total\{kind="ack",operation="remove",outcome="success"\} 1/,
+    );
+    expect(text).toMatch(
+      /mattermostbot_render_attempts_total\{source="live",outcome="complete"\} 1/,
+    );
+    expect(text).toMatch(/mattermostbot_active_live_renders 0/);
+    expect(text).toMatch(/mattermostbot_websocket_connected 1/);
   });
 });
 
@@ -1217,7 +1403,7 @@ describe("Mattermost proactive replies", () => {
     harness = startHarness();
     const h = harness;
     const state = createMemoryState();
-    await startBotAndConnect({
+    const bot = await startBotAndConnect({
       proactivity: fakeProactivity(h),
       state,
     });
@@ -1237,6 +1423,13 @@ describe("Mattermost proactive replies", () => {
     h.decisionHold.release();
     await sleep(30);
     expect(h.executes).toHaveLength(1);
+
+    const metrics = await (
+      await bot.app.fetch(new Request("http://mattermost.test/metrics"))
+    ).text();
+    expect(metrics).toMatch(
+      /mattermostbot_proactive_decisions_total\{outcome="error"\} 2/,
+    );
   });
 
   it("steers a turn that starts while classifying instead of doubling it", async () => {

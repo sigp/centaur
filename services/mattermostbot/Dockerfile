@@ -17,6 +17,9 @@ COPY services/mattermostbot/package.json services/mattermostbot/package.json
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store,sharing=locked \
     pnpm install --filter mattermostbot --prod --frozen-lockfile
 
+# Harness config files: response-context.ts imports the baked default models
+# so Mattermost response metadata can name the model without a hardcoded copy.
+COPY harness/ harness/
 COPY services/mattermostbot/ services/mattermostbot/
 WORKDIR /repo/services/mattermostbot
 

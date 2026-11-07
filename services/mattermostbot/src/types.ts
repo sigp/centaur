@@ -183,7 +183,10 @@ export type MattermostbotOptions = {
   harnessDefaultModels?: Record<string, string>;
   /** Deployment-configured reasoning defaults for Codex-compatible harnesses. */
   harnessDefaultReasoning?: Record<string, string>;
-  /** Strategy for resolving message-level harness/model/provider/reasoning overrides. */
+  /** Footer metadata mode: first assistant reply, every reply, or disabled. */
+  responseMetadataMode?: "first" | "always" | "never";
+  /** Include the configured Codex service tier in response metadata footers. */
+  responseServiceTierEnabled?: boolean;
   messageOverridesStrategy?: MessageOverridesStrategy;
   /** Proactive replies for eligible threads and configured channel rules. */
   proactivity?: MattermostbotProactivityOptions;
@@ -299,6 +302,8 @@ export type ForwardSessionInput = {
   contextPreamble?: string;
   executionId?: string;
   executeMessage?: MattermostbotApiMessage;
+  /** Rendered model metadata line for the successful execution reply. */
+  responseFooter?: string;
   messages: MattermostbotApiMessage[];
   onEventId(eventId: number): void;
   openStream: boolean;

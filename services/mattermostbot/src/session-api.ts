@@ -28,6 +28,7 @@ import {
   traceLog,
 } from "./utils";
 
+import { mattermostbotMetrics, observeSeconds } from "./metrics";
 export class SessionApiError extends Error {
   readonly action: string;
   readonly body: string;
@@ -61,14 +62,48 @@ export function isRetryableSessionApiError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return error.name === "AbortError" || error.name === "TypeError";
 }
-
 type ForwardSessionApiCallbacks = {
   onExecutionStarted?(
     execution: MattermostbotExecuteSessionResponse,
   ): Promise<void>;
   onMessagesAppended?(): Promise<void>;
+  onSessionCreated?(outcome: CreateSessionOutcome): Promise<void>;
   shouldExecute?(): Promise<boolean>;
 };
+
+type SessionApiOperation = {
+  action: string;
+  operation: string;
+};
+
+async function recordSessionApiOperation<T>(
+  options: MattermostbotOptions,
+  input: SessionApiOperation,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const startedAtMs = nowMs();
+  let outcome = "success";
+  try {
+    return await operation();
+  } catch (error) {
+    outcome = isRetryableSessionApiError(error)
+      ? "retryable_error"
+      : "error";
+    if (input.operation === "execute_session") {
+      mattermostbotMetrics.executionsFailed.inc({ reason: "execute_request" });
+    }
+    throw error;
+  } finally {
+    mattermostbotMetrics.sessionApiOperations.inc({
+      operation: input.operation,
+      outcome,
+    });
+    mattermostbotMetrics.sessionApiOperationDuration.observe(
+      { operation: input.operation, outcome },
+      observeSeconds(startedAtMs),
+    );
+  }
+}
 
 export async function collectInitialContext(
   thread: { allMessages: AsyncIterable<Message> },
@@ -188,23 +223,34 @@ export async function forwardToSessionApi(
   callbacks: ForwardSessionApiCallbacks = {},
 ): Promise<AsyncIterable<MattermostbotRendererSource> | null> {
   const createStartedAtMs = nowMs();
-  const created = await createSession(
+  const created = await recordSessionApiOperation(
     options,
-    input.threadId,
-    input.harnessType,
-    input.personaId,
-    input.conversationName,
+    { action: "create session", operation: "create_session" },
+    () =>
+      createSession(
+        options,
+        input.threadId,
+        input.harnessType,
+        input.personaId,
+        input.conversationName,
+      ),
   );
   if (created.harnessType) input.metadataHarnessType = created.harnessType;
   traceLog(options, "mattermostbot_session_create_complete", input.trace, {
     harness_type: created.harnessType,
     harness_switched: created.harnessSwitched,
     persona_id: created.personaId,
+    unavailable_requested_persona_id: created.unavailableRequestedPersonaId,
     phase_ms: elapsedMs(createStartedAtMs),
   });
+  await callbacks.onSessionCreated?.(created);
   if (input.messages.length > 0) {
     const appendStartedAtMs = nowMs();
-    await appendSessionMessages(options, input.threadId, input.messages);
+    await recordSessionApiOperation(
+      options,
+      { action: "append session messages", operation: "append_messages" },
+      () => appendSessionMessages(options, input.threadId, input.messages),
+    );
     traceLog(options, "mattermostbot_session_append_complete", input.trace, {
       message_count: input.messages.length,
       phase_ms: elapsedMs(appendStartedAtMs),
@@ -218,18 +264,24 @@ export async function forwardToSessionApi(
   if (!input.executeMessage) return null;
   if (callbacks.shouldExecute && !(await callbacks.shouldExecute())) return null;
   const executeStartedAtMs = nowMs();
-  const execution = await executeSession(
+  const execution = await recordSessionApiOperation(
     options,
-    input.threadId,
-    input.executeMessage,
-    input.model,
-    input.reasoning,
-    input.provider,
-    input.metadataModel,
-    input.metadataHarnessType,
-    input.contextPreamble,
-    input.proactiveContext,
+    { action: "execute session", operation: "execute_session" },
+    () =>
+      executeSession(
+        options,
+        input.threadId,
+        input.executeMessage!,
+        input.model,
+        input.reasoning,
+        input.provider,
+        input.metadataModel,
+        input.metadataHarnessType,
+        input.contextPreamble,
+        input.proactiveContext,
+      ),
   );
+  mattermostbotMetrics.executionsStarted.inc();
   traceLog(options, "mattermostbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
     phase_ms: elapsedMs(executeStartedAtMs),
@@ -253,18 +305,24 @@ export async function executeSessionTurn(
 ): Promise<MattermostbotExecuteSessionResponse | null> {
   if (!input.executeMessage) return null;
   const executeStartedAtMs = nowMs();
-  const execution = await executeSession(
+  const execution = await recordSessionApiOperation(
     options,
-    input.threadId,
-    input.executeMessage,
-    input.model,
-    input.reasoning,
-    input.provider,
-    input.metadataModel,
-    input.metadataHarnessType,
-    input.contextPreamble,
-    input.proactiveContext,
+    { action: "execute session", operation: "execute_session" },
+    () =>
+      executeSession(
+        options,
+        input.threadId,
+        input.executeMessage!,
+        input.model,
+        input.reasoning,
+        input.provider,
+        input.metadataModel,
+        input.metadataHarnessType,
+        input.contextPreamble,
+        input.proactiveContext,
+      ),
   );
+  mattermostbotMetrics.executionsStarted.inc();
   traceLog(options, "mattermostbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
     phase_ms: elapsedMs(executeStartedAtMs),
@@ -277,17 +335,25 @@ export async function interruptSessionExecution(
   threadId: string,
   reason: string,
 ): Promise<MattermostbotInterruptSessionResponse> {
-  const fetchFn = options.fetch ?? fetch;
-  const response = await fetchFn(
-    apiSessionUrl(options.apiUrl, threadId, "interrupt"),
-    {
-      method: "POST",
-      headers: apiHeaders(options),
-      body: JSON.stringify({ reason }),
+  return recordSessionApiOperation(
+    options,
+    { action: "interrupt session", operation: "interrupt_session" },
+    async () => {
+      const fetchFn = options.fetch ?? fetch;
+      const response = await fetchFn(
+        apiSessionUrl(options.apiUrl, threadId, "interrupt"),
+        {
+          method: "POST",
+          headers: apiHeaders(options),
+          body: JSON.stringify({ reason }),
+        },
+      );
+      await ensureApiOk(response, "interrupt session", options);
+      // A stopped turn is counted once, from its session.execution_cancelled
+      // event; stop_commands_total records the stop itself.
+      return (await response.json()) as MattermostbotInterruptSessionResponse;
     },
   );
-  await ensureApiOk(response, "interrupt session", options);
-  return (await response.json()) as MattermostbotInterruptSessionResponse;
 }
 export async function openSessionEventStream(
   options: MattermostbotOptions,
@@ -297,12 +363,17 @@ export async function openSessionEventStream(
   >,
 ): Promise<AsyncIterable<MattermostbotRendererSource>> {
   const streamStartedAtMs = nowMs();
-  const stream = await streamSessionNotifications(
+  const stream = await recordSessionApiOperation(
     options,
-    input.threadId,
-    input.afterEventId,
-    input.executionId,
-    input.onEventId,
+    { action: "stream events", operation: "open_event_stream" },
+    () =>
+      streamSessionNotifications(
+        options,
+        input.threadId,
+        input.afterEventId,
+        input.executionId,
+        input.onEventId,
+      ),
   );
   traceLog(options, "mattermostbot_session_events_opened", input.trace, {
     after_event_id: input.afterEventId,
@@ -472,6 +543,8 @@ type CreateSessionOutcome = {
   harnessSwitched: boolean;
   harnessType?: string;
   personaId?: string | null;
+  unavailableRequestedPersonaId?: string;
+  personaModel?: string;
 };
 
 async function createSession(
@@ -567,10 +640,18 @@ async function sessionOutcomeFromResponse(
         : "persona_id" in payload
           ? null
           : undefined;
+    const unavailableRequestedPersonaId = stringValue(
+      payload.unavailable_requested_persona_id,
+    );
+    const personaModel = stringValue(payload.persona_model);
     return {
       harnessSwitched: payload.harness_switched === true,
       ...(harnessType ? { harnessType } : {}),
       ...(personaId !== undefined ? { personaId } : {}),
+      ...(unavailableRequestedPersonaId
+        ? { unavailableRequestedPersonaId }
+        : {}),
+      ...(personaModel ? { personaModel } : {}),
     };
   } catch {
     return { harnessSwitched: false };
@@ -998,13 +1079,19 @@ async function* parseSessionEventStream(
   for await (const event of parseSseEvents(stream)) {
     if (typeof event.id === "number") onEventId(event.id);
     if (event.event === "session.output.line") {
+      const terminalOutcome = terminalOutputOutcome(event.data);
       yield {
         data: event.data,
         event: event.event,
         eventId: event.id,
         eventKind: event.event,
       } satisfies RustSessionStreamEvent;
-      if (isTerminalCodexOutputLine(event.data)) return;
+      if (terminalOutcome === "completed") {
+        mattermostbotMetrics.executionsCompleted.inc();
+      } else if (terminalOutcome === "failed") {
+        mattermostbotMetrics.executionsFailed.inc({ reason: "output_line" });
+      }
+      if (terminalOutcome) return;
       continue;
     }
     if (event.event === "session.activity_summary") {
@@ -1020,6 +1107,7 @@ async function* parseSessionEventStream(
       event.event === "session.execution_failed" ||
       event.event === "session.stream_error"
     ) {
+      mattermostbotMetrics.executionsFailed.inc({ reason: event.event });
       yield {
         data: { error: sessionErrorMessage(event) },
         event: event.event,
@@ -1029,6 +1117,7 @@ async function* parseSessionEventStream(
       return;
     }
     if (event.event === "session.execution_cancelled") {
+      mattermostbotMetrics.executionsInterrupted.inc();
       yield {
         data: { error: sessionErrorMessage(event, "Execution cancelled") },
         event: event.event,
@@ -1038,6 +1127,7 @@ async function* parseSessionEventStream(
       return;
     }
     if (event.event === "session.execution_completed") {
+      mattermostbotMetrics.executionsCompleted.inc();
       yield {
         data: sessionEventData(event),
         event: event.event,
@@ -1053,6 +1143,8 @@ async function* parseSseEvents(
   stream: ReadableStream<Uint8Array>,
 ): AsyncIterable<ParsedSessionEvent> {
   const reader = stream.getReader();
+  mattermostbotMetrics.sessionEventStreamsOpen.inc();
+  let reason: "cancelled" | "done" | "error" = "done";
   const decoder = new TextDecoder();
   let buffer = "";
   let eventName: string | undefined;
@@ -1089,9 +1181,14 @@ async function* parseSseEvents(
     if (data.length > 0) {
       yield { data: data.join("\n"), event: eventName, id: eventId };
     }
+  } catch (error) {
+    reason = "error";
+    throw error;
   } finally {
     await reader.cancel().catch(() => undefined);
     reader.releaseLock();
+    mattermostbotMetrics.sessionEventStreamsOpen.dec();
+    mattermostbotMetrics.sessionEventStreamClosures.inc({ reason });
   }
 }
 
@@ -1137,25 +1234,31 @@ function parseSseLine(
   return { state };
 }
 
-function isTerminalCodexOutputLine(line: string): boolean {
+function terminalOutputOutcome(
+  line: string,
+): "completed" | "failed" | undefined {
   let payload: unknown;
   try {
     payload = JSON.parse(line);
   } catch {
     // Non-JSON stdout lines (e.g. sandbox bootstrap notices) are noise, not a
     // signal that the turn finished; treating them as terminal drops the answer.
-    return false;
+    return undefined;
   }
-  if (!isJsonObject(payload)) return false;
-  if (isRetryableCodexErrorNotification(payload)) return false;
-
-  return (
+  if (!isJsonObject(payload) || isRetryableCodexErrorNotification(payload)) {
+    return undefined;
+  }
+  if (payload.type === "turn.failed" || payload.method === "error") {
+    return "failed";
+  }
+  if (
     payload.type === "turn.completed" ||
-    payload.type === "turn.failed" ||
     payload.type === "turn.done" ||
-    payload.method === "error" ||
     payload.method === "turn/completed"
-  );
+  ) {
+    return "completed";
+  }
+  return undefined;
 }
 
 function sessionEventData(event: ParsedSessionEvent): unknown {

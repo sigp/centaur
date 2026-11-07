@@ -36,8 +36,11 @@ import {
 } from "./message-overrides-strategy";
 import { isMattermostStopCommand } from "./stop-command";
 import {
+  buildMattermostResponseFooter,
   defaultModelForHarness,
+  defaultServiceTierForHarness,
   effectiveReasoningForHarness,
+  personaFallbackNotice,
   reasoningForModel,
 } from "./response-context";
 import {
@@ -58,8 +61,10 @@ import {
   resolveProactivityRules,
   type ProactivityRule,
 } from "./proactivity-rules";
+import { mattermostbotMetrics, observeSeconds } from "./metrics";
 import type {
   ForwardSessionInput,
+  JsonObject,
   Mattermostbot,
   MattermostbotApiMessage,
   MattermostbotExecuteSessionResponse,
@@ -154,13 +159,16 @@ export async function messageOverridesForText(
   text: string,
   trace?: MattermostbotTrace,
 ): Promise<{ cleanedText?: string; overrides: HarnessOverrides }> {
+  const startedAtMs = nowMs();
   const strategy =
     options.messageOverridesStrategy ?? DEFAULT_MESSAGE_OVERRIDES_STRATEGY;
   const persona = extractPersonaOverride(text);
+  let strategyFailed = false;
   let result: { cleanedText?: string; overrides: HarnessOverrides };
   try {
     result = await strategy({ text: persona.cleanedText });
   } catch (error) {
+    strategyFailed = true;
     traceLog(options, "mattermostbot_message_overrides_strategy_failed", trace, {
       error: errorMessage(error),
     });
@@ -170,15 +178,29 @@ export async function messageOverridesForText(
   }
   const { personaId: _strategyPersonaId, ...strategyOverrides } =
     result.overrides;
+  const overrides = {
+    ...strategyOverrides,
+    ...(persona.personaId ? { personaId: persona.personaId } : {}),
+  };
+  const outcome = strategyFailed
+    ? "strategy_failed"
+    : Object.keys(overrides).length > 0
+      ? "applied"
+      : "none";
+  mattermostbotMetrics.messageOverrides.inc({ outcome });
+  mattermostbotMetrics.messageOverridesDuration.observe(
+    { outcome },
+    observeSeconds(startedAtMs),
+  );
+  for (const field of Object.keys(overrides)) {
+    mattermostbotMetrics.messageOverrideFields.inc({ field });
+  }
   return {
     ...result,
     ...(persona.personaId && result.cleanedText === undefined
       ? { cleanedText: persona.cleanedText }
       : {}),
-    overrides: {
-      ...strategyOverrides,
-      ...(persona.personaId ? { personaId: persona.personaId } : {}),
-    },
+    overrides,
   };
 }
 
@@ -369,6 +391,15 @@ export function createMattermostbot(
       connected ? 200 : 503,
     );
   });
+  app.get("/metrics", (context) => {
+    mattermostbotMetrics.websocketConnected.set(
+      {},
+      adapter.isWebSocketConnected() ? 1 : 0,
+    );
+    return context.text(mattermostbotMetrics.expose(), 200, {
+      "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
+    });
+  });
 
   if (options.recoverRenderObligationsOnStart !== false) {
     scheduleRenderObligationRecovery(chat, state, options, reactions);
@@ -520,6 +551,9 @@ async function handleStopCommand(
         renderObligation: null,
       });
     }
+    mattermostbotMetrics.stopCommands.inc({
+      outcome: response.interrupted ? "interrupted" : "nothing_to_interrupt",
+    });
     traceLog(options, "mattermostbot_stop_command_complete", trace, {
       execution_id: response.execution_id,
       interrupted: response.interrupted,
@@ -528,6 +562,7 @@ async function handleStopCommand(
     traceLog(options, "mattermostbot_stop_command_failed", trace, {
       error: errorMessage(error),
     });
+    mattermostbotMetrics.stopCommands.inc({ outcome: "failed" });
     await thread
       .post("Couldn't confirm the stop. The agent may still be working.")
       .catch(() => undefined);
@@ -576,6 +611,8 @@ async function syncThreadMessageToSession(
       options.activeExecutionTtlMs ?? DEFAULT_ACTIVE_EXECUTION_TTL_MS,
     ) &&
     !executedIds.has(message.id);
+  const isFirstAssistantMessage =
+    shouldStartExecution && executedIds.size === 0;
   let reactionAck = input.reactionAck;
 
   let releaseExecutionSlot: (() => void) | null = null;
@@ -714,6 +751,20 @@ async function syncThreadMessageToSession(
       resolvedReasoning,
       options.harnessDefaultReasoning,
     );
+    const responseMetadataMode = options.responseMetadataMode ?? "first";
+    const includeResponseMetadata =
+      responseMetadataMode === "always" ||
+      (responseMetadataMode === "first" && isFirstAssistantMessage);
+    let responseFooter = buildMattermostResponseFooter({
+      harnessType: effectiveHarnessType,
+      metadataEnabled: includeResponseMetadata,
+      model: effectiveModel,
+      reasoning: effectiveReasoning,
+      serviceTier:
+        options.responseServiceTierEnabled === true && !resolvedProvider
+          ? defaultServiceTierForHarness(effectiveHarnessType)
+          : undefined,
+    });
 
     if (
       forwardedIds.has(message.id) &&
@@ -823,6 +874,7 @@ async function syncThreadMessageToSession(
       proactiveContext,
       provider: shouldStartExecution ? resolvedProvider : undefined,
       reasoning: effectiveReasoning,
+      responseFooter: shouldStartExecution ? responseFooter : undefined,
       messages: messagesToAppend,
       onEventId: (eventId) => {
         lastEventId = Math.max(lastEventId, eventId);
@@ -922,10 +974,11 @@ async function syncThreadMessageToSession(
         const delays = options.forwardRetryDelaysMs ?? FORWARD_RETRY_DELAYS_MS;
         const attempt = input.retryAttempt ?? 0;
         const delayMs = delays[attempt];
-        if (delayMs === undefined || !isRetryableSessionApiError(error)) throw error;
-        // As slackbotv2's handoff retry: wait in the background, then recompute
-        // eligibility, so a steer whose turn ended meanwhile starts the next
-        // turn and keeps its reaction until that turn's reply is posted.
+        if (delayMs === undefined || !isRetryableSessionApiError(error)) {
+          mattermostbotMetrics.forwardRetries.inc({ outcome: "exhausted" });
+          throw error;
+        }
+        mattermostbotMetrics.forwardRetries.inc({ outcome: "scheduled" });
         traceLog(options, "mattermostbot_forward_retry_scheduled", trace, {
           attempt: attempt + 1,
           delay_ms: delayMs,
@@ -969,6 +1022,62 @@ async function syncThreadMessageToSession(
           { ...forwardInput, executeMessage: undefined, openStream: false },
           {
             onMessagesAppended: commitMessagesAppended,
+            onSessionCreated: async (outcome) => {
+              if (outcome.personaId !== undefined) {
+                stickyOverridesUpdate = {
+                  ...(stickyOverridesUpdate ?? {}),
+                  personaId: outcome.personaId,
+                };
+                forwardInput.personaId = outcome.personaId ?? undefined;
+              }
+              const harnessType =
+                outcome.harnessType ?? effectiveHarnessType;
+              const personaModel = outcome.personaModel;
+              let model = effectiveModel;
+              let reasoning = effectiveReasoning;
+              if (harnessType !== effectiveHarnessType || personaModel) {
+                model =
+                  personaModel ??
+                  resolvedModel ??
+                  defaultModelForHarness(
+                    harnessType,
+                    options.harnessDefaultModels,
+                  );
+                const modelReasoning = reasoningForModel(
+                  harnessType,
+                  model,
+                  requestedReasoning,
+                );
+                reasoning = effectiveReasoningForHarness(
+                  harnessType,
+                  modelReasoning,
+                  options.harnessDefaultReasoning,
+                );
+                forwardInput.metadataModel = model;
+                forwardInput.reasoning = modelReasoning;
+                if (personaModel) {
+                  forwardInput.model = undefined;
+                  forwardInput.provider = undefined;
+                }
+              }
+              forwardInput.metadataHarnessType = harnessType;
+              responseFooter = buildMattermostResponseFooter({
+                harnessType,
+                metadataEnabled: includeResponseMetadata,
+                model,
+                notice: personaFallbackNotice(
+                  outcome.unavailableRequestedPersonaId,
+                  outcome.personaId,
+                ),
+                reasoning,
+                serviceTier:
+                  options.responseServiceTierEnabled === true &&
+                  (Boolean(personaModel) || !resolvedProvider)
+                    ? defaultServiceTierForHarness(harnessType)
+                    : undefined,
+              });
+              forwardInput.responseFooter = responseFooter;
+            },
             shouldExecute: async () => {
               stoppedBeforeExecute = stopRequestedFor(
                 (await thread.state) ?? {},
@@ -1054,15 +1163,18 @@ async function handleProactiveMessage(
   const proactivity = options.proactivity;
   if (!proactivity) return;
   const rules = resolveProactivityRules(proactivity.rules, thread.id);
+  const trace = proactiveTrace(thread, message);
+  const record = (outcome: string, fields: JsonObject = {}): void => {
+    mattermostbotMetrics.proactiveDecisions.inc({ outcome });
+    traceLog(options, "mattermostbot_proactive_decision", trace, {
+      outcome,
+      ...fields,
+    });
+  };
   let threadState = (await thread.state) ?? {};
   let skipReason = proactiveSkipReason(rules, threadState, message);
   if (skipReason) {
-    traceLog(
-      options,
-      "mattermostbot_proactive_decision",
-      proactiveTrace(thread, message),
-      { outcome: `skip_${skipReason}` },
-    );
+    record(`skip_${skipReason}`);
     return;
   }
 
@@ -1082,12 +1194,7 @@ async function handleProactiveMessage(
       debounceMs,
     );
     if (!earlierBurstIds) {
-      traceLog(
-        options,
-        "mattermostbot_proactive_decision",
-        proactiveTrace(thread, message),
-        { outcome: "skip_superseded" },
-      );
+      record("skip_superseded");
       return;
     }
     const mention = await state.get<PendingProactiveMessage>(
@@ -1097,33 +1204,18 @@ async function handleProactiveMessage(
       mention &&
       compareProactiveMessages(mention, pendingProactiveMessage(message)) > 0
     ) {
-      traceLog(
-        options,
-        "mattermostbot_proactive_decision",
-        proactiveTrace(thread, message),
-        { outcome: "skip_mentioned" },
-      );
+      record("skip_mentioned");
       return;
     }
     threadState = (await thread.state) ?? {};
     const forwarded = new Set(threadState.forwardedMessageIds ?? []);
     if (forwarded.has(message.id)) {
-      traceLog(
-        options,
-        "mattermostbot_proactive_decision",
-        proactiveTrace(thread, message),
-        { outcome: "skip_forwarded" },
-      );
+      record("skip_forwarded");
       return;
     }
     skipReason = proactiveSkipReason(rules, threadState, message);
     if (skipReason) {
-      traceLog(
-        options,
-        "mattermostbot_proactive_decision",
-        proactiveTrace(thread, message),
-        { outcome: `skip_${skipReason}` },
-      );
+      record(`skip_${skipReason}`);
       return;
     }
     burstIds = new Set(earlierBurstIds);
@@ -1170,12 +1262,7 @@ async function handleProactiveMessage(
   });
   if (!respondingLayer) {
     const failure = decisions.find((decision) => decision.status === "rejected");
-    traceLog(
-      options,
-      "mattermostbot_proactive_decision",
-      proactiveTrace(thread, message),
-      { outcome: failure ? "error" : "decline" },
-    );
+    record(failure ? "error" : "decline");
     return;
   }
   const rulesDecision = decisions[layers.indexOf("rules")];
@@ -1185,33 +1272,18 @@ async function handleProactiveMessage(
       : undefined;
   const releaseClaim = await claimProactiveHandoff(thread, state);
   if (!releaseClaim) {
-    traceLog(
-      options,
-      "mattermostbot_proactive_decision",
-      proactiveTrace(thread, message),
-      { outcome: "skip_claimed" },
-    );
+    record("skip_claimed");
     return;
   }
   try {
     const lateState = (await thread.state) ?? {};
     const lateSkipReason = proactiveSkipReason(rules, lateState, message);
     if (lateSkipReason) {
-      traceLog(
-        options,
-        "mattermostbot_proactive_decision",
-        proactiveTrace(thread, message),
-        { outcome: `skip_${lateSkipReason}` },
-      );
+      record(`skip_${lateSkipReason}`);
       return;
     }
     await thread.subscribe();
-    traceLog(
-      options,
-      "mattermostbot_proactive_decision",
-      proactiveTrace(thread, message),
-      { outcome: "respond", layer: respondingLayer, rule: matchedRule?.name },
-    );
+    record("respond", { layer: respondingLayer, rule: matchedRule?.name });
     await syncThreadMessageToSession(thread, message, {
       executionLimiter: input.executionLimiter,
       mode: "execute",
@@ -1376,6 +1448,7 @@ function scheduleExecutionRender(
   onSettled?: () => void,
 ): void {
   if (reactionAck) reactions.hold(reactionAck);
+  mattermostbotMetrics.activeLiveRenders.inc();
   const promise = (async () => {
     try {
       let attempt = 0;
@@ -1395,6 +1468,7 @@ function scheduleExecutionRender(
           attempt >=
           (options.renderRetryMaxAttempts ?? RENDER_RETRY_MAX_ATTEMPTS)
         ) {
+          mattermostbotMetrics.executionsFailed.inc({ reason: "render_exhausted" });
           const latest = (await thread.state) ?? {};
           await thread.setState({
             activeExecution: false,
@@ -1420,6 +1494,7 @@ function scheduleExecutionRender(
         await sleep(delayMs);
       }
     } finally {
+      mattermostbotMetrics.activeLiveRenders.dec();
       await renderLease.release?.();
       backgroundWaitUntil(reactions.completeThread(thread.id));
       onSettled?.();
@@ -1453,8 +1528,10 @@ async function withTransientSessionApiRetry<T>(
     } catch (error) {
       const delayMs = delays[attempt];
       if (delayMs === undefined || !isRetryableSessionApiError(error)) {
+        mattermostbotMetrics.forwardRetries.inc({ outcome: "exhausted" });
         throw error;
       }
+      mattermostbotMetrics.forwardRetries.inc({ outcome: "scheduled" });
       traceLog(options, "mattermostbot_forward_transient_retry", trace, {
         attempt: attempt + 1,
         delay_ms: delayMs,
@@ -1477,6 +1554,8 @@ async function renderExecutionAttempt(
     execution: MattermostbotExecuteSessionResponse,
   ) => Promise<void>,
 ): Promise<"complete" | "retry"> {
+  const renderStartedAtMs = nowMs();
+  let renderOutcome = "error";
   const state = (await thread.state) ?? {};
   if (
     isInitialExecution &&
@@ -1492,6 +1571,9 @@ async function renderExecutionAttempt(
   let rendered = false;
   let retry = false;
   try {
+    const footerState = input.responseFooter
+      ? { value: input.responseFooter }
+      : undefined;
     await renderExecutionStream(
       thread,
       streamSessionAfterHandoff(options, input, onExecutionStarted),
@@ -1499,16 +1581,33 @@ async function renderExecutionAttempt(
       options,
       isInitialExecution,
       trace,
+      footerState,
     );
     rendered = true;
+    renderOutcome = "complete";
     return "complete";
   } catch (error) {
     if (isRetryableSessionApiError(error)) {
       retry = true;
+      renderOutcome = "retry";
       return "retry";
     }
     throw error;
   } finally {
+    mattermostbotMetrics.renderAttempts.inc({
+      source: "live",
+      outcome: renderOutcome,
+    });
+    mattermostbotMetrics.renderAttemptDuration.observe(
+      { source: "live", outcome: renderOutcome },
+      observeSeconds(renderStartedAtMs),
+    );
+    if (renderOutcome === "complete") {
+      mattermostbotMetrics.lastSuccessfulRenderTimestamp.set(
+        { source: "live" },
+        Math.floor(Date.now() / 1000),
+      );
+    }
     const latest = (await thread.state) ?? {};
     await thread.setState({
       activeExecution: retry,
@@ -1526,11 +1625,12 @@ async function renderExecutionStream(
   options: MattermostbotOptions,
   _isInitialExecution: boolean,
   _trace?: MattermostbotTrace,
+  footerState?: { value?: string },
 ): Promise<void> {
   const logger = options.logger ?? noopLogger;
   const stopTyping = startMattermostTypingKeepalive(thread, logger);
   try {
-    await renderSplitExecutionStreams(thread, stream, options);
+    await renderSplitExecutionStreams(thread, stream, options, footerState);
   } finally {
     stopTyping();
   }
@@ -1540,6 +1640,7 @@ async function renderSplitExecutionStreams(
   thread: Thread,
   stream: AsyncIterable<MattermostbotRendererSource>,
   options: MattermostbotOptions,
+  footerState?: { value?: string },
 ): Promise<void> {
   const answerText = new AsyncTextQueue();
   let answerPost: Promise<void> | null = null;
@@ -1553,7 +1654,12 @@ async function renderSplitExecutionStreams(
       if (chunk.type !== "markdown_text") continue;
       sawText = true;
       if (!answerPost) {
-        answerPost = streamAnswerToThread(thread, answerText, options);
+        answerPost = streamAnswerToThread(
+          thread,
+          answerText,
+          options,
+          footerState,
+        );
         answerPost.catch(() => undefined);
       }
       answerText.push(chunk.text);
@@ -1564,11 +1670,17 @@ async function renderSplitExecutionStreams(
   } finally {
     if (!sawText && !sourceFailed) {
       if (!answerPost) {
-        answerPost = streamAnswerToThread(thread, answerText, options);
+        answerPost = streamAnswerToThread(
+          thread,
+          answerText,
+          options,
+          footerState,
+        );
         answerPost.catch(() => undefined);
       }
       answerText.push("Execution completed, but no final text was captured.");
     }
+    if (sourceFailed && footerState) footerState.value = undefined;
     answerText.end();
     if (answerPost) {
       if (sourceFailed) await answerPost.catch(() => undefined);
@@ -1581,6 +1693,7 @@ export async function streamAnswerToThread(
   thread: Thread,
   source: AsyncIterable<string>,
   options: MattermostbotOptions,
+  footerState?: { value?: string },
 ): Promise<void> {
   const maxChars = Math.max(
     1,
@@ -1592,6 +1705,9 @@ export async function streamAnswerToThread(
   );
   let pending = "";
   let current: { id: string; threadId: string } | null = null;
+  const lastPost: {
+    value: { content: string; id: string; threadId: string } | null;
+  } = { value: null };
   let lastEditedContent = "";
   let lastEditAtMs = 0;
 
@@ -1612,11 +1728,17 @@ export async function streamAnswerToThread(
 
   const finalizeMessage = async (content: string): Promise<void> => {
     if (current) {
+      const finalized = { ...current, content };
       await editCurrent(content);
+      lastPost.value = finalized;
       current = null;
       lastEditedContent = "";
     } else if (content.trim()) {
       await postNew(content);
+      const posted = current as { id: string; threadId: string } | null;
+      if (posted !== null) {
+        lastPost.value = { id: posted.id, threadId: posted.threadId, content };
+      }
       current = null;
       lastEditedContent = "";
     }
@@ -1647,6 +1769,21 @@ export async function streamAnswerToThread(
   }
   if (pending.trim()) await finalizeMessage(pending);
 
+  const footer = footerState?.value?.trim();
+  if (!footer) return;
+  const footerLine = `\n\n${footer}`;
+  const finalPost = lastPost.value;
+  if (finalPost && finalPost.content.length + footerLine.length <= maxChars) {
+    const content = `${finalPost.content}${footerLine}`;
+    await thread.adapter.editMessage(finalPost.threadId, finalPost.id, {
+      raw: content,
+    });
+    finalPost.content = content;
+    mattermostbotMetrics.responseFooters.inc({ placement: "inline" });
+  } else {
+    await thread.adapter.postMessage(thread.id, { raw: footer });
+    mattermostbotMetrics.responseFooters.inc({ placement: "separate" });
+  }
 }
 
 async function* streamSessionAfterHandoff(
@@ -1740,16 +1877,20 @@ async function recoverRenderObligations(
   options: MattermostbotOptions,
   reactions: ReactionController,
 ): Promise<number> {
+  const startedAtMs = nowMs();
   await chat.initialize();
   const indexedThreadIds = await state.getList<string>(
     RENDER_OBLIGATION_INDEX_KEY,
   );
+  const uniqueThreadIds = Array.from(new Set(indexedThreadIds));
   let deferredCount = 0;
-  for (const threadId of Array.from(new Set(indexedThreadIds))) {
+  let pendingCount = 0;
+  for (const threadId of uniqueThreadIds) {
     try {
       const thread = chat.thread(threadId);
       const obligation = (await thread.state)?.renderObligation;
       if (!obligation) continue;
+      pendingCount += 1;
       const leaseToken = randomUUID();
       const leaseAcquired = await state.setIfNotExists(
         renderRecoveryLeaseKey(threadId),
@@ -1771,6 +1912,13 @@ async function recoverRenderObligations(
           )
         ) {
           deferredCount += 1;
+          mattermostbotMetrics.renderRecoveryThreadEvents.inc({
+            event: "deferred",
+          });
+        } else {
+          mattermostbotMetrics.renderRecoveryThreadEvents.inc({
+            event: "complete",
+          });
         }
       } finally {
         const current = await state.get<string>(
@@ -1782,12 +1930,33 @@ async function recoverRenderObligations(
       }
     } catch (error) {
       deferredCount += 1;
+      mattermostbotMetrics.renderRecoveryThreadEvents.inc({
+        event: "failed",
+      });
       traceLog(options, "mattermostbot_render_recovery_thread_failed", undefined, {
         error: errorMessage(error),
         thread_id: threadId,
       });
     }
   }
+  const outcome = deferredCount > 0 ? "deferred" : "complete";
+  mattermostbotMetrics.renderRecoveryScans.inc({ outcome });
+  mattermostbotMetrics.renderRecoveryScanDuration.observe(
+    { outcome },
+    observeSeconds(startedAtMs),
+  );
+  mattermostbotMetrics.renderRecoveryObligations.set(
+    { state: "indexed_threads" },
+    uniqueThreadIds.length,
+  );
+  mattermostbotMetrics.renderRecoveryObligations.set(
+    { state: "pending" },
+    pendingCount,
+  );
+  mattermostbotMetrics.renderRecoveryObligations.set(
+    { state: "deferred" },
+    deferredCount,
+  );
   return deferredCount;
 }
 
@@ -1810,6 +1979,7 @@ async function recoverRenderObligation(
   const thread = chat.thread(threadId);
   const threadState = (await thread.state) ?? {};
   let lastEventId = Math.max(threadState.lastEventId ?? 0, obligation.afterEventId);
+  const renderStartedAtMs = nowMs();
   const input: ForwardSessionInput = {
     afterEventId: lastEventId,
     executionId: obligation.executionId,
@@ -1841,6 +2011,14 @@ async function recoverRenderObligation(
       lastEventId,
       renderObligation: null,
     });
+    mattermostbotMetrics.renderAttempts.inc({
+      source: "recovery",
+      outcome: "error",
+    });
+    mattermostbotMetrics.renderAttemptDuration.observe(
+      { source: "recovery", outcome: "error" },
+      observeSeconds(renderStartedAtMs),
+    );
     await reactions.completeRecovered(threadId, obligation.message.id);
     return false;
   }
@@ -1862,6 +2040,21 @@ async function recoverRenderObligation(
     );
     rendered = true;
   } finally {
+    const outcome = rendered ? "complete" : "error";
+    mattermostbotMetrics.renderAttempts.inc({
+      source: "recovery",
+      outcome,
+    });
+    mattermostbotMetrics.renderAttemptDuration.observe(
+      { source: "recovery", outcome },
+      observeSeconds(renderStartedAtMs),
+    );
+    if (rendered) {
+      mattermostbotMetrics.lastSuccessfulRenderTimestamp.set(
+        { source: "recovery" },
+        Math.floor(Date.now() / 1000),
+      );
+    }
     const latest = (await thread.state) ?? {};
     await thread.setState({
       activeExecution: false,
@@ -1886,6 +2079,7 @@ async function indexRenderObligation(
     maxLength: RENDER_OBLIGATION_INDEX_MAX_LENGTH,
     ttlMs: RENDER_INDEX_TTL_MS,
   });
+  mattermostbotMetrics.renderObligationsIndexed.inc();
   traceLog(input.options, "mattermostbot_render_obligation_indexed", input.trace);
 }
 

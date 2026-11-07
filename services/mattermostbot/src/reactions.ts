@@ -2,6 +2,7 @@ import type { Message as ChatMessage, Thread } from "chat";
 import type { MattermostAdapter } from "chat-adapter-mattermost";
 import type { MattermostbotOptions } from "./types";
 import { elapsedMs, errorMessage, noopLogger, nowMs } from "./utils";
+import { mattermostbotMetrics } from "./metrics";
 
 /** `ack` marks a mention that starts a turn; `steering` marks a mentioned follow-up into one. */
 export type ReactionKind = "ack" | "steering";
@@ -83,13 +84,31 @@ export function createReactionController(
       } else {
         await adapter.removeReaction(threadId, messageId, name);
       }
+      mattermostbotMetrics.reactions.inc({
+        kind,
+        operation,
+        outcome: "success",
+      });
       return true;
     } catch (error) {
       // Removing a reaction that is already gone is the state we want.
-      if (operation === "remove" && isNotFound(error)) return true;
+      if (operation === "remove" && isNotFound(error)) {
+        mattermostbotMetrics.reactions.inc({
+          kind,
+          operation,
+          outcome: "success",
+        });
+        return true;
+      }
       if (isRefused(error)) {
+        mattermostbotMetrics.reactions.inc({
+          kind,
+          operation,
+          outcome: "refused",
+        });
         if (!state.disabled) {
           state.disabled = true;
+          mattermostbotMetrics.reactionKindsDisabled.set({ kind }, 1);
           logger.warn("mattermostbot_reaction_auto_disabled", {
             error: errorMessage(error),
             kind,
@@ -109,6 +128,11 @@ export function createReactionController(
         operation,
         phase_ms: elapsedMs(startedAtMs),
         thread_id: threadId,
+      });
+      mattermostbotMetrics.reactions.inc({
+        kind,
+        operation,
+        outcome: "error",
       });
       return false;
     }

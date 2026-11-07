@@ -1,3 +1,26 @@
+import claudeSettings from "../../../harness/claude/settings.json";
+import codexConfig from "../../../harness/codex/config.toml";
+
+const HARNESS_DISPLAY_NAMES: Record<string, string> = {
+  amp: "Amp",
+  claudecode: "Claude Code",
+  codex: "Codex",
+  nanocodex: "Nanocodex",
+  pi: "Pi",
+  omp: "OMP",
+};
+
+const REASONING_DISPLAY_NAMES: Record<string, string> = {
+  none: "None",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "XHigh",
+  max: "Max",
+  ultra: "Ultra",
+};
+
 const STANDARD_CODEX_REASONING_EFFORTS = new Set([
   "none",
   "low",
@@ -73,17 +96,43 @@ const CODEX_REASONING_EFFORTS_BY_MODEL: Record<string, ReadonlySet<string>> = {
   "gpt-6-luna": GPT_5_6_REASONING_EFFORTS,
 };
 
-// These are the values baked into the harness images. Explicit deployment
-// environment values supplied in `configured` override them.
-const BAKED_DEFAULT_MODELS: Record<string, string | undefined> = {
-  claudecode: "claude-opus-5-5",
-  codex: "gpt-5.6-sol",
-  nanocodex: "gpt-5.6-sol",
+const CODEX_CONFIG = codexConfig as {
+  model?: unknown;
+  model_reasoning_effort?: unknown;
+  service_tier?: unknown;
 };
-const BAKED_DEFAULT_REASONING: Record<string, string | undefined> = {
-  codex: "medium",
-  nanocodex: "medium",
+const HARNESS_DEFAULT_MODELS: Record<string, string | undefined> = {
+  claudecode:
+    typeof claudeSettings.model === "string" ? claudeSettings.model : undefined,
+  codex: typeof CODEX_CONFIG.model === "string" ? CODEX_CONFIG.model : undefined,
+  nanocodex:
+    typeof CODEX_CONFIG.model === "string" ? CODEX_CONFIG.model : undefined,
 };
+const HARNESS_DEFAULT_REASONING: Record<string, string | undefined> = {
+  codex:
+    typeof CODEX_CONFIG.model_reasoning_effort === "string"
+      ? CODEX_CONFIG.model_reasoning_effort
+      : undefined,
+  nanocodex:
+    typeof CODEX_CONFIG.model_reasoning_effort === "string"
+      ? CODEX_CONFIG.model_reasoning_effort
+      : undefined,
+};
+const HARNESS_DEFAULT_SERVICE_TIERS: Record<string, string | undefined> = {
+  codex:
+    typeof CODEX_CONFIG.service_tier === "string"
+      ? CODEX_CONFIG.service_tier
+      : undefined,
+};
+
+export function harnessDisplayName(
+  harnessType: string | null | undefined,
+): string | undefined {
+  if (!harnessType) return undefined;
+  const key = harnessType.trim().toLowerCase();
+  if (!key) return undefined;
+  return HARNESS_DISPLAY_NAMES[key] ?? titleCase(key);
+}
 
 export function defaultModelForHarness(
   harnessType: string | null | undefined,
@@ -91,7 +140,7 @@ export function defaultModelForHarness(
 ): string | undefined {
   if (!harnessType) return undefined;
   const key = harnessType.trim().toLowerCase();
-  return configured?.[key]?.trim() || BAKED_DEFAULT_MODELS[key];
+  return configured?.[key]?.trim() || HARNESS_DEFAULT_MODELS[key];
 }
 
 export function defaultReasoningForHarness(
@@ -100,7 +149,14 @@ export function defaultReasoningForHarness(
 ): string | undefined {
   if (!harnessType) return undefined;
   const key = harnessType.trim().toLowerCase();
-  return configured?.[key]?.trim().toLowerCase() || BAKED_DEFAULT_REASONING[key];
+  return configured?.[key]?.trim().toLowerCase() || HARNESS_DEFAULT_REASONING[key];
+}
+
+export function defaultServiceTierForHarness(
+  harnessType: string | null | undefined,
+): string | undefined {
+  if (!harnessType) return undefined;
+  return HARNESS_DEFAULT_SERVICE_TIERS[harnessType.trim().toLowerCase()];
 }
 
 export function effectiveReasoningForHarness(
@@ -149,4 +205,86 @@ export function reasoningForModel(
       selectedModel === modelId || selectedModel.startsWith(`${modelId}-20`),
   )?.[1];
   return supported?.has(effectiveEffort) ? effort : undefined;
+}
+
+const CLAUDE_MODEL_ID =
+  /^claude-([a-z]+)((?:-\d{1,2})*)((?:-[a-z]+)*)(?:-\d{8})?$/;
+const GPT_MODEL_ID =
+  /^gpt-(\d+(?:\.\d+)?)((?:-[a-z]+)*)(?:-\d{4}-\d{2}-\d{2})?$/;
+const GPT_CODENAMES = new Set(["sol", "luna", "terra", "astra"]);
+
+export function modelDisplayName(model: string): string {
+  const id = model.toLowerCase();
+  const gpt = GPT_MODEL_ID.exec(id);
+  if (gpt) {
+    const [, version = "", variant = ""] = gpt;
+    const word = variant.slice(1);
+    if (GPT_CODENAMES.has(word)) return `${titleCase(word)} ${version}`;
+    return ["GPT", version, titleCase(variant)].filter(Boolean).join(" ");
+  }
+  const claude = CLAUDE_MODEL_ID.exec(id);
+  if (!claude) return model.toUpperCase();
+  const [, family = "", version = "", variant = ""] = claude;
+  return [titleCase(family), version.slice(1).replace(/-/g, "."), titleCase(variant)]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function reasoningDisplayName(
+  reasoning: string | null | undefined,
+): string | undefined {
+  const key = reasoning?.trim().toLowerCase();
+  if (!key) return undefined;
+  return REASONING_DISPLAY_NAMES[key] ?? titleCase(key);
+}
+
+export function personaFallbackNotice(
+  unavailablePersonaId: string | undefined,
+  personaId: string | null | undefined,
+): string | undefined {
+  if (!unavailablePersonaId) return undefined;
+  return personaId
+    ? `Persona "${unavailablePersonaId}" isn't available. Using "${personaId}" instead.`
+    : `Persona "${unavailablePersonaId}" isn't available. Continuing without a persona.`;
+}
+
+export function buildMattermostResponseFooter(params: {
+  harnessType?: string | null;
+  metadataEnabled?: boolean;
+  model?: string | null;
+  notice?: string | null;
+  reasoning?: string | null;
+  serviceTier?: string | null;
+}): string | undefined {
+  const includeMetadata = params.metadataEnabled === true;
+  const notice = params.notice?.trim();
+  if (!includeMetadata && !notice) return undefined;
+  const segments: string[] = [];
+  if (notice) segments.push(`⚠ ${escapeMattermostMarkdown(notice)}`);
+  if (includeMetadata) {
+    const model = params.model?.trim();
+    if (model) segments.push(escapeMattermostMarkdown(modelDisplayName(model)));
+    const harness = harnessDisplayName(params.harnessType);
+    if (harness) segments.push(escapeMattermostMarkdown(harness));
+    const reasoning = reasoningDisplayName(params.reasoning);
+    if (reasoning) segments.push(escapeMattermostMarkdown(reasoning));
+    const serviceTier = params.serviceTier?.trim();
+    if (serviceTier) {
+      segments.push(escapeMattermostMarkdown(titleCase(serviceTier)));
+    }
+  }
+  if (segments.length === 0) return undefined;
+  return `_${segments.join(" · ")}_`;
+}
+
+function escapeMattermostMarkdown(text: string): string {
+  return text.replaceAll("\\", "\\\\").replaceAll("*", "\\*").replaceAll("_", "\\_");
+}
+
+function titleCase(value: string): string {
+  return value
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 }
