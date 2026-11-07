@@ -71,6 +71,8 @@ Optional Teams ingress bootstrap (consumed when teamsbot.enabled=true):
 Optional Mattermost ingress bootstrap (consumed when mattermostbot.enabled=true):
   MATTERMOST_BOT_TOKEN       when set, seeds the mattermostbot bot token; overwritten
                              on every run so token rotation works
+  MATTERMOSTBOT_SLASH_COMMAND_TOKENS
+                             slash-command verification token; overwritten on every run
   MATTERMOSTBOT_API_KEY      bearer the bot sends to api-rs; auto-generated once when
                              absent (never rotated in place)
 
@@ -239,6 +241,9 @@ if secret_exists centaur-infra-env; then
       patch_data+=("\"MATTERMOSTBOT_API_KEY\":\"$(printf '%s' "${MATTERMOSTBOT_API_KEY:-$(rand_hex)}" | base64 | tr -d '\n')\"")
     fi
   fi
+  if [[ -n "${MATTERMOSTBOT_SLASH_COMMAND_TOKENS:-}" ]]; then
+    patch_data+=("\"MATTERMOSTBOT_SLASH_COMMAND_TOKENS\":\"$(printf '%s' "$MATTERMOSTBOT_SLASH_COMMAND_TOKENS" | base64 | tr -d '\n')\"")
+  fi
   # iron-control keys: top up only when absent so we never rotate them out from
   # under a running pod (its ActiveRecord-encrypted data would become
   # undecryptable). Generated values mirror the create path.
@@ -358,6 +363,9 @@ else
       --from-literal=MATTERMOST_BOT_TOKEN="$MATTERMOST_BOT_TOKEN"
       --from-literal=MATTERMOSTBOT_API_KEY="${MATTERMOSTBOT_API_KEY:-$(rand_hex)}"
     )
+  fi
+  if [[ -n "${MATTERMOSTBOT_SLASH_COMMAND_TOKENS:-}" ]]; then
+    secret_args+=(--from-literal=MATTERMOSTBOT_SLASH_COMMAND_TOKENS="$MATTERMOSTBOT_SLASH_COMMAND_TOKENS")
   fi
   if [[ -n "${OP_CONNECT_TOKEN:-}" ]]; then
     secret_args+=(--from-literal=OP_CONNECT_TOKEN="$OP_CONNECT_TOKEN")

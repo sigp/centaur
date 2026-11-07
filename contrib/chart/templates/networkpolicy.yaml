@@ -352,6 +352,38 @@ spec:
     - ports:
         - protocol: TCP
           port: 443
+{{- if .Values.mattermostbot.enabled }}
+    # Mattermost server egress mirrors mattermostbot.serverEgress.
+{{- with .Values.mattermostbot.serverEgress.cidrs }}
+    - to:
+{{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.mattermostbot.serverEgress.port }}
+{{- end }}
+{{- with .Values.mattermostbot.serverEgress.podSelector }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ toYaml . | nindent 14 }}
+{{- with $.Values.mattermostbot.serverEgress.namespace }}
+          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.mattermostbot.serverEgress.port }}
+{{- end }}
+{{- if and (not .Values.mattermostbot.serverEgress.cidrs) (not .Values.mattermostbot.serverEgress.podSelector) }}
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.mattermostbot.serverEgress.port }}
+{{- end }}
+{{- end }}
     # Kubernetes API egress. The kubernetes.default ClusterIP (:443) is DNAT'd
     # to the real endpoint port (6443 on k3s/kubeadm); enforcing CNIs match
     # egress post-DNAT, so allow that port or api-rs can't manage sandboxes.
@@ -541,9 +573,8 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Health probes and annotation-based Prometheus scrapes from the configured
-    # ingress source namespaces reach mattermostbot; the websocket connection
-    # and OpenAI-compatible classifier calls are outbound.
+    # The ingress controller namespace must be admitted in
+    # networkPolicy.ingressSourceNamespaces when mattermostbot.ingress is enabled.
     - from:
 {{- range $ingressSourceNamespaces }}
         - namespaceSelector:

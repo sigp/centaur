@@ -77,6 +77,63 @@ state store, and admits health probes and annotation-based metric scrapes on
 port 3001. If proactivity or the `llm` message-override strategy is enabled,
 it adds TCP 443 egress for the configured OpenAI-compatible endpoint.
 
+## Expose workflow and slash-command endpoints
+
+The optional Mattermost Ingress exposes only the `/api/mattermost` prefix on
+the bot's port `3001`; health and metrics remain private. Set `publicUrl` to
+the HTTPS origin reachable by Mattermost, or leave it empty to derive
+`https://<ingress.host>` when the chart's ingress is enabled with a host. Add
+the ingress controller namespace to `networkPolicy.ingressSourceNamespaces`.
+
+```yaml
+mattermostbot:
+  publicUrl: https://centaur-mm.example.com
+  ingress:
+    enabled: true
+    className: nginx
+    host: centaur-mm.example.com
+    tls:
+      - hosts: [centaur-mm.example.com]
+        secretName: centaur-mm-tls
+  slashCommands:
+    workflows: [deploy, investigate]
+```
+
+Create the command under **Product menu → Integrations → Slash Commands → Add
+Slash Command**. If **Integrations** is missing, a System Admin enables custom
+slash commands under **System Console → Integrations → Integration
+Management**. Configure:
+
+- Command trigger word: `centaur`
+- Request URL: `<publicUrl>/api/mattermost/commands`
+- Request method: `POST`
+
+Put the token Mattermost generates in the infra Secret as
+`MATTERMOSTBOT_SLASH_COMMAND_TOKENS`; do not put it in a values file. The
+bootstrap script accepts the same-named shell variable and rotates it on each
+run.
+
+`/centaur help` lists commands. `/centaur run <workflow> [JSON object]` starts one
+of the names in `mattermostbot.slashCommands.workflows`; the optional JSON object
+is passed as workflow input. Any other text is a prompt: the bot posts
+`@<user> asked: <prompt>` and answers in that post's thread, as if the user had
+mentioned it, so inline flags work too.
+
+Typed in a thread's reply box, a command stays in that thread: a prompt joins
+the thread's conversation like a mention there (steering a running turn),
+`run` posts its start notice in the thread and gives the workflow that thread,
+and `/centaur stop` interrupts the thread's running turn, as `@<bot> stop` does.
+Typed in the channel, `/centaur stop` only explains that it needs a thread.
+
+Workflow messages can include interactive buttons. Mattermost sends each click
+to the bot's `/api/mattermost/actions`; the bot checks the team, channel and
+post, and api-rs verifies the button's signature before starting the run. No
+callback secret is configured separately.
+
+The chart renders `MATTERMOST_BASE_URL` and `MATTERMOST_BOT_TOKEN` into api-rs
+when the bot is enabled, plus `MATTERMOST_WORKFLOW_ACTIONS_URL` when `publicUrl`
+is set or the ingress fallback applies.
+
 ## Provide secrets and deploy
 
 The bootstrap script accepts the token directly from the shell. It overwrites
@@ -93,6 +150,7 @@ provide these keys in the Secret named by `secretManager.existingSecretName`:
 
 - `MATTERMOST_BOT_TOKEN`
 - `MATTERMOSTBOT_API_KEY`
+- `MATTERMOSTBOT_SLASH_COMMAND_TOKENS` (when slash commands are enabled)
 - `DATABASE_URL` (the Chat SDK state store is rendered as
   `MATTERMOSTBOT_DATABASE_URL`)
 
@@ -297,7 +355,4 @@ The first Mattermost integration deliberately has a narrow surface:
   thread identity, so replies stay in the originating Mattermost thread.
 - Direct messages and group-message channels are denied, even if the bot is
   added to them.
-- Slash commands are not supported.
-- Interactive buttons and callbacks are not supported; no callback URL or
-  callback secret is needed.
 - There is one bot replica by design. Do not add an HPA or a second pod.

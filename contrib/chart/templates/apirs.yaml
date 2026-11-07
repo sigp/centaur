@@ -1,6 +1,10 @@
 {{- if .Values.apiRs.enabled }}
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
 {{- $mcpPublicUrl := default .Values.slackbotv2.mcpPublicUrl .Values.apiRs.mcpPublicUrl -}}
+{{- $mattermostPublicUrl := .Values.mattermostbot.publicUrl | trimSuffix "/" -}}
+{{- if and (not $mattermostPublicUrl) .Values.mattermostbot.ingress.enabled .Values.mattermostbot.ingress.host -}}
+{{- $mattermostPublicUrl = printf "https://%s" .Values.mattermostbot.ingress.host -}}
+{{- end -}}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
 {{- $repoCacheStorageType := include "centaur.repoCacheStorageType" . -}}
 {{- $repoCacheUsePvc := eq $repoCacheStorageType "persistentVolumeClaim" -}}
@@ -243,6 +247,20 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" $ }}
                   key: {{ printf "%s%s" $.Values.secretManager.envPrefix $ingress.key }}
+{{- end }}
+{{- end }}
+{{- if .Values.mattermostbot.enabled }}
+            - name: MATTERMOST_BASE_URL
+              value: {{ .Values.mattermostbot.serverUrl | quote }}
+            - name: MATTERMOST_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sMATTERMOST_BOT_TOKEN" .Values.secretManager.envPrefix }}
+                  optional: true
+{{- if $mattermostPublicUrl }}
+            - name: MATTERMOST_WORKFLOW_ACTIONS_URL
+              value: {{ printf "%s/api/mattermost/actions" $mattermostPublicUrl | quote }}
 {{- end }}
 {{- end }}
             - name: BIND_ADDR

@@ -98,6 +98,14 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sMATTERMOSTBOT_API_KEY" .Values.secretManager.envPrefix }}
+            - name: MATTERMOSTBOT_SLASH_WORKFLOWS
+              value: {{ join "," .Values.mattermostbot.slashCommands.workflows | quote }}
+            - name: MATTERMOSTBOT_SLASH_COMMAND_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sMATTERMOSTBOT_SLASH_COMMAND_TOKENS" .Values.secretManager.envPrefix }}
+                  optional: true
             - name: MATTERMOSTBOT_DATABASE_URL
               valueFrom:
                 secretKeyRef:

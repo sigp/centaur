@@ -608,6 +608,26 @@
         "userName": { "type": "string" },
         "serverUrl": { "type": "string" },
         "teamAllowlist": { "type": "string" },
+        "publicUrl": { "type": "string" },
+        "ingress": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "className": { "type": "string" },
+            "annotations": { "type": "object" },
+            "host": { "type": "string" },
+            "tls": { "type": "array" }
+          }
+        },
+        "slashCommands": {
+          "type": "object",
+          "properties": {
+            "workflows": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
         "serverEgress": {
           "type": "object",
           "properties": {

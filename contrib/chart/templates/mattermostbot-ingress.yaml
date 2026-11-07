@@ -1,0 +1,33 @@
+{{- if and .Values.mattermostbot.enabled .Values.mattermostbot.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "mattermostbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "mattermostbot") | nindent 4 }}
+  {{- with .Values.mattermostbot.ingress.annotations }}
+  annotations:
+{{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.mattermostbot.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+    - {{- if .Values.mattermostbot.ingress.host }}
+      host: {{ .Values.mattermostbot.ingress.host | quote }}
+      {{- end }}
+      http:
+        paths:
+          - path: /api/mattermost
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "centaur.componentName" (dict "root" . "component" "mattermostbot") }}
+                port:
+                  number: 3001
+  {{- with .Values.mattermostbot.ingress.tls }}
+  tls:
+{{ toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

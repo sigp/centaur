@@ -27,6 +27,9 @@ Use these as the main extension points:
 | `mattermostbot.serverUrl`, `mattermostbot.teamAllowlist` | Helm values set the Mattermost base URL and comma/space-separated team IDs; both are required for useful Mattermost ingress operation. |
 | `mattermostbot.serverEgress.*` | Helm values scope Mattermost NetworkPolicy egress by TCP port, CIDRs, or an in-cluster pod selector; default is TCP 443 to any address. |
 | `mattermostbot.extraEnv` | Helm values provide optional Mattermostbot environment overrides, including `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST` and `MATTERMOSTBOT_STATE_KEY_PREFIX`. |
+| `mattermostbot.publicUrl` | Helm value; defaults to empty and falls back to `https://<ingress.host>` when `mattermostbot.ingress` is enabled with a host. Public HTTPS origin for Mattermost slash-command and workflow-action callbacks. |
+| `mattermostbot.ingress.enabled`, `.className`, `.annotations`, `.host`, `.tls` | Helm values; ingress is disabled by default. Exposes only `/api/mattermost` to the Mattermost bot Service on port `3001`; health and metrics stay private. |
+| `mattermostbot.slashCommands.workflows` | Helm value; defaults to `[]`. Workflow names allowed by `/centaur run <workflow> [JSON]`; rendered as `MATTERMOSTBOT_SLASH_WORKFLOWS`. |
 | `sandbox.extraEnv` | Extra variables copied into every sandbox pod through `KUBERNETES_SANDBOX_EXTRA_ENV`. |
 | `overlays.sources` | Ordered repo-cache-backed overlay repos for tools, workflows, and skills; subdirs default to `tools`, `workflows`, and `.agents/skills`. |
 | `overlay.systemPrompt` | Small inline prompt overlay escape hatch. |
@@ -60,6 +63,7 @@ Optional required-by-mode variables:
 | `TEAMSBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it when Teams credentials are present and it is omitted. | Static API key used by Teamsbot. |
 | `MATTERMOST_BOT_TOKEN` | Local shell before `just bootstrap-secrets`; production Secret. | Mattermost bot account token; when supplied to the bootstrap script it is overwritten on each run. |
 | `MATTERMOSTBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it when Mattermost credentials are present and it is omitted. | Static API key accepted by api-rs for Mattermost sessions. |
+| `MATTERMOSTBOT_SLASH_COMMAND_TOKENS` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Mattermost slash-command verification token; optional, and the `/commands` route returns `404` when absent. |
 | `CENTAUR_APIRS_ADMIN_API_KEY` | `secretManager.existingSecretName` or the api-rs environment. | Optional static bearer token with every api-rs capability. Generate a distinct value with `openssl rand -hex 32`. |
 
 ## Console and Permission Control Plane
@@ -127,6 +131,9 @@ created. Changing a default does not rewrite existing principals.
 | `apiRs.metrics.annotations` | Helm value. | Additional scrape annotations for Prometheus-compatible collectors. |
 | `apiRs.activitySummary.*` | Helm values, default disabled. | Enables API-RS to summarize live session activity into durable `session.activity_summary` events. |
 | `SLACK_BOT_TOKEN` | Explicit `secretKeyRef` from `secretManager.existingSecretName`. | Slack Web API access for api-rs Slack proxy and workflow Slack helpers. |
+| `MATTERMOST_BASE_URL` | Chart-rendered from `mattermostbot.serverUrl` when `mattermostbot.enabled`. | Mattermost REST base URL used by api-rs workflow actions. |
+| `MATTERMOST_BOT_TOKEN` | `secretManager.existingSecretName`, chart-rendered when `mattermostbot.enabled`. | Mattermost bot token used by api-rs workflow actions. |
+| `MATTERMOST_WORKFLOW_ACTIONS_URL` | Chart-rendered when `mattermostbot.enabled`, from `mattermostbot.publicUrl` or else `https://<ingress.host>` with the bot ingress enabled. | Signed callback URL embedded in Mattermost workflow buttons. |
 | `OPENAI_API_KEY` | Secret mounted into api-rs, or `apiRs.extraEnv` for local/dev overrides. | OpenAI credential for activity summaries; the feature stays disabled when no key is present. |
 | `OPENAI_BASE_URL` | `apiRs.extraEnv`; default `https://api.openai.com/v1`. | OpenAI-compatible Responses API base URL for every api-rs OpenAI caller: Codex, generated session titles, and activity summaries. API-RS passes it into Codex sandboxes and derives iron-proxy's `OPENAI_API_KEY` host scope from it; `api.openai.com` and `us.api.openai.com` are always included. |
 | `SESSION_ACTIVITY_SUMMARY_OPENAI_BASE_URL` | Deprecated `apiRs.activitySummary.openaiBaseUrl` compatibility setting. | Existing activity-summary endpoint override. `OPENAI_BASE_URL` takes precedence when both are set. |
@@ -209,6 +216,8 @@ Execution tuning:
 | `MATTERMOST_BASE_URL` | `mattermostbot.serverUrl`. | Base URL of the Mattermost server. |
 | `MATTERMOST_BOT_TOKEN` | `secretManager.existingSecretName`. | Mattermost bot account token used for the websocket connection. |
 | `MATTERMOSTBOT_API_KEY` | `secretManager.existingSecretName`. | Dedicated bearer key used by Mattermostbot to call api-rs. |
+| `MATTERMOSTBOT_SLASH_WORKFLOWS` | `mattermostbot.slashCommands.workflows`. | Comma-separated workflow allowlist for `/centaur run`. |
+| `MATTERMOSTBOT_SLASH_COMMAND_TOKENS` | `secretManager.existingSecretName`; optional. | Slash-command token accepted by the bot's `/api/mattermost/commands` route. |
 | `MATTERMOSTBOT_DATABASE_URL` | `DATABASE_URL` in `secretManager.existingSecretName`. | Chat SDK Postgres state store. |
 | `MATTERMOSTBOT_USER_NAME` | `mattermostbot.userName`. | Bot username used for Mattermost adapter setup; defaults to `centaur`. |
 | `MATTERMOSTBOT_TEAM_ALLOWLIST` | `mattermostbot.teamAllowlist`. | Comma/space-separated Mattermost team IDs. The bot remains inert until this is set; direct messages and group messages are denied. |
@@ -216,6 +225,7 @@ Execution tuning:
 | `mattermostbot.serverEgress.port` | Helm value, default `443`. | Mattermost server TCP port allowed by the bot NetworkPolicy. Set it for a non-HTTPS or nonstandard server port. |
 | `mattermostbot.serverEgress.cidrs` | Helm value. | Optional destination address ranges. Empty permits the configured port to any address. |
 | `mattermostbot.serverEgress.podSelector`, `mattermostbot.serverEgress.namespace` | Helm values. | Optional in-cluster Mattermost pod labels and namespace. Use this for a Mattermost Service/pod instead of CIDRs. |
+| `mattermostbot.publicUrl`, `.ingress.*`, `.slashCommands.workflows` | Helm values; defaults are empty URL, disabled ingress, and an empty workflow list. | Configure Mattermost callback exposure and the workflow names available to `/centaur run`. |
 | `mattermostbot.extraEnv`, `mattermostbot.resources` | Helm values. | Additional container environment and resource requests/limits. |
 | `OPENAI_API_KEY` | Optional key in `secretManager.existingSecretName`. | Shared fallback key for the `llm` message-override strategy and the OpenAI proactivity classifier. |
 | `MATTERMOSTBOT_DEFAULT_HARNESS` | Chart-rendered from `sandbox.harnessEngine`. | Base harness for new Mattermost threads without an explicit flag or channel default; defaults to `codex`. |

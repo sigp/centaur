@@ -1024,6 +1024,30 @@ mattermostbot:
   # Comma/space-separated Mattermost team IDs. The bot is INERT (ignores all posts) until set;
   # DMs and group messages are always denied.
   teamAllowlist: ""
+  # Public HTTPS base URL of the Mattermost-facing endpoints, e.g. https://centaur-mm.example.com.
+  # Mattermost POSTs interactive button clicks and slash commands to
+  # <publicUrl>/api/mattermost/{actions,commands}. api-rs signs it into workflow buttons as
+  # MATTERMOST_WORKFLOW_ACTIONS_URL (<publicUrl>/api/mattermost/actions). Empty falls back to
+  # https://<ingress.host> when ingress is enabled with a host; with neither, workflow buttons
+  # are unavailable.
+  publicUrl: ""
+  # Optional Ingress exposing ONLY the /api/mattermost path prefix of the bot (port 3001), so
+  # /health and /metrics stay private. Bring your own controller via className + annotations + tls,
+  # and add the controller's namespace to networkPolicy.ingressSourceNamespaces so its pods can
+  # reach the bot (the bot NetworkPolicy admits those namespaces).
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: ""
+    tls: []
+  # `/centaur` slash command (POST <publicUrl>/api/mattermost/commands). The command's token
+  # goes in the infra secret as MATTERMOSTBOT_SLASH_COMMAND_TOKENS (comma/space-separated);
+  # unset, the endpoint answers 404.
+  slashCommands:
+    # Workflow names that `/centaur run <workflow> [JSON]` may start (MATTERMOSTBOT_SLASH_WORKFLOWS).
+    # Empty disables `run`.
+    workflows: []
   # NetworkPolicy egress to the Mattermost server (used when networkPolicy.enabled=true). With
   # neither cidrs nor podSelector set, the bot may reach TCP `port` on any address, like discordbot.
   serverEgress:
