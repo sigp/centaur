@@ -15,6 +15,9 @@ name: sigp release
       - Cargo.lock
       - crates/**
       - services/api-rs/**
+      # The api-rs image installs the Python workflow host and SDK.
+      - services/workflow-python/**
+      - centaur_sdk/**
       - contrib/chart/**
       - services/console/**
       - services/mattermostbot/**
