@@ -1,0 +1,899 @@
+import type { RustSessionStreamEvent } from "@centaur/harness-events";
+import { isRetryableCodexErrorNotification } from "@centaur/rendering";
+import type { Attachment, Message } from "chat";
+import type {
+  MattermostbotApiAttachment,
+  MattermostbotApiMessage,
+  MattermostbotAppendMessagesRequest,
+  MattermostbotCreateSessionRequest,
+  MattermostbotExecuteSessionRequest,
+  MattermostbotExecuteSessionResponse,
+  MattermostbotOptions,
+  MattermostbotRendererSource,
+  MattermostbotSessionMessage,
+  ForwardSessionInput,
+  JsonObject,
+  JsonValue,
+} from "./types";
+import {
+  elapsedMs,
+  isJsonObject,
+  noopLogger,
+  nowMs,
+  stringValue,
+  toAsyncIterable,
+  traceLog,
+} from "./utils";
+
+export class SessionApiError extends Error {
+  readonly action: string;
+  readonly body: string;
+  readonly retryable: boolean;
+  readonly status: number;
+  readonly statusText: string;
+
+  constructor(input: {
+    action: string;
+    body: string;
+    retryable: boolean;
+    status: number;
+    statusText: string;
+  }) {
+    // api-rs error bodies can carry internals; keep them out of the message,
+    // which is surfaced verbatim into the user-facing Mattermost thread.
+    super(
+      `Centaur session ${input.action} failed: ${input.status} ${input.statusText}`,
+    );
+    this.name = "SessionApiError";
+    this.action = input.action;
+    this.body = input.body;
+    this.retryable = input.retryable;
+    this.status = input.status;
+    this.statusText = input.statusText;
+  }
+}
+
+export function isRetryableSessionApiError(error: unknown): boolean {
+  if (error instanceof SessionApiError) return error.retryable;
+  if (!(error instanceof Error)) return false;
+  return error.name === "AbortError" || error.name === "TypeError";
+}
+
+type ForwardSessionApiCallbacks = {
+  onExecutionStarted?(
+    execution: MattermostbotExecuteSessionResponse,
+  ): Promise<void>;
+  onMessagesAppended?(): Promise<void>;
+};
+
+export async function collectInitialContext(
+  thread: { allMessages: AsyncIterable<Message> },
+  currentMessage: Message,
+): Promise<MattermostbotApiMessage[]> {
+  const messages: Message[] = [];
+  try {
+    for await (const message of thread.allMessages) {
+      messages.push(message);
+    }
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      (error.name === "ResourceNotFoundError" ||
+        /not found|not available/i.test(error.message))
+    ) {
+      return [await serializeMessage(currentMessage)];
+    }
+    throw error;
+  }
+
+  const currentIndex = messages.findIndex(
+    (message) => message.id === currentMessage.id,
+  );
+  if (currentIndex >= 0) {
+    messages[currentIndex] = currentMessage;
+  } else {
+    messages.push(currentMessage);
+  }
+
+  const serialized: MattermostbotApiMessage[] = [];
+  for (const message of messages) {
+    serialized.push(await serializeMessage(message));
+  }
+  return serialized;
+}
+
+
+// Messages without text or attachments would fabricate a synthetic "continue"
+// turn when executed. Callers skip such events.
+export function isContentlessApiMessage(
+  message: MattermostbotApiMessage,
+): boolean {
+  return message.text.trim() === "" && message.attachments.length === 0;
+}
+
+export async function serializeMessage(
+  message: Message,
+): Promise<MattermostbotApiMessage> {
+  const attachments: MattermostbotApiAttachment[] = [];
+  for (const attachment of message.attachments) {
+    attachments.push(await serializeAttachment(attachment));
+  }
+
+  return {
+    attachments,
+    author: {
+      fullName: message.author.fullName,
+      isBot: message.author.isBot,
+      isMe: message.author.isMe,
+      userId: message.author.userId,
+      userName: message.author.userName,
+    },
+    id: message.id,
+    isMention: message.isMention === true,
+    raw: message.raw,
+    text: message.text,
+    threadId: message.threadId,
+    timestamp: message.metadata.dateSent.toISOString(),
+  };
+}
+
+// Create/append and execute are deliberately separate: the websocket ingress
+// records the session first, then starts execution after the handoff succeeds.
+export async function forwardToSessionApi(
+  options: MattermostbotOptions,
+  input: ForwardSessionInput,
+  callbacks: ForwardSessionApiCallbacks = {},
+): Promise<AsyncIterable<MattermostbotRendererSource> | null> {
+  const createStartedAtMs = nowMs();
+  await createSession(options, input.threadId, input.conversationName);
+  traceLog(options, "mattermostbot_session_create_complete", input.trace, {
+    phase_ms: elapsedMs(createStartedAtMs),
+  });
+  if (input.messages.length > 0) {
+    const appendStartedAtMs = nowMs();
+    await appendSessionMessages(options, input.threadId, input.messages);
+    traceLog(options, "mattermostbot_session_append_complete", input.trace, {
+      message_count: input.messages.length,
+      phase_ms: elapsedMs(appendStartedAtMs),
+    });
+    await callbacks.onMessagesAppended?.();
+  } else {
+    traceLog(options, "mattermostbot_session_append_skipped", input.trace, {
+      message_count: 0,
+    });
+  }
+  if (!input.executeMessage) return null;
+
+  const executeStartedAtMs = nowMs();
+  const execution = await executeSession(
+    options,
+    input.threadId,
+    input.executeMessage,
+  );
+  traceLog(options, "mattermostbot_session_execute_complete", input.trace, {
+    execution_id: execution.execution_id,
+    phase_ms: elapsedMs(executeStartedAtMs),
+  });
+  await callbacks.onExecutionStarted?.(execution);
+  if (!input.openStream) return null;
+
+  return openSessionEventStream(options, input);
+}
+
+/**
+ * Execute the session turn on its own (start the agent run), returning the
+ * execution. Split out of forwardToSessionApi so the render stream can run it
+ * AFTER the 👀 working reaction lands — the execute call blocks on cold
+ * sandbox spin-up. Idempotent via the request's idempotency_key, so a render
+ * retry won't re-spawn the sandbox.
+ */
+export async function executeSessionTurn(
+  options: MattermostbotOptions,
+  input: ForwardSessionInput,
+): Promise<MattermostbotExecuteSessionResponse | null> {
+  if (!input.executeMessage) return null;
+  const executeStartedAtMs = nowMs();
+  const execution = await executeSession(
+    options,
+    input.threadId,
+    input.executeMessage,
+  );
+  traceLog(options, "mattermostbot_session_execute_complete", input.trace, {
+    execution_id: execution.execution_id,
+    phase_ms: elapsedMs(executeStartedAtMs),
+  });
+  return execution;
+}
+
+export async function openSessionEventStream(
+  options: MattermostbotOptions,
+  input: Pick<
+    ForwardSessionInput,
+    "afterEventId" | "executionId" | "onEventId" | "threadId" | "trace"
+  >,
+): Promise<AsyncIterable<MattermostbotRendererSource>> {
+  const streamStartedAtMs = nowMs();
+  const stream = await streamSessionNotifications(
+    options,
+    input.threadId,
+    input.afterEventId,
+    input.executionId,
+    input.onEventId,
+  );
+  traceLog(options, "mattermostbot_session_events_opened", input.trace, {
+    after_event_id: input.afterEventId,
+    execution_id: input.executionId,
+    phase_ms: elapsedMs(streamStartedAtMs),
+  });
+  return stream;
+}
+
+// Deliberate delta from slackbotv2 (which removed this entirely): the
+// synthetic starting item primes the mapper's task state so answer deltas
+// stream immediately instead of waiting out the pre-stream grace period.
+export function startingStreamNotification(threadId: string): JsonObject {
+  return {
+    method: "item/started",
+    params: {
+      threadId,
+      turnId: "mattermostbot-starting-turn",
+      startedAtMs: Date.now(),
+      item: {
+        id: "mattermostbot-starting",
+        memoryCitation: null,
+        phase: "commentary",
+        text: "",
+        type: "agentMessage",
+      },
+    },
+  };
+}
+
+export function sessionStreamError(error: unknown): RustSessionStreamEvent {
+  return {
+    data: { error: error instanceof Error ? error.message : String(error) },
+    event: "session.stream_error",
+    eventKind: "session.stream_error",
+  };
+}
+
+/** Largest attachment we are willing to buffer in memory and inline as base64. */
+export const MAX_INLINE_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+
+/**
+ * Largest JSON codex input line we will emit. A `data:` URL inlined directly in
+ * the user message blows past this for larger images, so anything bigger is
+ * delivered out-of-band as `attachment.chunk` lines and referenced by a staged
+ * attachment id (mirrors slackbotv2).
+ */
+const MAX_CODEX_INPUT_LINE_CHARS = 900 * 1024;
+const STAGED_ATTACHMENT_CHUNK_CHARS = 700 * 1024;
+
+export async function serializeAttachment(
+  attachment: Attachment,
+  fetchFn: typeof fetch = fetch,
+): Promise<MattermostbotApiAttachment> {
+  const serialized: MattermostbotApiAttachment = {
+    fetchMetadata: attachment.fetchMetadata,
+    height: attachment.height,
+    mimeType: attachment.mimeType,
+    name: attachment.name,
+    size: attachment.size,
+    type: attachment.type,
+    url: attachment.url,
+    width: attachment.width,
+  };
+
+  if (
+    typeof attachment.size === "number" &&
+    attachment.size > MAX_INLINE_ATTACHMENT_BYTES
+  ) {
+    serialized.fetchError = attachmentTooLargeError(attachment.size);
+    return serialized;
+  }
+
+  try {
+    // Mattermost file attachments can be represented by a URL or downloaded
+    // to base64. AWS Bedrock accepts data URLs and staged attachment chunks,
+    // so inline only within the bounded size limit.
+    const data =
+      attachment.data ??
+      (await attachment.fetchData?.()) ??
+      (await fetchAttachmentData(attachment.url, fetchFn));
+    if (data) {
+      const byteLength = Buffer.isBuffer(data)
+        ? data.length
+        : data instanceof Blob
+          ? data.size
+          : data.byteLength;
+      if (byteLength > MAX_INLINE_ATTACHMENT_BYTES) {
+        serialized.fetchError = attachmentTooLargeError(byteLength);
+        return serialized;
+      }
+      serialized.dataBase64 = await bytesToBase64(data);
+    }
+  } catch (error) {
+    serialized.fetchError =
+      error instanceof Error ? error.message : String(error);
+  }
+
+  return serialized;
+}
+
+async function fetchAttachmentData(
+  url: string | undefined,
+  fetchFn: typeof fetch,
+): Promise<Buffer | undefined> {
+  if (!url) return undefined;
+  const response = await fetchFn(url);
+  if (!response.ok) {
+    throw new Error(
+      `failed to download attachment (${response.status} ${response.statusText})`,
+    );
+  }
+  return Buffer.from(await response.arrayBuffer());
+}
+
+function attachmentTooLargeError(bytes: number): string {
+  return `attachment too large to inline (${bytes} bytes > ${MAX_INLINE_ATTACHMENT_BYTES} byte limit)`;
+}
+
+async function bytesToBase64(
+  data: Buffer | Blob | ArrayBuffer,
+): Promise<string> {
+  if (Buffer.isBuffer(data)) return data.toString("base64");
+  const bytes = data instanceof Blob ? await data.arrayBuffer() : data;
+  return Buffer.from(bytes).toString("base64");
+}
+
+async function createSession(
+  options: MattermostbotOptions,
+  threadId: string,
+  conversationName?: string,
+): Promise<void> {
+  const fetchFn = options.fetch ?? fetch;
+  const name = conversationName?.trim();
+  const body: MattermostbotCreateSessionRequest = {
+    harness_type: "codex",
+    metadata: {
+      source: "mattermostbot",
+      platform: "mattermost",
+      thread_id: threadId,
+      // api-rs reads this as the session principal's display name.
+      ...(name ? { mattermost_conversation_name: name } : {}),
+    },
+  };
+  const response = await fetchFn(apiSessionUrl(options.apiUrl, threadId), {
+    method: "POST",
+    headers: apiHeaders(options),
+    body: JSON.stringify(body),
+  });
+  await ensureApiOk(response, "create session", options);
+}
+
+async function appendSessionMessages(
+  options: MattermostbotOptions,
+  threadId: string,
+  messages: MattermostbotApiMessage[],
+): Promise<void> {
+  const fetchFn = options.fetch ?? fetch;
+  const body: MattermostbotAppendMessagesRequest = {
+    messages: messages.map(toSessionMessage),
+  };
+  const response = await fetchFn(
+    apiSessionUrl(options.apiUrl, threadId, "messages"),
+    {
+      method: "POST",
+      headers: apiHeaders(options),
+      body: JSON.stringify(body),
+    },
+  );
+  await ensureApiOk(response, "append session messages", options);
+}
+
+async function executeSession(
+  options: MattermostbotOptions,
+  threadId: string,
+  message: MattermostbotApiMessage,
+): Promise<MattermostbotExecuteSessionResponse> {
+  const fetchFn = options.fetch ?? fetch;
+  const body: MattermostbotExecuteSessionRequest = {
+    idempotency_key: message.id,
+    metadata: sessionMetadata(message, { action: "execute" }),
+    input_lines: toCodexInputLines(message, threadId),
+    ...(options.idleTimeoutMs === undefined
+      ? {}
+      : { idle_timeout_ms: options.idleTimeoutMs }),
+    ...(options.maxDurationMs === undefined
+      ? {}
+      : { max_duration_ms: options.maxDurationMs }),
+  };
+  const response = await fetchFn(
+    apiSessionUrl(options.apiUrl, threadId, "execute"),
+    {
+      method: "POST",
+      headers: apiHeaders(options),
+      body: JSON.stringify(body),
+    },
+  );
+  await ensureApiOk(response, "execute session", options);
+  return (await response.json()) as MattermostbotExecuteSessionResponse;
+}
+
+async function ensureApiOk(
+  response: Response,
+  action: string,
+  options: MattermostbotOptions,
+): Promise<void> {
+  if (response.ok) return;
+  let body = "";
+  try {
+    body = await response.text();
+  } catch {
+    body = "";
+  }
+  // api-rs is internal and unauthenticated; keep detailed error bodies in
+  // server logs while exposing only a generic message to Mattermost users.
+  if (body) {
+    (options.logger ?? noopLogger).warn("mattermostbot_session_api_error", {
+      action,
+      status: response.status,
+      status_text: response.statusText,
+      body,
+    });
+  }
+  throw new SessionApiError({
+    action,
+    body,
+    retryable: isRetryableApiStatus(response.status),
+    status: response.status,
+    statusText: response.statusText,
+  });
+}
+
+function isRetryableApiStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+async function streamSessionNotifications(
+  options: MattermostbotOptions,
+  threadId: string,
+  afterEventId: number,
+  executionId: string | undefined,
+  onEventId: (eventId: number) => void,
+): Promise<AsyncIterable<MattermostbotRendererSource>> {
+  const fetchFn = options.fetch ?? fetch;
+  const url = new URL(apiSessionUrl(options.apiUrl, threadId, "events"));
+  url.searchParams.set("after_event_id", String(afterEventId));
+  if (executionId) url.searchParams.set("execution_id", executionId);
+  const response = await fetchFn(url.toString(), {
+    method: "GET",
+    headers: apiHeaders(options, false),
+  });
+  await ensureApiOk(response, "stream events", options);
+  if (!response.body) return toAsyncIterable([]);
+  return parseSessionEventStream(response.body, onEventId);
+}
+
+function apiSessionUrl(
+  apiUrl: string,
+  threadId: string,
+  suffix?: "messages" | "execute" | "events",
+): string {
+  const path = `/api/session/${encodeURIComponent(threadId)}${suffix ? `/${suffix}` : ""}`;
+  return new URL(path, ensureTrailingSlash(apiUrl)).toString();
+}
+
+function ensureTrailingSlash(value: string): string {
+  return value.endsWith("/") ? value : `${value}/`;
+}
+
+function apiHeaders(options: MattermostbotOptions, jsonBody = true): HeadersInit {
+  const apiKey = options.apiKey ?? process.env.MATTERMOSTBOT_API_KEY;
+  return {
+    ...(jsonBody ? { "content-type": "application/json" } : {}),
+    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+  };
+}
+
+function toSessionMessage(
+  message: MattermostbotApiMessage,
+): MattermostbotSessionMessage {
+  return {
+    client_message_id: message.id,
+    role: message.author.isMe ? "assistant" : "user",
+    parts: sessionMessageParts(message),
+    metadata: sessionMetadata(message),
+  };
+}
+
+function sessionMessageParts(message: MattermostbotApiMessage): JsonValue[] {
+  const parts: JsonValue[] = [];
+  if (message.text.trim()) {
+    parts.push({ type: "text", text: message.text });
+  }
+  for (const attachment of message.attachments) {
+    parts.push(sessionAttachmentPart(attachment));
+  }
+  return parts.length > 0 ? parts : [{ type: "text", text: "" }];
+}
+
+function sessionAttachmentPart(attachment: MattermostbotApiAttachment): JsonObject {
+  const part: JsonObject = {
+    ...attachment,
+    attachment_type: attachment.type,
+    type: "attachment",
+  };
+  // Don't persist megabytes of base64 in the stored session message; the
+  // executing turn delivers the bytes separately (inline or staged chunks).
+  if (
+    typeof attachment.dataBase64 === "string" &&
+    attachment.dataBase64.length > MAX_CODEX_INPUT_LINE_CHARS
+  ) {
+    delete part.dataBase64;
+    part.dataBase64Omitted = `${attachment.dataBase64.length} base64 chars omitted from stored session message`;
+  }
+  return part;
+}
+
+export function sessionMetadata(
+  message: MattermostbotApiMessage,
+  extra: JsonObject = {},
+): JsonObject {
+  return {
+    source: "mattermostbot",
+    platform: "mattermost",
+    message_id: message.id,
+    thread_id: message.threadId,
+    is_mention: message.isMention,
+    timestamp: message.timestamp,
+    user_id: message.author.userId,
+    user_name: message.author.userName,
+    ...extra,
+  };
+}
+
+/**
+ * Build the codex input lines for an execute turn. Attachments whose inlined
+ * `data:` URL would push the user-message line past `MAX_CODEX_INPUT_LINE_CHARS`
+ * are streamed ahead of it as `attachment.chunk` lines and referenced by a
+ * staged attachment id; everything else stays inline. Mirrors slackbotv2.
+ */
+export function toCodexInputLines(
+  message: MattermostbotApiMessage,
+  threadId: string,
+): string[] {
+  const staged = new Map<MattermostbotApiAttachment, string>();
+  const lines: string[] = [];
+  for (const attachment of message.attachments) {
+    if (!attachment.dataBase64) continue;
+    const inlineLine = toCodexInputLineWithStaged(message, threadId, staged);
+    if (
+      inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS &&
+      attachment.dataBase64.length <= MAX_CODEX_INPUT_LINE_CHARS
+    ) {
+      continue;
+    }
+    const stagedAttachmentId = `att-${message.id}-${staged.size + 1}`;
+    staged.set(attachment, stagedAttachmentId);
+    lines.push(...stagedAttachmentInputLines(attachment, stagedAttachmentId));
+  }
+  lines.push(toCodexInputLineWithStaged(message, threadId, staged));
+  return lines;
+}
+
+function toCodexInputLineWithStaged(
+  message: MattermostbotApiMessage,
+  threadId: string,
+  staged: Map<MattermostbotApiAttachment, string>,
+): string {
+  return JSON.stringify({
+    type: "user",
+    thread_key: threadId,
+    trace_metadata: sessionMetadata(message, { action: "execute" }),
+    message: {
+      role: "user",
+      content: codexInputContent(message, staged),
+    },
+  });
+}
+
+function stagedAttachmentInputLines(
+  attachment: MattermostbotApiAttachment,
+  stagedAttachmentId: string,
+): string[] {
+  const dataBase64 = attachment.dataBase64;
+  if (!dataBase64) return [];
+  const lines: string[] = [];
+  // Keep chunks on a base64 boundary (multiple of 4) so each decodes cleanly.
+  const chunkSize =
+    STAGED_ATTACHMENT_CHUNK_CHARS - (STAGED_ATTACHMENT_CHUNK_CHARS % 4);
+  for (
+    let offset = 0, index = 0;
+    offset < dataBase64.length;
+    offset += chunkSize, index += 1
+  ) {
+    const chunk = dataBase64.slice(offset, offset + chunkSize);
+    lines.push(
+      JSON.stringify({
+        type: "attachment.chunk",
+        attachmentId: stagedAttachmentId,
+        name: attachment.name,
+        mimeType: attachment.mimeType,
+        attachmentType: attachment.type,
+        chunkIndex: index,
+        final: offset + chunkSize >= dataBase64.length,
+        dataBase64: chunk,
+      }),
+    );
+  }
+  return lines;
+}
+
+function codexInputContent(
+  message: MattermostbotApiMessage,
+  staged: Map<MattermostbotApiAttachment, string> = new Map(),
+): JsonValue[] {
+  const content: JsonValue[] = [];
+  if (message.text.trim()) {
+    content.push({ type: "text", text: message.text });
+  }
+  for (const attachment of message.attachments) {
+    content.push(codexAttachmentInput(attachment, staged.get(attachment)));
+  }
+  return content.length > 0 ? content : [{ type: "text", text: "continue" }];
+}
+
+export function codexAttachmentInput(
+  attachment: MattermostbotApiAttachment,
+  stagedAttachmentId?: string,
+): JsonValue {
+  if (stagedAttachmentId) {
+    return {
+      type: "attachment",
+      attachment_type: attachment.type,
+      stagedAttachmentId,
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+    };
+  }
+  const dataUrl =
+    attachment.dataBase64 && attachment.mimeType
+      ? `data:${attachment.mimeType};base64,${attachment.dataBase64}`
+      : undefined;
+  if (attachment.type === "image" && (dataUrl || attachment.url)) {
+    return {
+      type: "image",
+      url: dataUrl ?? attachment.url,
+      detail: "auto",
+      name: attachment.name,
+    };
+  }
+  if (attachment.dataBase64) {
+    return {
+      type: "attachment",
+      attachment_type: attachment.type,
+      dataBase64: attachment.dataBase64,
+      mimeType: attachment.mimeType,
+      name: attachment.name,
+      size: attachment.size,
+    };
+  }
+  return {
+    type: "text",
+    text: attachmentDescription(attachment),
+  };
+}
+
+function attachmentDescription(attachment: MattermostbotApiAttachment): string {
+  const fields = [
+    `name=${attachment.name ?? "attachment"}`,
+    `type=${attachment.type}`,
+    attachment.mimeType ? `mime=${attachment.mimeType}` : undefined,
+    attachment.url ? `url=${attachment.url}` : undefined,
+    attachment.dataBase64Omitted
+      ? `content=${attachment.dataBase64Omitted}`
+      : undefined,
+    attachment.fetchError ? `fetch_error=${attachment.fetchError}` : undefined,
+  ].filter(Boolean);
+  return `[Mattermost attachment: ${fields.join(" ")}]`;
+}
+
+type ParsedSessionEvent = {
+  data: string;
+  event?: string;
+  id?: number;
+};
+
+async function* parseSessionEventStream(
+  stream: ReadableStream<Uint8Array>,
+  onEventId: (eventId: number) => void,
+): AsyncIterable<MattermostbotRendererSource> {
+  for await (const event of parseSseEvents(stream)) {
+    if (typeof event.id === "number") onEventId(event.id);
+    if (event.event === "session.output.line") {
+      yield {
+        data: event.data,
+        event: event.event,
+        eventId: event.id,
+        eventKind: event.event,
+      } satisfies RustSessionStreamEvent;
+      if (isTerminalCodexOutputLine(event.data)) return;
+      continue;
+    }
+    if (event.event === "session.activity_summary") {
+      yield {
+        data: sessionEventData(event),
+        event: event.event,
+        eventId: event.id,
+        eventKind: event.event,
+      } satisfies RustSessionStreamEvent;
+      continue;
+    }
+    if (
+      event.event === "session.execution_failed" ||
+      event.event === "session.stream_error"
+    ) {
+      yield {
+        data: { error: sessionErrorMessage(event) },
+        event: event.event,
+        eventId: event.id,
+        eventKind: event.event,
+      } satisfies RustSessionStreamEvent;
+      return;
+    }
+    if (event.event === "session.execution_cancelled") {
+      yield {
+        data: { error: sessionErrorMessage(event, "Execution cancelled") },
+        event: event.event,
+        eventId: event.id,
+        eventKind: event.event,
+      } satisfies RustSessionStreamEvent;
+      return;
+    }
+    if (event.event === "session.execution_completed") {
+      yield {
+        data: sessionEventData(event),
+        event: event.event,
+        eventId: event.id,
+        eventKind: event.event,
+      } satisfies RustSessionStreamEvent;
+      return;
+    }
+  }
+}
+
+async function* parseSseEvents(
+  stream: ReadableStream<Uint8Array>,
+): AsyncIterable<ParsedSessionEvent> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let eventName: string | undefined;
+  let eventId: number | undefined;
+  let data: string[] = [];
+
+  // The consumer returns early on terminal events, abandoning this generator
+  // at a yield point. Always release the reader and cancel the SSE response.
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const emitted = parseSseLine(line, { data, eventId, eventName });
+        data = emitted.state.data;
+        eventId = emitted.state.eventId;
+        eventName = emitted.state.eventName;
+        if (emitted.event) yield emitted.event;
+      }
+    }
+
+    buffer += decoder.decode();
+    if (buffer) {
+      const emitted = parseSseLine(buffer, { data, eventId, eventName });
+      data = emitted.state.data;
+      eventId = emitted.state.eventId;
+      eventName = emitted.state.eventName;
+      if (emitted.event) yield emitted.event;
+    }
+    if (data.length > 0) {
+      yield { data: data.join("\n"), event: eventName, id: eventId };
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
+function parseSseLine(
+  line: string,
+  state: {
+    data: string[];
+    eventId?: number;
+    eventName?: string;
+  },
+): {
+  event?: ParsedSessionEvent;
+  state: { data: string[]; eventId?: number; eventName?: string };
+} {
+  if (!line.trim()) {
+    const event =
+      state.data.length > 0
+        ? {
+            data: state.data.join("\n"),
+            event: state.eventName,
+            id: state.eventId,
+          }
+        : undefined;
+    return { event, state: { data: [] } };
+  }
+  if (line.startsWith(":")) return { state };
+
+  const separator = line.indexOf(":");
+  const field = separator >= 0 ? line.slice(0, separator) : line;
+  const value =
+    separator >= 0 ? line.slice(separator + 1).replace(/^ /, "") : "";
+  if (field === "event") return { state: { ...state, eventName: value } };
+  if (field === "id") {
+    const id = Number.parseInt(value, 10);
+    return {
+      state: { ...state, eventId: Number.isFinite(id) ? id : undefined },
+    };
+  }
+  if (field === "data" && value !== "[DONE]") {
+    return { state: { ...state, data: [...state.data, value] } };
+  }
+
+  return { state };
+}
+
+function isTerminalCodexOutputLine(line: string): boolean {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(line);
+  } catch {
+    // Non-JSON stdout lines (e.g. sandbox bootstrap notices) are noise, not a
+    // signal that the turn finished; treating them as terminal drops the answer.
+    return false;
+  }
+  if (!isJsonObject(payload)) return false;
+  if (isRetryableCodexErrorNotification(payload)) return false;
+
+  return (
+    payload.type === "turn.completed" ||
+    payload.type === "turn.failed" ||
+    payload.type === "turn.done" ||
+    payload.method === "error" ||
+    payload.method === "turn/completed"
+  );
+}
+
+function sessionEventData(event: ParsedSessionEvent): unknown {
+  try {
+    return JSON.parse(event.data);
+  } catch {
+    return event.data;
+  }
+}
+
+function sessionErrorMessage(
+  event: ParsedSessionEvent,
+  fallback?: string,
+): string {
+  let message = fallback ?? `${event.event ?? "session error"}`;
+  try {
+    const payload = JSON.parse(event.data);
+    if (isJsonObject(payload)) {
+      message =
+        stringValue(payload.error) ?? stringValue(payload.message) ?? message;
+    }
+  } catch {
+    if (event.data.trim()) message = event.data.trim();
+  }
+  return message;
+}
