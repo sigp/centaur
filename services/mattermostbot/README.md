@@ -4,15 +4,20 @@ Mattermost chat ingress for the Centaur agent. The service uses Chat SDK's `chat
 
 ## Behavior
 
-- A Mattermost `@centaur` mention in an allowlisted public or private team channel starts or selects a thread.
-- Follow-ups in a subscribed thread append to the same Centaur session, including while an execution is active; a new mention starts another execution when no live execution is running.
-- Session create/append handoffs retry transient api-rs failures. Render retries are bounded; exhaustion posts an in-thread failure and clears the live execution flag while retaining the obligation for restart recovery.
-- Render obligations are indexed in persistent state and recovered on startup, so a pod restart can finish an in-flight reply and clear `activeExecution`.
-- Thread keys are the adapter IDs verbatim: `mattermost:<base64url channel id>` or `mattermost:<base64url channel id>:<base64url root post id>`.
-- The session create metadata includes `mattermost_conversation_name` from the channel display name.
-- Long answers are split across ordered Mattermost posts, each no longer than `MATTERMOSTBOT_MAX_POST_CHARS`.
-- Direct messages and group messages are denied. The service is inert until `MATTERMOSTBOT_TEAM_ALLOWLIST` is configured.
-- Own posts are ignored. Bot/webhook posts require their author ID in `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST`.
+- A mentioned stop command (`stop`, `cancel`, `kill`, or `end`, with common
+  polite variants) interrupts the api-rs execution and never starts a new turn.
+- Inline flags select the harness, model, provider, persona, and per-turn
+  reasoning (`--codex`, `--claude`, `--model <id>`, `--provider <id>`,
+  `--persona <id>`, `-rsn <effort>`). Flags are removed from the current
+  message and initial context. Harness, model, and provider choices stick to a
+  thread; a conflicting explicit harness flag restarts the thread on that
+  harness.
+- `MATTERMOSTBOT_CHANNEL_DEFAULTS` supplies per-channel JSON defaults. A
+  thread override wins over a channel default, which wins over deployment
+  defaults.
+- Attachment downloads send the bot token only to the configured Mattermost
+  origin. History-fetch failures release the team execution slot and post an
+  in-thread permission/error notice.
 
 Run one replica per bot token. Two consumers on one Mattermost token receive the same WebSocket events and can execute a turn twice. Deploy with one replica and a `Recreate` strategy.
 
@@ -27,6 +32,17 @@ Run one replica per bot token. Two consumers on one Mattermost token receive the
 | `MATTERMOSTBOT_API_KEY` | Yes | Bearer key accepted by api-rs. |
 | `MATTERMOSTBOT_DATABASE_URL` | Yes | PostgreSQL URL for `@chat-adapter/state-pg`. |
 | `MATTERMOSTBOT_USER_NAME` | No | Username used before `/users/me`; defaults to `centaur`. |
+| `MATTERMOSTBOT_DEFAULT_HARNESS` | No | Harness for new threads; defaults to `codex`. |
+| `MATTERMOSTBOT_ENABLED_HARNESSES` | No | Comma-separated enabled harness wire values. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_STRATEGY` | No | `flags` or `llm`; defaults to `flags`. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_MODEL` | No | Decisions model for `llm`; defaults to `gpt-6-luna`. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_BASE_URL` | No | OpenAI-compatible Decisions API base URL. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_API_KEY` | No | Decisions API key; falls back to `OPENAI_API_KEY`. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_TIMEOUT_MS` | No | Decisions request timeout. |
+| `MATTERMOSTBOT_CHANNEL_DEFAULTS` | No | JSON map keyed by Mattermost channel id. |
+| `CLAUDE_MODEL` / `CODEX_MODEL` | No | Deployment-configured default model metadata. |
+| `CODEX_MODEL_REASONING_EFFORT` | No | Deployment-configured Codex/Nanocodex reasoning default. |
+| `CENTAUR_PI_MODEL` / `CENTAUR_OMP_MODEL` | No | Deployment-configured Pi/OMP default model metadata. |
 | `MATTERMOSTBOT_TEAM_ALLOWLIST` | Yes to do anything | Comma/space-separated team IDs. Empty means inert. |
 | `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST` | No | Comma/space-separated bot author IDs allowed to trigger or append. |
 | `MATTERMOSTBOT_MAX_POST_CHARS` | No | Maximum answer post size; defaults to `16000` (below Mattermost's default `16383` limit). |

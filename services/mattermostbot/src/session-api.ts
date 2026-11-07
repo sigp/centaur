@@ -8,6 +8,8 @@ import type {
   MattermostbotCreateSessionRequest,
   MattermostbotExecuteSessionRequest,
   MattermostbotExecuteSessionResponse,
+  MattermostbotFetch,
+  MattermostbotInterruptSessionResponse,
   MattermostbotOptions,
   MattermostbotRendererSource,
   MattermostbotSessionMessage,
@@ -15,6 +17,7 @@ import type {
   JsonObject,
   JsonValue,
 } from "./types";
+import { extractMessageOverrides, extractPersonaOverride } from "./overrides";
 import {
   elapsedMs,
   isJsonObject,
@@ -64,11 +67,13 @@ type ForwardSessionApiCallbacks = {
     execution: MattermostbotExecuteSessionResponse,
   ): Promise<void>;
   onMessagesAppended?(): Promise<void>;
+  shouldExecute?(): Promise<boolean>;
 };
 
 export async function collectInitialContext(
   thread: { allMessages: AsyncIterable<Message> },
   currentMessage: Message,
+  options?: MattermostbotOptions,
 ): Promise<MattermostbotApiMessage[]> {
   const messages: Message[] = [];
   try {
@@ -81,7 +86,7 @@ export async function collectInitialContext(
       (error.name === "ResourceNotFoundError" ||
         /not found|not available/i.test(error.message))
     ) {
-      return [await serializeMessage(currentMessage)];
+      return [await serializeMessage(currentMessage, options)];
     }
     throw error;
   }
@@ -97,9 +102,18 @@ export async function collectInitialContext(
 
   const serialized: MattermostbotApiMessage[] = [];
   for (const message of messages) {
-    serialized.push(await serializeMessage(message));
+    const item = await serializeMessage(message, options);
+    // A replayed history item may predate inline directives. Strip flags
+    // before any context or stored message reaches api-rs.
+    item.text = stripInlineDirectiveText(item.text);
+    serialized.push(item);
   }
   return serialized;
+}
+
+function stripInlineDirectiveText(text: string): string {
+  const persona = extractPersonaOverride(text);
+  return extractMessageOverrides(persona.cleanedText).cleanedText;
 }
 
 
@@ -113,10 +127,19 @@ export function isContentlessApiMessage(
 
 export async function serializeMessage(
   message: Message,
+  options?: MattermostbotOptions,
 ): Promise<MattermostbotApiMessage> {
   const attachments: MattermostbotApiAttachment[] = [];
   for (const attachment of message.attachments) {
-    attachments.push(await serializeAttachment(attachment));
+    attachments.push(
+      await serializeAttachment(
+        attachment,
+        options?.fetch ?? fetch,
+        options
+          ? { baseUrl: options.baseUrl, botToken: options.botToken }
+          : undefined,
+      ),
+    );
   }
 
   return {
@@ -145,8 +168,18 @@ export async function forwardToSessionApi(
   callbacks: ForwardSessionApiCallbacks = {},
 ): Promise<AsyncIterable<MattermostbotRendererSource> | null> {
   const createStartedAtMs = nowMs();
-  await createSession(options, input.threadId, input.conversationName);
+  const created = await createSession(
+    options,
+    input.threadId,
+    input.harnessType,
+    input.personaId,
+    input.conversationName,
+  );
+  if (created.harnessType) input.metadataHarnessType = created.harnessType;
   traceLog(options, "mattermostbot_session_create_complete", input.trace, {
+    harness_type: created.harnessType,
+    harness_switched: created.harnessSwitched,
+    persona_id: created.personaId,
     phase_ms: elapsedMs(createStartedAtMs),
   });
   if (input.messages.length > 0) {
@@ -163,12 +196,18 @@ export async function forwardToSessionApi(
     });
   }
   if (!input.executeMessage) return null;
-
+  if (callbacks.shouldExecute && !(await callbacks.shouldExecute())) return null;
   const executeStartedAtMs = nowMs();
   const execution = await executeSession(
     options,
     input.threadId,
     input.executeMessage,
+    input.model,
+    input.reasoning,
+    input.provider,
+    input.metadataModel,
+    input.metadataHarnessType,
+    input.contextPreamble,
   );
   traceLog(options, "mattermostbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -197,6 +236,12 @@ export async function executeSessionTurn(
     options,
     input.threadId,
     input.executeMessage,
+    input.model,
+    input.reasoning,
+    input.provider,
+    input.metadataModel,
+    input.metadataHarnessType,
+    input.contextPreamble,
   );
   traceLog(options, "mattermostbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -205,6 +250,23 @@ export async function executeSessionTurn(
   return execution;
 }
 
+export async function interruptSessionExecution(
+  options: MattermostbotOptions,
+  threadId: string,
+  reason: string,
+): Promise<MattermostbotInterruptSessionResponse> {
+  const fetchFn = options.fetch ?? fetch;
+  const response = await fetchFn(
+    apiSessionUrl(options.apiUrl, threadId, "interrupt"),
+    {
+      method: "POST",
+      headers: apiHeaders(options),
+      body: JSON.stringify({ reason }),
+    },
+  );
+  await ensureApiOk(response, "interrupt session", options);
+  return (await response.json()) as MattermostbotInterruptSessionResponse;
+}
 export async function openSessionEventStream(
   options: MattermostbotOptions,
   input: Pick<
@@ -269,9 +331,15 @@ export const MAX_INLINE_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 const MAX_CODEX_INPUT_LINE_CHARS = 900 * 1024;
 const STAGED_ATTACHMENT_CHUNK_CHARS = 700 * 1024;
 
+type MattermostAttachmentAuth = {
+  baseUrl: string;
+  botToken: string;
+};
+
 export async function serializeAttachment(
   attachment: Attachment,
-  fetchFn: typeof fetch = fetch,
+  fetchFn: MattermostbotFetch = fetch,
+  auth?: MattermostAttachmentAuth,
 ): Promise<MattermostbotApiAttachment> {
   const serialized: MattermostbotApiAttachment = {
     fetchMetadata: attachment.fetchMetadata,
@@ -293,13 +361,10 @@ export async function serializeAttachment(
   }
 
   try {
-    // Mattermost file attachments can be represented by a URL or downloaded
-    // to base64. AWS Bedrock accepts data URLs and staged attachment chunks,
-    // so inline only within the bounded size limit.
     const data =
       attachment.data ??
       (await attachment.fetchData?.()) ??
-      (await fetchAttachmentData(attachment.url, fetchFn));
+      (await fetchAttachmentData(attachment.url, fetchFn, auth));
     if (data) {
       const byteLength = Buffer.isBuffer(data)
         ? data.length
@@ -320,18 +385,53 @@ export async function serializeAttachment(
   return serialized;
 }
 
+const MAX_ATTACHMENT_REDIRECTS = 5;
+
 async function fetchAttachmentData(
   url: string | undefined,
-  fetchFn: typeof fetch,
+  fetchFn: MattermostbotFetch,
+  auth?: MattermostAttachmentAuth,
 ): Promise<Buffer | undefined> {
   if (!url) return undefined;
-  const response = await fetchFn(url);
-  if (!response.ok) {
-    throw new Error(
-      `failed to download attachment (${response.status} ${response.statusText})`,
-    );
+  let currentUrl = url;
+  for (let redirect = 0; redirect <= MAX_ATTACHMENT_REDIRECTS; redirect += 1) {
+    const headers: HeadersInit = {};
+    if (auth && sameOrigin(currentUrl, auth.baseUrl)) {
+      headers.authorization = `Bearer ${auth.botToken}`;
+    }
+    const response = await fetchFn(currentUrl, {
+      headers,
+      redirect: "manual",
+    });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) {
+        throw new Error(
+          `failed to download attachment (${response.status} redirect without location)`,
+        );
+      }
+      if (redirect === MAX_ATTACHMENT_REDIRECTS) {
+        throw new Error("failed to download attachment (too many redirects)");
+      }
+      currentUrl = new URL(location, currentUrl).toString();
+      continue;
+    }
+    if (!response.ok) {
+      throw new Error(
+        `failed to download attachment (${response.status} ${response.statusText})`,
+      );
+    }
+    return Buffer.from(await response.arrayBuffer());
   }
-  return Buffer.from(await response.arrayBuffer());
+  return undefined;
+}
+
+function sameOrigin(left: string, right: string): boolean {
+  try {
+    return new URL(left).origin === new URL(right).origin;
+  } catch {
+    return false;
+  }
 }
 
 function attachmentTooLargeError(bytes: number): string {
@@ -346,29 +446,126 @@ async function bytesToBase64(
   return Buffer.from(bytes).toString("base64");
 }
 
+type CreateSessionOutcome = {
+  harnessSwitched: boolean;
+  harnessType?: string;
+  personaId?: string | null;
+};
+
 async function createSession(
   options: MattermostbotOptions,
   threadId: string,
+  harnessType?: string,
+  personaId?: string,
   conversationName?: string,
-): Promise<void> {
+): Promise<CreateSessionOutcome> {
+  const requested =
+    harnessType ?? options.defaultHarnessType ?? "codex";
+  if (
+    options.enabledHarnesses !== undefined &&
+    !options.enabledHarnesses.includes(requested)
+  ) {
+    throw new Error(`Harness ${requested} is not enabled for this deployment`);
+  }
+  const response = await postCreateSession(
+    options,
+    threadId,
+    requested,
+    personaId,
+    conversationName,
+    harnessType ? "restart" : undefined,
+  );
+  if (response.ok) return sessionOutcomeFromResponse(response);
+
+  const body = await response.text().catch(() => "");
+  const existing =
+    response.status === 409 ? existingHarnessFromConflict(body) : undefined;
+  if (existing && existing !== requested) {
+    const existingEnabled =
+      options.enabledHarnesses === undefined ||
+      options.enabledHarnesses.includes(existing);
+    const retry = await postCreateSession(
+      options,
+      threadId,
+      existingEnabled ? existing : requested,
+      personaId,
+      conversationName,
+      existingEnabled ? undefined : "restart",
+    );
+    await ensureApiOk(retry, "create session", options);
+    return sessionOutcomeFromResponse(retry);
+  }
+  throw new SessionApiError({
+    action: "create session",
+    body,
+    retryable: isRetryableApiStatus(response.status),
+    status: response.status,
+    statusText: response.statusText,
+  });
+}
+
+async function postCreateSession(
+  options: MattermostbotOptions,
+  threadId: string,
+  harnessType: string,
+  personaId?: string,
+  conversationName?: string,
+  onHarnessConflict?: "reject" | "restart",
+): Promise<Response> {
   const fetchFn = options.fetch ?? fetch;
   const name = conversationName?.trim();
   const body: MattermostbotCreateSessionRequest = {
-    harness_type: "codex",
+    harness_type: harnessType,
     metadata: {
       source: "mattermostbot",
       platform: "mattermost",
       thread_id: threadId,
-      // api-rs reads this as the session principal's display name.
       ...(name ? { mattermost_conversation_name: name } : {}),
     },
+    ...(personaId ? { persona_id: personaId } : {}),
+    ...(onHarnessConflict ? { on_harness_conflict: onHarnessConflict } : {}),
   };
-  const response = await fetchFn(apiSessionUrl(options.apiUrl, threadId), {
+  return fetchFn(apiSessionUrl(options.apiUrl, threadId), {
     method: "POST",
     headers: apiHeaders(options),
     body: JSON.stringify(body),
   });
-  await ensureApiOk(response, "create session", options);
+}
+
+async function sessionOutcomeFromResponse(
+  response: Response,
+): Promise<CreateSessionOutcome> {
+  try {
+    const payload: unknown = await response.json();
+    if (!isJsonObject(payload)) return { harnessSwitched: false };
+    const harnessType = stringValue(payload.harness_type);
+    const personaId =
+      typeof payload.persona_id === "string"
+        ? payload.persona_id
+        : "persona_id" in payload
+          ? null
+          : undefined;
+    return {
+      harnessSwitched: payload.harness_switched === true,
+      ...(harnessType ? { harnessType } : {}),
+      ...(personaId !== undefined ? { personaId } : {}),
+    };
+  } catch {
+    return { harnessSwitched: false };
+  }
+}
+
+function existingHarnessFromConflict(body: string): string | undefined {
+  try {
+    const payload: unknown = JSON.parse(body);
+    if (isJsonObject(payload)) {
+      const existing = stringValue(payload.existing_harness);
+      if (existing) return existing;
+    }
+  } catch {
+    // Fall through to the legacy error-string form.
+  }
+  return /already exists with harness_type ([A-Za-z0-9_-]+)/.exec(body)?.[1];
 }
 
 async function appendSessionMessages(
@@ -395,12 +592,30 @@ async function executeSession(
   options: MattermostbotOptions,
   threadId: string,
   message: MattermostbotApiMessage,
+  model?: string,
+  reasoning?: string,
+  provider?: string,
+  metadataModel?: string,
+  metadataHarnessType?: string,
+  contextPreamble?: string,
 ): Promise<MattermostbotExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch;
+  const recordedModel = metadataModel ?? model;
   const body: MattermostbotExecuteSessionRequest = {
     idempotency_key: message.id,
-    metadata: sessionMetadata(message, { action: "execute" }),
-    input_lines: toCodexInputLines(message, threadId),
+    metadata: sessionMetadata(message, {
+      action: "execute",
+      ...(recordedModel ? { model: recordedModel } : {}),
+      ...(metadataHarnessType ? { harness_type: metadataHarnessType } : {}),
+    }),
+    input_lines: toCodexInputLines(
+      message,
+      threadId,
+      model,
+      reasoning,
+      provider,
+      contextPreamble,
+    ),
     ...(options.idleTimeoutMs === undefined
       ? {}
       : { idle_timeout_ms: options.idleTimeoutMs }),
@@ -478,7 +693,7 @@ async function streamSessionNotifications(
 function apiSessionUrl(
   apiUrl: string,
   threadId: string,
-  suffix?: "messages" | "execute" | "events",
+  suffix?: "messages" | "execute" | "events" | "interrupt",
 ): string {
   const path = `/api/session/${encodeURIComponent(threadId)}${suffix ? `/${suffix}` : ""}`;
   return new URL(path, ensureTrailingSlash(apiUrl)).toString();
@@ -562,12 +777,24 @@ export function sessionMetadata(
 export function toCodexInputLines(
   message: MattermostbotApiMessage,
   threadId: string,
+  model?: string,
+  reasoning?: string,
+  provider?: string,
+  contextPreamble?: string,
 ): string[] {
   const staged = new Map<MattermostbotApiAttachment, string>();
   const lines: string[] = [];
   for (const attachment of message.attachments) {
     if (!attachment.dataBase64) continue;
-    const inlineLine = toCodexInputLineWithStaged(message, threadId, staged);
+    const inlineLine = toCodexInputLineWithStaged(
+      message,
+      threadId,
+      staged,
+      model,
+      reasoning,
+      provider,
+      contextPreamble,
+    );
     if (
       inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS &&
       attachment.dataBase64.length <= MAX_CODEX_INPUT_LINE_CHARS
@@ -578,7 +805,17 @@ export function toCodexInputLines(
     staged.set(attachment, stagedAttachmentId);
     lines.push(...stagedAttachmentInputLines(attachment, stagedAttachmentId));
   }
-  lines.push(toCodexInputLineWithStaged(message, threadId, staged));
+  lines.push(
+    toCodexInputLineWithStaged(
+      message,
+      threadId,
+      staged,
+      model,
+      reasoning,
+      provider,
+      contextPreamble,
+    ),
+  );
   return lines;
 }
 
@@ -586,14 +823,31 @@ function toCodexInputLineWithStaged(
   message: MattermostbotApiMessage,
   threadId: string,
   staged: Map<MattermostbotApiAttachment, string>,
+  model?: string,
+  reasoning?: string,
+  provider?: string,
+  contextPreamble?: string,
 ): string {
+  const content: JsonValue[] = [];
+  if (contextPreamble?.trim()) {
+    content.push({ type: "text", text: contextPreamble });
+  }
+  content.push(...codexInputContent(message, staged));
   return JSON.stringify({
     type: "user",
     thread_key: threadId,
-    trace_metadata: sessionMetadata(message, { action: "execute" }),
+    ...(model ? { model } : {}),
+    ...(provider ? { provider } : {}),
+    ...(reasoning ? { reasoning } : {}),
+    trace_metadata: sessionMetadata(message, {
+      action: "execute",
+      ...(model ? { model } : {}),
+      ...(provider ? { provider } : {}),
+      ...(reasoning ? { reasoning } : {}),
+    }),
     message: {
       role: "user",
-      content: codexInputContent(message, staged),
+      content,
     },
   });
 }

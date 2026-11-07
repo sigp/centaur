@@ -3,6 +3,8 @@ import type { CodexAppServerToChatStreamOptions } from "@centaur/rendering";
 import type { Attachment, Chat, Logger, StateAdapter } from "chat";
 import type { MattermostAdapter } from "chat-adapter-mattermost";
 import type { Hono } from "hono";
+import type { HarnessOverrides } from "./overrides";
+import type { ChannelDefaults } from "./channel-defaults";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
@@ -61,6 +63,10 @@ export type MattermostbotAppendMessagesRequest = {
 export type MattermostbotCreateSessionRequest = {
   harness_type: string;
   metadata: JsonObject;
+  /** 'restart': switch the thread to harness_type if it is pinned elsewhere. */
+  on_harness_conflict?: "reject" | "restart";
+  /** Persona requested when the thread is created; api-rs pins the first value. */
+  persona_id?: string;
 };
 
 export type MattermostbotExecuteSessionRequest = {
@@ -71,6 +77,25 @@ export type MattermostbotExecuteSessionRequest = {
   metadata: JsonObject;
 };
 
+export type MattermostbotInterruptSessionResponse = {
+  execution_id?: string;
+  interrupted: boolean;
+  ok: boolean;
+  thread_key: string;
+};
+
+export type MessageOverridesStrategyInput = { text: string };
+
+
+
+export type MessageOverridesStrategyResult = {
+  cleanedText?: string;
+  overrides: HarnessOverrides;
+};
+
+export type MessageOverridesStrategy = (
+  input: MessageOverridesStrategyInput,
+) => Promise<MessageOverridesStrategyResult>;
 export type MattermostbotExecuteSessionResponse = {
   execution_id: string;
   ok: boolean;
@@ -109,6 +134,16 @@ export type MattermostbotOptions = {
   apiUrl: string;
   /** Mattermost server base URL, e.g. https://mattermost.example.com */
   baseUrl: string;
+  channelDefaults?: ChannelDefaults;
+  /** Harness for new threads when no explicit message override is given. */
+  defaultHarnessType?: string;
+  enabledHarnesses?: readonly string[];
+  /** Deployment-configured model defaults, mirrored from harness env vars. */
+  harnessDefaultModels?: Record<string, string>;
+  /** Deployment-configured reasoning defaults for Codex-compatible harnesses. */
+  harnessDefaultReasoning?: Record<string, string>;
+  /** Strategy for resolving message-level harness/model/provider/reasoning overrides. */
+  messageOverridesStrategy?: MessageOverridesStrategy;
   botToken: string;
   fetch?: MattermostbotFetch;
   idleTimeoutMs?: number;
@@ -155,6 +190,15 @@ export type MattermostbotThreadState = {
    * with the flag.
    */
   activeExecutionStartedAt?: number | null;
+  /** Sticky per-thread harness/model/provider/persona choices. */
+  harnessType?: string | null;
+  model?: string | null;
+  personaId?: string | null;
+  provider?: string | null;
+  /** Timestamp of the most recent stop command; used to suppress its run. */
+  stopRequestedAt?: number | null;
+  /** Set once a mention makes the thread eligible for proactive replies. */
+  proactiveEligible?: boolean;
   executedMessageIds?: string[];
   forwardedMessageIds?: string[];
   historyForwarded?: boolean;
@@ -189,6 +233,15 @@ export type ForwardSessionInput = {
    * display name.
    */
   conversationName?: string;
+  /** Explicit/sticky execution controls forwarded to api-rs. */
+  harnessType?: string;
+  metadataHarnessType?: string;
+  metadataModel?: string;
+  model?: string;
+  personaId?: string;
+  provider?: string;
+  reasoning?: string;
+  contextPreamble?: string;
   executionId?: string;
   executeMessage?: MattermostbotApiMessage;
   messages: MattermostbotApiMessage[];

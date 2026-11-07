@@ -30,6 +30,7 @@ type MattermostPost = {
   delete_at: number;
   is_pinned: boolean;
   root_id: string;
+  metadata?: Record<string, unknown>;
 };
 
 function makePost(
@@ -96,12 +97,17 @@ type Harness = {
   executes: Record<string, unknown>[];
   /** Number of upcoming append requests to answer with 503. */
   failAppends: number;
+  /** Number of upcoming thread-history requests to answer with HTTP 500. */
+  failHistory: number;
   /** Answer every event-stream open with 503. */
   failEvents: boolean;
   /** Text streamed as the final answer, one delta per entry. */
   answerChunks: string[];
   /** When set, the event stream emits its first delta, then waits on this. */
   hold: { promise: Promise<void>; release(): void } | null;
+  fileRequests: Array<{ authorization: string | null; path: string }>;
+  interrupts: Record<string, unknown>[];
+  executeHold: { promise: Promise<void>; release(): void } | null;
   posts: Record<string, unknown>[];
   sockets: Array<{ send(data: string): void }>;
   close(): void;
@@ -133,7 +139,11 @@ function startHarness(): Harness {
     executes: [],
     failAppends: 0,
     failEvents: false,
+    failHistory: 0,
+    fileRequests: [],
     hold: null,
+    interrupts: [],
+    executeHold: null,
     posts: [],
     sendPosted: (post) => {
       stored.set(post.id, post);
@@ -182,11 +192,23 @@ function startHarness(): Harness {
           return Response.json({ ok: true });
         }
         if (request.method === "POST" && suffix === "execute") {
-          harness.executes.push((await request.json()) as Record<string, unknown>);
+          const execute = (await request.json()) as Record<string, unknown>;
+          harness.executes.push(execute);
+          if (harness.executeHold) await harness.executeHold.promise;
           return Response.json({
             execution_id: "exec-1",
             ok: true,
             status: "running",
+            thread_key: threadKey,
+          });
+        }
+        if (request.method === "POST" && suffix === "interrupt") {
+          harness.interrupts.push((await request.json()) as Record<string, unknown>);
+          return Response.json({
+            execution_id: "exec-1",
+            interrupted: true,
+            ok: true,
+            status: "stopped",
             thread_key: threadKey,
           });
         }
@@ -240,8 +262,21 @@ function startHarness(): Harness {
           type: "O",
         });
       }
+      if (url.pathname.startsWith("/api/v4/files/") && request.method === "GET") {
+        harness.fileRequests.push({
+          authorization: request.headers.get("authorization"),
+          path: url.pathname,
+        });
+        return new Response("file-bytes", {
+          headers: { "content-type": "text/plain" },
+        });
+      }
       const threadMatch = url.pathname.match(/^\/api\/v4\/posts\/([^/]+)\/thread$/);
       if (threadMatch) {
+        if (harness.failHistory > 0) {
+          harness.failHistory -= 1;
+          return new Response("history unavailable", { status: 500 });
+        }
         const rootId = threadMatch[1] ?? "";
         const members = [...stored.values()].filter(
           (candidate) => candidate.id === rootId || candidate.root_id === rootId,
@@ -359,6 +394,190 @@ function appendedIds(h: Harness): string[] {
 }
 
 describe("Mattermost reliability", () => {
+  it("strips inline flags in the Mattermost flow and forwards create/execute controls", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({ state });
+
+    h.sendPosted(
+      makePost(
+        ROOT_ID,
+        "@centaur --claude-code --persona eng --model opus --provider bedrock -rsn high inspect this",
+      ),
+    );
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    await waitFor(() => h.executes.length === 1);
+    expect(JSON.stringify(h.appends)).toContain("inspect this");
+    expect(JSON.stringify(h.appends)).not.toContain("--claude-code");
+    expect(h.creates[0]).toMatchObject({
+      harness_type: "claudecode",
+      persona_id: "eng",
+    });
+    expect(JSON.stringify(h.executes)).toContain("claude-opus-5-5");
+    expect(JSON.stringify(h.executes)).toContain("amazon-bedrock");
+    expect(JSON.stringify(h.executes)).toContain("high");
+  });
+  it("downloads Mattermost files with the bot token and forwards their bytes to api-rs", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({ state });
+
+    h.sendPosted({
+      ...makePost(ROOT_ID, "@centaur inspect this file"),
+      metadata: {
+        files: [
+          {
+            id: "file-1",
+            mime_type: "text/plain",
+            name: "note.txt",
+            size: 10,
+          },
+        ],
+      },
+    });
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    await waitFor(() => h.appends.length > 0);
+    expect(
+      h.fileRequests.some(
+        (request) =>
+          request.authorization === "Bearer MATTERMOST_BOT_TOKEN" &&
+          request.path === "/api/v4/files/file-1",
+      ),
+    ).toBe(true);
+    expect(JSON.stringify(h.appends)).toContain("ZmlsZS1ieXRlcw==");
+  });
+  it("keeps explicit harness, model and provider sticky on a later plain mention", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({ state });
+
+    h.sendPosted(
+      makePost(
+        ROOT_ID,
+        "@centaur --claude --model opus --provider bedrock -rsn high first",
+      ),
+    );
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    h.sendPosted(makePost("sticky-followup", "@centaur plain followup", ROOT_ID));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false && h.executes.length === 2);
+
+    const second = JSON.stringify(h.executes[1]);
+    expect(second).toContain("claude-opus-5-5");
+    expect(second).toContain("amazon-bedrock");
+    expect(second).toContain('"harness_type":"claudecode"');
+  });
+  it("applies channel defaults above deployment defaults and pins the channel persona", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    const channelDefaults: NonNullable<MattermostbotOptions["channelDefaults"]> = {
+      [CHANNEL_ID]: {
+        harnessType: "claudecode",
+        model: "claude-opus-5-5",
+        personaId: "channel-persona",
+      },
+    };
+    await startBotAndConnect({
+      channelDefaults,
+      defaultHarnessType: "codex",
+      harnessDefaultModels: { codex: "deployment-model" },
+      state,
+    });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur use the channel default"));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    expect(h.creates[0]).toMatchObject({
+      harness_type: "claudecode",
+      persona_id: "channel-persona",
+    });
+    expect(JSON.stringify(h.executes[0])).toContain("claude-opus-5-5");
+    expect(JSON.stringify(h.executes[0])).not.toContain("deployment-model");
+
+    channelDefaults[CHANNEL_ID] = {
+      harnessType: "codex",
+      model: "changed-channel-model",
+      personaId: "changed-persona",
+    };
+    h.sendPosted(makePost("channel-default-followup", "@centaur follow up", ROOT_ID));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false && h.executes.length === 2);
+    expect(h.creates[1]).toMatchObject({ persona_id: "channel-persona" });
+  });
+  it("restarts a pinned thread when a conflicting harness flag is requested", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({ state });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur --claude first harness"));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    h.sendPosted(makePost("harness-switch", "@centaur --codex second harness", ROOT_ID));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false && h.executes.length === 2);
+
+    expect(h.creates).toHaveLength(2);
+    expect(h.creates[0]).toMatchObject({ harness_type: "claudecode" });
+    expect(h.creates[1]).toMatchObject({
+      harness_type: "codex",
+      on_harness_conflict: "restart",
+    });
+    expect(JSON.stringify(h.executes[1])).toContain('"harness_type":"codex"');
+  });
+
+  it("falls back to the deployment harness when a disabled harness is requested", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await startBotAndConnect({
+      defaultHarnessType: "codex",
+      enabledHarnesses: ["codex"],
+      state,
+    });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur --claude disabled request"));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    expect(h.creates[0]).toMatchObject({ harness_type: "codex" });
+    expect(JSON.stringify(h.executes[0])).toContain('"harness_type":"codex"');
+    expect(JSON.stringify(h.creates[0])).not.toContain("claudecode");
+  });
+  it("interrupts an active turn for a mentioned stop without starting another execution", async () => {
+    harness = startHarness();
+    const h = harness;
+    h.hold = newGate();
+    const state = createMemoryState();
+    await startBotAndConnect({ state });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur start work"));
+    await waitFor(() => h.eventRequests.length === 1);
+    h.sendPosted(makePost("stop-active", "@centaur stop", ROOT_ID));
+    await waitFor(() => h.interrupts.length === 1);
+    expect(h.interrupts[0]).toMatchObject({
+      reason: "Interrupted from Mattermost by user-1",
+    });
+    expect(h.executes).toHaveLength(1);
+    expect(appendedIds(h)).toEqual([ROOT_ID]);
+    h.hold.release();
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    expect((await threadState(state))?.proactiveEligible).toBe(false);
+  });
+  it("does not start execution when a stop is recorded before the execute handoff", async () => {
+    harness = startHarness();
+    const h = harness;
+    const state = createMemoryState();
+    await state.connect();
+    await state.set(`thread-state:${THREAD_KEY}`, {
+      proactiveEligible: false,
+      stopRequestedAt: Date.now() + 60_000,
+    });
+    await startBotAndConnect({ state });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur start work"));
+    await waitFor(() => h.appends.length >= 1);
+    await sleep(20);
+    expect(h.executes).toHaveLength(0);
+    expect(appendedIds(h)).toEqual([ROOT_ID]);
+  });
   it("appends a follow-up posted while an execution is active instead of dropping it", async () => {
     harness = startHarness();
     const h = harness;
@@ -547,5 +766,32 @@ describe("Mattermost reliability", () => {
     expect(h.posts[0]).toMatchObject({ channel_id: CHANNEL_ID, root_id: ROOT_ID });
     // The obligation is kept so a restart can still retry the render.
     expect((await threadState(state))?.renderObligation).not.toBeNull();
+  });
+
+  it("releases the team slot and replies when history fetches fail, then executes a later mention", async () => {
+    harness = startHarness();
+    const h = harness;
+    h.failHistory = 3;
+    const state = createMemoryState();
+    await startBotAndConnect({
+      maxConcurrentExecutionsPerTeam: 1,
+      state,
+    });
+
+    for (const [index, text] of ["first", "second", "third"].entries()) {
+      h.sendPosted(makePost(`history-${index + 1}`, `@centaur ${text}`, ROOT_ID));
+      await waitFor(() => h.botPostTexts().length >= index + 1);
+    }
+    expect(
+      h.botPostTexts().filter((text) =>
+        text.includes("I couldn't read this thread's history"),
+      ),
+    ).toHaveLength(3);
+    expect(h.posts.every((post) => String(post.root_id) === ROOT_ID)).toBe(true);
+
+    h.sendPosted(makePost("history-4", "@centaur fourth", ROOT_ID));
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    await waitFor(() => h.botPostTexts().join("\n").includes("first streamed reply"));
+    expect(h.executes).toHaveLength(1);
   });
 });

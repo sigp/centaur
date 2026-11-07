@@ -24,10 +24,27 @@ import {
   isMattermostAllowlistEmpty,
   resolveMattermostConversationName,
 } from "./mattermost-allowlist";
+import { resolveChannelDefault } from "./channel-defaults";
+import {
+  extractMessageOverrides,
+  extractPersonaOverride,
+  isHarnessEnabled,
+  type HarnessOverrides,
+} from "./overrides";
+import {
+  createFlagMessageOverridesStrategy,
+} from "./message-overrides-strategy";
+import { isMattermostStopCommand } from "./stop-command";
+import {
+  defaultModelForHarness,
+  effectiveReasoningForHarness,
+  reasoningForModel,
+} from "./response-context";
 import {
   collectInitialContext,
   executeSessionTurn,
   forwardToSessionApi,
+  interruptSessionExecution,
   isContentlessApiMessage,
   isRetryableSessionApiError,
   openSessionEventStream,
@@ -102,6 +119,111 @@ const RENDER_RETRY_INITIAL_DELAY_MS = 250;
 const RENDER_RETRY_MAX_DELAY_MS = 5_000;
 const RENDER_RETRY_MAX_ATTEMPTS = 10;
 const FORWARD_RETRY_DELAYS_MS = [1_000, 3_000] as const;
+const DEFAULT_MESSAGE_OVERRIDES_STRATEGY = createFlagMessageOverridesStrategy();
+
+export async function messageOverridesForText(
+  options: MattermostbotOptions,
+  text: string,
+  trace?: MattermostbotTrace,
+): Promise<{ cleanedText?: string; overrides: HarnessOverrides }> {
+  const strategy =
+    options.messageOverridesStrategy ?? DEFAULT_MESSAGE_OVERRIDES_STRATEGY;
+  const persona = extractPersonaOverride(text);
+  let result: { cleanedText?: string; overrides: HarnessOverrides };
+  try {
+    result = await strategy({ text: persona.cleanedText });
+  } catch (error) {
+    traceLog(options, "mattermostbot_message_overrides_strategy_failed", trace, {
+      error: errorMessage(error),
+    });
+    result = await DEFAULT_MESSAGE_OVERRIDES_STRATEGY({
+      text: persona.cleanedText,
+    });
+  }
+  const { personaId: _strategyPersonaId, ...strategyOverrides } =
+    result.overrides;
+  return {
+    ...result,
+    ...(persona.personaId && result.cleanedText === undefined
+      ? { cleanedText: persona.cleanedText }
+      : {}),
+    overrides: {
+      ...strategyOverrides,
+      ...(persona.personaId ? { personaId: persona.personaId } : {}),
+    },
+  };
+}
+
+type StickyThreadOverrides = Pick<
+  MattermostbotThreadState,
+  "harnessType" | "model" | "personaId" | "provider"
+>;
+
+function stickyThreadOverrideUpdate(
+  overrides: HarnessOverrides,
+): StickyThreadOverrides | undefined {
+  const update: StickyThreadOverrides = {};
+  if (overrides.harnessType) {
+    update.harnessType = overrides.harnessType;
+    if (!overrides.model) update.model = null;
+    if (!overrides.provider) update.provider = null;
+  }
+  if (overrides.model) update.model = overrides.model;
+  if (overrides.personaId) update.personaId = overrides.personaId;
+  if (overrides.provider) {
+    update.provider = overrides.provider;
+    if (!overrides.model) update.model = null;
+  }
+  return Object.keys(update).length > 0 ? update : undefined;
+}
+
+function hasStickyModelOverride(
+  overrides: Pick<MattermostbotThreadState, "harnessType" | "model" | "provider">,
+): boolean {
+  return Boolean(overrides.harnessType || overrides.model || overrides.provider);
+}
+
+function preservePinnedPersona(
+  state: MattermostbotThreadState,
+  update: StickyThreadOverrides | undefined,
+): StickyThreadOverrides | undefined {
+  if (
+    !update?.personaId ||
+    !Object.prototype.hasOwnProperty.call(state, "personaId")
+  ) {
+    return update;
+  }
+  return { ...update, personaId: state.personaId ?? null };
+}
+
+function personaOnlyStickyOverride(
+  update: StickyThreadOverrides | undefined,
+): StickyThreadOverrides | undefined {
+  return update?.personaId ? { personaId: update.personaId } : undefined;
+}
+
+function stickyOverrideValue(
+  state: MattermostbotThreadState,
+  update: StickyThreadOverrides | undefined,
+  key: keyof StickyThreadOverrides,
+): string | undefined {
+  if (update && Object.prototype.hasOwnProperty.call(update, key)) {
+    const value = update[key];
+    return typeof value === "string" ? value : undefined;
+  }
+  const value = state[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function stickyOverrideRaw(
+  state: MattermostbotThreadState,
+  update: StickyThreadOverrides | undefined,
+  key: keyof StickyThreadOverrides,
+): string | null | undefined {
+  return update && Object.prototype.hasOwnProperty.call(update, key)
+    ? update[key]
+    : state[key];
+}
 
 export function createMattermostbot(
   options: MattermostbotOptions,
@@ -144,6 +266,7 @@ export function createMattermostbot(
 
   chat.onNewMention(async (thread, message) => {
     if (!(await isAllowedMattermostMessage(message, options, logger))) return;
+    if (await handleStopCommand(thread, message, options)) return;
     await thread.subscribe();
     await syncThreadMessageToSession(thread, message, {
       mode: "execute",
@@ -155,6 +278,12 @@ export function createMattermostbot(
 
   chat.onSubscribedMessage(async (thread, message) => {
     if (!(await isAllowedMattermostMessage(message, options, logger))) return;
+    if (
+      message.isMention === true &&
+      (await handleStopCommand(thread, message, options))
+    ) {
+      return;
+    }
     await syncThreadMessageToSession(thread, message, {
       mode: message.isMention === true ? "execute" : "append",
       executionLimiter,
@@ -219,6 +348,62 @@ function createDefaultState(
   });
 }
 
+async function handleStopCommand(
+  thread: Thread<MattermostbotThreadState>,
+  message: ChatMessage,
+  options: MattermostbotOptions,
+): Promise<boolean> {
+  if (!isMattermostStopCommand(message)) return false;
+  const trace: MattermostbotTrace = {
+    includeContext: false,
+    messageId: message.id,
+    mode: "append",
+    openStream: false,
+    startedAtMs: nowMs(),
+    threadId: thread.id,
+  };
+  const latest = (await thread.state) ?? {};
+  await thread.setState({
+    proactiveEligible: false,
+    stopRequestedAt: message.metadata.dateSent.getTime(),
+  });
+  try {
+    const response = await interruptSessionExecution(
+      options,
+      thread.id,
+      `Interrupted from Mattermost by ${message.author.userId}`,
+    );
+    if (response.interrupted) {
+      await thread.setState({
+        activeExecution: false,
+        activeExecutionStartedAt: null,
+        lastEventId:
+          latest.lastEventId ?? latest.renderObligation?.afterEventId ?? 0,
+        renderObligation: null,
+      });
+    }
+    traceLog(options, "mattermostbot_stop_command_complete", trace, {
+      execution_id: response.execution_id,
+      interrupted: response.interrupted,
+    });
+  } catch (error) {
+    traceLog(options, "mattermostbot_stop_command_failed", trace, {
+      error: errorMessage(error),
+    });
+    await thread
+      .post("Couldn't confirm the stop. The agent may still be working.")
+      .catch(() => undefined);
+  }
+  return true;
+}
+
+function stopRequestedFor(
+  state: MattermostbotThreadState,
+  message: ChatMessage,
+): boolean {
+  return (state.stopRequestedAt ?? 0) >= message.metadata.dateSent.getTime();
+}
+
 async function syncThreadMessageToSession(
   thread: Thread<MattermostbotThreadState>,
   message: ChatMessage,
@@ -261,102 +446,255 @@ async function syncThreadMessageToSession(
     }
   }
 
-  const includeContext = shouldStartExecution && state.historyForwarded !== true;
-  const serialized = await serializeMessage(message);
-  const duplicateIncrementalMessage =
-    forwardedIds.has(message.id) && !shouldStartExecution && !includeContext;
-  if (duplicateIncrementalMessage) return;
-
-  const trace: MattermostbotTrace = {
-    includeContext,
-    messageId: message.id,
-    mode: input.mode,
-    openStream: shouldStartExecution,
-    startedAtMs: traceStartedAtMs,
-    threadId: thread.id,
-  };
-
-  if (shouldStartExecution && isContentlessApiMessage(serialized)) {
-    releaseExecutionSlot?.();
-    logger.warn("mattermostbot_contentless_message_skipped", {
-      message_id: message.id,
-      thread_id: thread.id,
-    });
-    return;
-  }
-
-  const messages = includeContext
-    ? await collectInitialContext(thread, message)
-    : [serialized];
-  const messagesToAppend = messages.filter((item) => !forwardedIds.has(item.id));
-  const conversationName = await resolveMattermostConversationName(
-    options,
-    thread.id,
-  );
-  let lastEventId = state.lastEventId ?? 0;
-  const forwardInput: ForwardSessionInput = {
-    afterEventId: lastEventId,
-    conversationName,
-    executeMessage: shouldStartExecution ? serialized : undefined,
-    messages: messagesToAppend,
-    onEventId: (eventId) => {
-      lastEventId = Math.max(lastEventId, eventId);
-    },
-    openStream: false,
-    threadId: thread.id,
-    trace,
-  };
-
-  const commitMessagesAppended = async (): Promise<void> => {
-    const latest = (await thread.state) ?? {};
-    const ids = new Set(latest.forwardedMessageIds ?? []);
-    for (const item of messagesToAppend) ids.add(item.id);
-    await thread.setState({
-      forwardedMessageIds: Array.from(ids).slice(-1000),
-      historyForwarded: latest.historyForwarded || includeContext,
-      lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
-    });
-  };
-
-  const commitExecutionStarted = async (
-    execution: MattermostbotExecuteSessionResponse,
-  ): Promise<void> => {
-    const latest = (await thread.state) ?? {};
-    const latestExecutedIds = new Set(latest.executedMessageIds ?? []);
-    latestExecutedIds.add(serialized.id);
-    if (!renderLease.release) {
-      try {
-        renderLease.release = await acquireRenderLease(input.state, thread.id);
-      } catch (error) {
-        traceLog(options, "mattermostbot_render_lease_acquire_failed", trace, {
-          error: errorMessage(error),
-        });
-      }
-    }
-    await thread.setState({
-      activeExecution: true,
-      activeExecutionStartedAt: Date.now(),
-      executedMessageIds: Array.from(latestExecutedIds).slice(-1000),
-      lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
-      renderObligation: {
-        afterEventId: lastEventId,
-        executionId: execution.execution_id,
-        message: serialized,
-      },
-    });
-    await indexRenderObligation(input.state, {
-      options,
-      threadId: thread.id,
-      trace,
-    });
-  };
-
+  let handoffStarted = false;
   const renderLease: { release: (() => Promise<void>) | null } = {
     release: null,
   };
 
-  if (!shouldStartExecution) {
-    try {
+  try {
+    const includeContext =
+      shouldStartExecution && state.historyForwarded !== true;
+    const trace: MattermostbotTrace = {
+      includeContext,
+      messageId: message.id,
+      mode: input.mode,
+      openStream: shouldStartExecution,
+      startedAtMs: traceStartedAtMs,
+      threadId: thread.id,
+    };
+    const serialized = await serializeMessage(message, options);
+    const explicitOverrides = extractMessageOverrides(serialized.text);
+    const messageOverrides = await messageOverridesForText(
+      options,
+      serialized.text,
+      trace,
+    );
+    if (messageOverrides.cleanedText !== undefined) {
+      serialized.text = messageOverrides.cleanedText;
+    }
+    const overrides = messageOverrides.overrides;
+    const requestedStickyOverrides = preservePinnedPersona(
+      state,
+      stickyThreadOverrideUpdate(overrides),
+    );
+    const preserveStickyModelOverrides = Boolean(
+      requestedStickyOverrides &&
+        hasStickyModelOverride(requestedStickyOverrides) &&
+        hasStickyModelOverride(state) &&
+        !hasStickyModelOverride(explicitOverrides),
+    );
+    let stickyOverridesUpdate = preserveStickyModelOverrides
+      ? personaOnlyStickyOverride(requestedStickyOverrides)
+      : requestedStickyOverrides;
+    const effectiveOverrides = {
+      harnessType: stickyOverrideValue(state, stickyOverridesUpdate, "harnessType"),
+      model: stickyOverrideValue(state, stickyOverridesUpdate, "model"),
+      personaId: stickyOverrideValue(state, stickyOverridesUpdate, "personaId"),
+      provider: stickyOverrideValue(state, stickyOverridesUpdate, "provider"),
+    };
+    const channelDefault = resolveChannelDefault(
+      options.channelDefaults,
+      thread.id,
+    );
+    const selectedHarnessType =
+      effectiveOverrides.harnessType ??
+      channelDefault?.harnessType ??
+      options.defaultHarnessType ??
+      "codex";
+    if (!isHarnessEnabled(selectedHarnessType, options.enabledHarnesses)) {
+      const fallbackHarness = options.defaultHarnessType ?? "codex";
+      stickyOverridesUpdate = {
+        ...stickyOverridesUpdate,
+        harnessType: fallbackHarness,
+        model: null,
+        provider: null,
+      };
+      effectiveOverrides.harnessType = fallbackHarness;
+      effectiveOverrides.model = undefined;
+      effectiveOverrides.provider = undefined;
+      logger.warn("mattermostbot_disabled_harness_reset", {
+        disabled_harness: selectedHarnessType,
+        fallback_harness: fallbackHarness,
+        thread_id: thread.id,
+      });
+    }
+    const resolvedHarnessType =
+      effectiveOverrides.harnessType ?? channelDefault?.harnessType;
+    const resolvedModel =
+      stickyOverrideRaw(state, stickyOverridesUpdate, "model") === null
+        ? undefined
+        : effectiveOverrides.model ?? channelDefault?.model;
+    const resolvedProvider =
+      stickyOverrideRaw(state, stickyOverridesUpdate, "provider") === null
+        ? undefined
+        : effectiveOverrides.provider ?? channelDefault?.provider;
+    const resolvedPersonaId =
+      stickyOverrideRaw(state, stickyOverridesUpdate, "personaId") === null
+        ? undefined
+        : effectiveOverrides.personaId ?? channelDefault?.personaId;
+    if (
+      shouldStartExecution &&
+      resolvedPersonaId &&
+      !Object.prototype.hasOwnProperty.call(state, "personaId")
+    ) {
+      stickyOverridesUpdate = {
+        ...(stickyOverridesUpdate ?? {}),
+        personaId: resolvedPersonaId,
+      };
+    }
+    const effectiveHarnessType =
+      resolvedHarnessType ?? options.defaultHarnessType ?? "codex";
+    const effectiveModel =
+      resolvedModel ??
+      defaultModelForHarness(
+        effectiveHarnessType,
+        options.harnessDefaultModels,
+      );
+    const requestedReasoning = overrides.reasoning ?? channelDefault?.reasoning;
+    const resolvedReasoning = reasoningForModel(
+      effectiveHarnessType,
+      effectiveModel,
+      requestedReasoning,
+    );
+    const effectiveReasoning = effectiveReasoningForHarness(
+      effectiveHarnessType,
+      resolvedReasoning,
+      options.harnessDefaultReasoning,
+    );
+
+    if (forwardedIds.has(message.id) && !shouldStartExecution && !includeContext) {
+      return;
+    }
+    if (shouldStartExecution && isContentlessApiMessage(serialized)) {
+      logger.warn("mattermostbot_contentless_message_skipped", {
+        message_id: message.id,
+        thread_id: thread.id,
+      });
+      return;
+    }
+
+    let messages: MattermostbotApiMessage[];
+    if (includeContext) {
+      try {
+        messages = await collectInitialContext(thread, message, options);
+      } catch (error) {
+        logger.error("mattermostbot_history_fetch_failed", {
+          error: errorMessage(error),
+          message_id: message.id,
+          thread_id: thread.id,
+        });
+        await thread
+          .post(
+            "I couldn't read this thread's history, so I didn't start a turn. Check that I can read this channel, then mention me again.",
+          )
+          .catch(() => undefined);
+        return;
+      }
+      const current = messages.find((item) => item.id === serialized.id);
+      if (current) current.text = serialized.text;
+    } else {
+      messages = [serialized];
+    }
+
+    const pinnedHarness = typeof state.harnessType === "string"
+      ? state.harnessType
+      : undefined;
+    const harnessRestart =
+      shouldStartExecution &&
+      Boolean(explicitOverrides.harnessType) &&
+      Boolean(pinnedHarness) &&
+      pinnedHarness !== effectiveHarnessType;
+    const messagesToAppend = (harnessRestart ? messages : messages).filter(
+      (item) => harnessRestart || !forwardedIds.has(item.id),
+    );
+    const conversationName = await resolveMattermostConversationName(
+      options,
+      thread.id,
+    );
+    let lastEventId = state.lastEventId ?? 0;
+    const forwardInput: ForwardSessionInput = {
+      afterEventId: lastEventId,
+      conversationName,
+      executeMessage: shouldStartExecution ? serialized : undefined,
+      harnessType:
+        shouldStartExecution &&
+        (resolvedHarnessType || explicitOverrides.harnessType)
+          ? effectiveHarnessType
+          : undefined,
+      metadataHarnessType: shouldStartExecution
+        ? effectiveHarnessType
+        : undefined,
+      metadataModel: shouldStartExecution ? effectiveModel : undefined,
+      model: shouldStartExecution ? resolvedModel : undefined,
+      personaId: shouldStartExecution ? resolvedPersonaId : undefined,
+      provider: shouldStartExecution ? resolvedProvider : undefined,
+      reasoning: effectiveReasoning,
+      messages: messagesToAppend,
+      onEventId: (eventId) => {
+        lastEventId = Math.max(lastEventId, eventId);
+      },
+      openStream: false,
+      threadId: thread.id,
+      trace,
+    };
+
+    const commitMessagesAppended = async (): Promise<void> => {
+      const latest = (await thread.state) ?? {};
+      const ids = new Set(latest.forwardedMessageIds ?? []);
+      for (const item of messagesToAppend) ids.add(item.id);
+      await thread.setState({
+        ...(stickyOverridesUpdate ?? {}),
+        forwardedMessageIds: Array.from(ids).slice(-1000),
+        historyForwarded: latest.historyForwarded || includeContext,
+        lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
+      });
+    };
+
+    const commitExecutionStarted = async (
+      execution: MattermostbotExecuteSessionResponse,
+    ): Promise<void> => {
+      const latest = (await thread.state) ?? {};
+      const latestExecutedIds = new Set(latest.executedMessageIds ?? []);
+      latestExecutedIds.add(serialized.id);
+      if (!renderLease.release) {
+        try {
+          renderLease.release = await acquireRenderLease(input.state, thread.id);
+        } catch (error) {
+          traceLog(options, "mattermostbot_render_lease_acquire_failed", trace, {
+            error: errorMessage(error),
+          });
+        }
+      }
+      await thread.setState({
+        ...(stickyOverridesUpdate ?? {}),
+        activeExecution: true,
+        activeExecutionStartedAt: Date.now(),
+        executedMessageIds: Array.from(latestExecutedIds).slice(-1000),
+        lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
+        renderObligation: {
+          afterEventId: lastEventId,
+          executionId: execution.execution_id,
+          message: serialized,
+        },
+      });
+      await indexRenderObligation(input.state, {
+        options,
+        threadId: thread.id,
+        trace,
+      });
+      const afterCommit = (await thread.state) ?? {};
+      if (stopRequestedFor(afterCommit, message)) {
+        backgroundWaitUntil(
+          interruptSessionExecution(
+            options,
+            thread.id,
+            "Interrupted from Mattermost",
+          ).catch(() => undefined),
+        );
+      }
+    };
+
+    if (!shouldStartExecution) {
       if (messagesToAppend.length > 0) {
         await withTransientSessionApiRetry(
           () =>
@@ -367,34 +705,43 @@ async function syncThreadMessageToSession(
           trace,
         );
       }
-    } catch (error) {
-      logger.error("mattermostbot_session_turn_failed", {
-        error: errorMessage(error),
-        message_id: message.id,
-        thread_id: thread.id,
-      });
-      await thread
-        .post(`Centaur could not complete this turn: ${errorMessage(error)}`)
-        .catch(() => undefined);
+      return;
     }
-    return;
-  }
 
-  try {
     await thread.setState({
       activeExecution: true,
       activeExecutionStartedAt: Date.now(),
     });
+    let stoppedBeforeExecute = false;
     await withTransientSessionApiRetry(
       () =>
         forwardToSessionApi(
           options,
           { ...forwardInput, executeMessage: undefined, openStream: false },
-          { onMessagesAppended: commitMessagesAppended },
+          {
+            onMessagesAppended: commitMessagesAppended,
+            shouldExecute: async () => {
+              stoppedBeforeExecute = stopRequestedFor(
+                (await thread.state) ?? {},
+                message,
+              );
+              return !stoppedBeforeExecute;
+            },
+          },
         ),
       options,
       trace,
     );
+    if (stoppedBeforeExecute) {
+      const latest = (await thread.state) ?? {};
+      await thread.setState({
+        activeExecution: false,
+        activeExecutionStartedAt: null,
+        lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
+      });
+      return;
+    }
+    handoffStarted = true;
     scheduleExecutionRender(
       thread,
       serialized,
@@ -408,17 +755,23 @@ async function syncThreadMessageToSession(
       releaseExecutionSlot ?? undefined,
     );
   } catch (error) {
+    logger.error("mattermostbot_session_turn_failed", {
+      error: errorMessage(error),
+      message_id: message.id,
+      thread_id: thread.id,
+    });
     await renderLease.release?.();
-    releaseExecutionSlot?.();
     const latest = (await thread.state) ?? {};
     await thread.setState({
       activeExecution: false,
       activeExecutionStartedAt: null,
-      lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
+      lastEventId: latest.lastEventId ?? 0,
     });
     await thread
       .post(`Centaur could not complete this turn: ${errorMessage(error)}`)
       .catch(() => undefined);
+  } finally {
+    if (!handoffStarted) releaseExecutionSlot?.();
   }
 }
 
@@ -536,6 +889,18 @@ async function renderExecutionAttempt(
     execution: MattermostbotExecuteSessionResponse,
   ) => Promise<void>,
 ): Promise<"complete" | "retry"> {
+  const state = (await thread.state) ?? {};
+  if (
+    isInitialExecution &&
+    typeof state.stopRequestedAt === "number" &&
+    state.stopRequestedAt >= Date.parse(message.timestamp)
+  ) {
+    await thread.setState({
+      activeExecution: false,
+      activeExecutionStartedAt: null,
+    });
+    return "complete";
+  }
   let rendered = false;
   let retry = false;
   try {

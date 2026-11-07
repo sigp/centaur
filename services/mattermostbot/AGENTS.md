@@ -12,6 +12,19 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
 - Mattermost uses background post-and-edit streaming. The handler only performs the session create/append handoff, so subscribed follow-ups are appended while an execution is active instead of being dropped by the thread lock.
 - Transient session create/append failures retry. Render retries are bounded; exhaustion posts an in-thread failure, clears `activeExecution`, and leaves the obligation for a later recovery.
 - Render obligations are indexed in persistent state, leased per thread, and recovered at startup. Keep the state adapter persistent so subscriptions, locks, dedupe state, and render progress survive restarts.
+- A mentioned stop command is handled before session sync: it records
+  `stopRequestedAt`/`proactiveEligible`, interrupts api-rs, and never starts a
+  turn. Inline harness/model/provider/persona flags are stripped before
+  persistence or execution; harness, model, and provider selections are sticky
+  per thread, and a conflicting explicit harness restarts the session.
+- Channel defaults are keyed by Mattermost channel ID and have lower
+  precedence than thread overrides but higher precedence than deployment
+  defaults. Persona selection applies only at session creation.
+- Attachment authorization is origin-scoped to `MATTERMOST_BASE_URL`; never
+  forward the Mattermost bot token to a foreign URL or redirect.
+- Team execution slots are released on every failure before render handoff.
+  History-fetch failures post an in-thread notice instead of silently wedging
+  the team cap.
 - Long answers are split into ordered posts below `MATTERMOSTBOT_MAX_POST_CHARS` (default 16000, below Mattermost's default MaxPostSize of 16383).
 
 ## Environment
@@ -25,6 +38,17 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
 | `MATTERMOSTBOT_API_KEY` | Yes | Bearer key accepted by api-rs. Keep secret. |
 | `MATTERMOSTBOT_DATABASE_URL` | Yes | PostgreSQL URL used by `@chat-adapter/state-pg`. |
 | `MATTERMOSTBOT_USER_NAME` | No | Configured bot username before `/users/me`; defaults to `centaur`. |
+| `MATTERMOSTBOT_DEFAULT_HARNESS` | No | New-thread harness; defaults to `codex`. |
+| `MATTERMOSTBOT_ENABLED_HARNESSES` | No | Enabled harness wire values. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_STRATEGY` | No | `flags` or `llm`; defaults to `flags`. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_MODEL` | No | LLM decisions model; defaults to `gpt-6-luna`. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_BASE_URL` | No | OpenAI-compatible decisions endpoint. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_API_KEY` | No | LLM key; falls back to `OPENAI_API_KEY`. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_TIMEOUT_MS` | No | LLM decision timeout. |
+| `MATTERMOSTBOT_CHANNEL_DEFAULTS` | No | JSON channel-id to default overrides map. |
+| `CLAUDE_MODEL`, `CODEX_MODEL` | No | Deployment model defaults. |
+| `CODEX_MODEL_REASONING_EFFORT` | No | Codex/Nanocodex default reasoning. |
+| `CENTAUR_PI_MODEL`, `CENTAUR_OMP_MODEL` | No | Pi/OMP deployment model defaults. |
 | `MATTERMOSTBOT_TEAM_ALLOWLIST` | Yes to do anything | Comma/space-separated Mattermost team IDs. Empty means inert. |
 | `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST` | No | Comma/space-separated bot author IDs allowed to trigger or append. Empty means all bot posts are ignored. |
 | `MATTERMOSTBOT_MAX_POST_CHARS` | No | Maximum answer post size; defaults to `16000`, below Mattermost's default `16383` limit. |

@@ -1,4 +1,12 @@
 import { createMattermostbot, type MattermostbotOptions } from "./index";
+import {
+  parseChannelDefaults,
+} from "./channel-defaults";
+import {
+  createFlagMessageOverridesStrategy,
+  createOpenAiMessageOverridesStrategy,
+} from "./message-overrides-strategy";
+import { isHarnessEnabled, parseEnabledHarnesses } from "./overrides";
 
 const port = numberEnv("PORT", 3001);
 const apiUrl = stringEnv("CENTAUR_API_URL", "http://127.0.0.1:8080");
@@ -6,6 +14,21 @@ const baseUrl = requiredEnv("MATTERMOST_BASE_URL");
 const botToken = requiredEnv("MATTERMOST_BOT_TOKEN");
 const apiKey = requiredEnv("MATTERMOSTBOT_API_KEY");
 const postgresUrl = requiredEnv("MATTERMOSTBOT_DATABASE_URL");
+const enabledHarnesses = parseEnabledHarnesses(
+  optionalEnv("MATTERMOSTBOT_ENABLED_HARNESSES"),
+);
+const defaultHarnessType = stringEnv("MATTERMOSTBOT_DEFAULT_HARNESS", "codex");
+if (!isHarnessEnabled(defaultHarnessType, enabledHarnesses)) {
+  throw new Error(
+    "MATTERMOSTBOT_DEFAULT_HARNESS must be enabled in MATTERMOSTBOT_ENABLED_HARNESSES",
+  );
+}
+const messageOverridesStrategyMode = messageOverridesStrategyModeEnv(
+  "MATTERMOSTBOT_MESSAGE_OVERRIDES_STRATEGY",
+);
+const messageOverridesStrategyApiKey =
+  optionalEnv("MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_API_KEY") ??
+  optionalEnv("OPENAI_API_KEY");
 
 const logger = {
   debug: (message: string, data?: unknown) => log("debug", message, data),
@@ -20,6 +43,37 @@ const options: MattermostbotOptions = {
   apiUrl,
   baseUrl,
   botToken,
+  channelDefaults: parseChannelDefaults(
+    optionalEnv("MATTERMOSTBOT_CHANNEL_DEFAULTS"),
+    (reason) =>
+      logger.warn("mattermostbot MATTERMOSTBOT_CHANNEL_DEFAULTS", { reason }),
+  ),
+  defaultHarnessType,
+  enabledHarnesses,
+  harnessDefaultModels: {
+    ...(optionalEnv("CLAUDE_MODEL")
+      ? { claudecode: optionalEnv("CLAUDE_MODEL")! }
+      : {}),
+    ...(optionalEnv("CODEX_MODEL")
+      ? {
+          codex: optionalEnv("CODEX_MODEL")!,
+          nanocodex: optionalEnv("CODEX_MODEL")!,
+        }
+      : {}),
+    ...(optionalEnv("CENTAUR_PI_MODEL")
+      ? { pi: optionalEnv("CENTAUR_PI_MODEL")! }
+      : {}),
+    ...(optionalEnv("CENTAUR_OMP_MODEL")
+      ? { omp: optionalEnv("CENTAUR_OMP_MODEL")! }
+      : {}),
+  },
+  harnessDefaultReasoning: optionalEnv("CODEX_MODEL_REASONING_EFFORT")
+    ? {
+        codex: optionalEnv("CODEX_MODEL_REASONING_EFFORT")!,
+        nanocodex: optionalEnv("CODEX_MODEL_REASONING_EFFORT")!,
+      }
+    : {},
+  messageOverridesStrategy: createMessageOverridesStrategy(),
   idleTimeoutMs: optionalNumberEnv("SESSION_IDLE_TIMEOUT_MS"),
   logger,
   maxDurationMs: optionalNumberEnv("SESSION_MAX_DURATION_MS"),
@@ -54,6 +108,32 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
 process.on("SIGINT", () => void shutdown("SIGINT"));
 
 await chat.initialize();
+function messageOverridesStrategyModeEnv(name: string): "flags" | "llm" {
+  const value = optionalEnv(name)?.toLowerCase();
+  if (!value) return "flags";
+  if (value === "flags" || value === "llm") return value;
+  throw new Error(`${name} must be "flags" or "llm"`);
+}
+
+function createMessageOverridesStrategy(): MattermostbotOptions["messageOverridesStrategy"] {
+  if (messageOverridesStrategyMode !== "llm") {
+    return createFlagMessageOverridesStrategy();
+  }
+  if (!messageOverridesStrategyApiKey) {
+    return async () => ({ overrides: {} });
+  }
+  return createOpenAiMessageOverridesStrategy({
+    apiKey: messageOverridesStrategyApiKey,
+    baseUrl: optionalEnv(
+      "MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_BASE_URL",
+    ),
+    logger,
+    model: stringEnv("MATTERMOSTBOT_MESSAGE_OVERRIDES_MODEL", "gpt-6-luna"),
+    timeoutMs: optionalNumberEnv(
+      "MATTERMOSTBOT_MESSAGE_OVERRIDES_TIMEOUT_MS",
+    ),
+  });
+}
 
 function optionalEnv(name: string): string | undefined {
   const value = process.env[name]?.trim();
