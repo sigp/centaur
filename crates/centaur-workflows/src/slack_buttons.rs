@@ -17,6 +17,9 @@ struct Target {
 }
 
 #[derive(Deserialize, Serialize)]
+// Mattermost claims carry `platform`; refusing unknown fields keeps a
+// Mattermost-signed button from verifying as a Slack one.
+#[serde(deny_unknown_fields)]
 struct Claims {
     group_id: String,
     action: String,
@@ -24,7 +27,6 @@ struct Claims {
     #[serde(flatten)]
     target: Target,
 }
-
 #[derive(Deserialize)]
 pub struct Invocation {
     pub button: String,

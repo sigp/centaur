@@ -38,6 +38,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+pub mod mattermost_buttons;
 pub mod slack_button_feedback;
 pub mod slack_buttons;
 
@@ -3568,6 +3569,14 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
+        Some("ctx.post_to_mattermost") => match post_python_mattermost_message(message).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(error.to_string()),
+        },
+        Some("ctx.update_mattermost") => match update_python_mattermost_message(message).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(error.to_string()),
+        },
         other => Err(format!("unsupported context request type {other:?}")),
     };
     Ok(match result {
@@ -4354,6 +4363,99 @@ fn python_slack_message_payload(
     payload
 }
 
+async fn post_python_mattermost_message(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+    let channel = message
+        .get("channel")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest("ctx.post_to_mattermost requires channel".to_owned())
+        })?;
+    let text = message.get("text").and_then(Value::as_str).ok_or_else(|| {
+        WorkflowRuntimeError::BadRequest("ctx.post_to_mattermost requires text".to_owned())
+    })?;
+    let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
+    let mut payload = json!({
+        "channel_id": channel,
+        "message": text,
+    });
+    if let Some(root_id) = args.get("root_id") {
+        payload["root_id"] = root_id.clone();
+    }
+    if let Some(props) = args.get("props") {
+        payload["props"] = props.clone();
+    }
+    let secret = env::var("CENTAUR_JWT_SIGNING_SECRET").unwrap_or_default();
+    mattermost_buttons::sign_message(&mut payload, secret.trim().as_bytes())?;
+    send_mattermost_request("POST", "/api/v4/posts", payload).await
+}
+
+async fn update_python_mattermost_message(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+    let post_id = message
+        .get("post_id")
+        .and_then(Value::as_str)
+        .filter(|post_id| !post_id.trim().is_empty())
+        .ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest("ctx.update_mattermost requires post_id".to_owned())
+        })?;
+    let text = message.get("text").and_then(Value::as_str).ok_or_else(|| {
+        WorkflowRuntimeError::BadRequest("ctx.update_mattermost requires text".to_owned())
+    })?;
+    let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
+    let mut payload = json!({
+        "id": post_id,
+        "message": text,
+    });
+    if let Some(props) = args.get("props") {
+        payload["props"] = props.clone();
+    }
+    let secret = env::var("CENTAUR_JWT_SIGNING_SECRET").unwrap_or_default();
+    mattermost_buttons::sign_message(&mut payload, secret.trim().as_bytes())?;
+    send_mattermost_request("PUT", &format!("/api/v4/posts/{post_id}"), payload).await
+}
+
+async fn send_mattermost_request(
+    method: &'static str,
+    path: &str,
+    payload: Value,
+) -> Result<Value, WorkflowRuntimeError> {
+    let base = env::var("MATTERMOST_BASE_URL")
+        .map_err(|_| WorkflowRuntimeError::BadRequest("MATTERMOST_BASE_URL must be set".into()))?;
+    let base = base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "MATTERMOST_BASE_URL must be set".into(),
+        ));
+    }
+    let token = env::var("MATTERMOST_BOT_TOKEN")
+        .map_err(|_| WorkflowRuntimeError::BadRequest("MATTERMOST_BOT_TOKEN must be set".into()))?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "MATTERMOST_BOT_TOKEN must be set".into(),
+        ));
+    }
+    let response = reqwest::Client::new()
+        .request(
+            method.parse().map_err(|_| {
+                WorkflowRuntimeError::Internal(format!("invalid Mattermost method {method}"))
+            })?,
+            format!("{base}{path}"),
+        )
+        .timeout(Duration::from_secs(15))
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(WorkflowRuntimeError::Upstream(format!(
+            "Mattermost {method} {path} failed with status {status}: {body}"
+        )));
+    }
+    serde_json::from_str(&body).map_err(WorkflowRuntimeError::from)
+}
+
 async fn send_slack_request(
     method: &'static str,
     payload: Value,
@@ -4700,7 +4802,193 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::{Arc, Mutex},
+    };
 
+    struct EnvironmentGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvironmentGuard {
+        fn new() -> Self {
+            Self { saved: Vec::new() }
+        }
+
+        fn save(&mut self, name: &'static str) {
+            if self.saved.iter().all(|(saved, _)| *saved != name) {
+                self.saved.push((name, std::env::var(name).ok()));
+            }
+        }
+
+        fn set(&mut self, name: &'static str, value: &str) {
+            self.save(name);
+            // Environment mutation is process-global; this guard restores every
+            // value before the test exits.
+            unsafe { std::env::set_var(name, value) };
+        }
+
+        fn remove(&mut self, name: &'static str) {
+            self.save(name);
+            unsafe { std::env::remove_var(name) };
+        }
+    }
+
+    impl Drop for EnvironmentGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.drain(..) {
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+            }
+        }
+    }
+
+    fn read_mock_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0, "mock client closed before sending a request");
+            request.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length:")
+                        .or_else(|| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                return String::from_utf8(request).unwrap();
+            }
+        }
+    }
+
+    fn spawn_mattermost_mock(
+        request_count: usize,
+    ) -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().unwrap();
+                seen.lock().unwrap().push(read_mock_request(&mut stream));
+                let body =
+                    r#"{"id":"post-1","channel_id":"abcdefghijklmnopqrstuvwxyz","message":"ok"}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    #[tokio::test]
+    async fn mattermost_runtime_posts_and_updates_with_signed_context() {
+        let (base_url, requests, server) = spawn_mattermost_mock(2);
+        let mut environment = EnvironmentGuard::new();
+        environment.set("MATTERMOST_BASE_URL", &base_url);
+        environment.set("MATTERMOST_BOT_TOKEN", "mattermost-token");
+        environment.set("CENTAUR_JWT_SIGNING_SECRET", "test-secret");
+        environment.set(
+            "MATTERMOST_WORKFLOW_ACTIONS_URL",
+            "https://mattermost.example/actions",
+        );
+
+        let props = json!({
+            "attachments": [{"text": "", "actions": [{
+                "id": "a0",
+                "name": "Approve",
+                "type": "button",
+                "style": "primary",
+                "integration": {"context": {
+                    "centaur_workflow_action":
+                        "centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve",
+                    "label": "Approve",
+                    "value": json!({
+                        "workflow_name": "review",
+                        "input": {"release_id": "r1"}
+                    }).to_string()
+                }}
+            }]}]
+        });
+        let posted = post_python_mattermost_message(&json!({
+            "channel": "abcdefghijklmnopqrstuvwxyz",
+            "text": "Approve release?",
+            "args": {"root_id": "root-1", "props": props}
+        }))
+        .await
+        .unwrap();
+        assert_eq!(posted["id"], "post-1");
+
+        environment.remove("MATTERMOST_WORKFLOW_ACTIONS_URL");
+        let missing_url = post_python_mattermost_message(&json!({
+            "channel": "abcdefghijklmnopqrstuvwxyz",
+            "text": "Approve release?",
+            "args": {"props": json!({"attachments": [{"actions": [{
+                "integration": {"context": {
+                    "centaur_workflow_action":
+                        "centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve",
+                    "label": "Approve",
+                    "value": json!({
+                        "workflow_name": "review",
+                        "input": {}
+                    }).to_string()
+                }}
+            }]}]})}
+        }))
+        .await
+        .unwrap_err();
+        assert!(
+            missing_url
+                .to_string()
+                .contains("MATTERMOST_WORKFLOW_ACTIONS_URL")
+        );
+
+        let updated = update_python_mattermost_message(&json!({
+            "post_id": "post-1",
+            "text": "Updated release.",
+            "args": {"props": {"attachments": []}}
+        }))
+        .await
+        .unwrap();
+        assert_eq!(updated["id"], "post-1");
+        drop(environment);
+        server.join().unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("POST /api/v4/posts HTTP/1.1"));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer mattermost-token")
+        );
+        assert!(requests[0].contains("\"button\":\"v1."));
+        assert!(requests[0].contains("\"url\":\"https://mattermost.example/actions\""));
+        assert!(!requests[0].contains("\"value\""));
+        assert!(requests[1].starts_with("PUT /api/v4/posts/post-1 HTTP/1.1"));
+        assert!(requests[1].contains("\"id\":\"post-1\""));
+        assert!(requests[1].contains("\"message\":\"Updated release.\""));
+    }
     async fn assert_structured_host_error_is_bounded(message_type: &str) {
         let stderr_task = tokio::spawn(async {
             std::future::pending::<()>().await;

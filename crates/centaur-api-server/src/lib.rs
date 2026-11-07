@@ -494,6 +494,19 @@ mod tests {
                     .unwrap();
             assert_eq!(response.status(), expected, "{thread_key}");
         }
+        let response = build_router_with_app_state(AppState::unready(test_auth_with_mattermost()))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/workflows/runs")
+                    .header(header::AUTHORIZATION, authorized)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"workflow_name":"review","input":{}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -540,6 +553,132 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn mattermost_workflow_actions_are_platform_bound() {
+        let channel = "abcdefghijklmnopqrstuvwxyz";
+        let mut mattermost_message = json!({
+            "channel_id": channel,
+            "props": {"attachments": [{"actions": [{
+                "integration": {"context": {
+                    "centaur_workflow_action":
+                        "centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve",
+                    "label": "Approve",
+                    "value": json!({"workflow_name": "review", "input": {"release_id": "r1"}}).to_string()
+                }}
+            }]}]}
+        });
+        centaur_workflows::mattermost_buttons::sign_message_with_actions_url(
+            &mut mattermost_message,
+            b"test-secret",
+            Some("https://mattermost.example/actions"),
+        )
+        .unwrap();
+        let mattermost_button = mattermost_message["props"]["attachments"][0]["actions"][0]
+            ["integration"]["context"]["button"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let mut slack_message = json!({
+            "channel": "C1",
+            "blocks": [{"type": "actions", "elements": [{
+                "type": "button",
+                "action_id":
+                    "centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve",
+                "value": json!({"workflow_name": "review", "input": {}}).to_string()
+            }]}]
+        });
+        centaur_workflows::slack_buttons::sign_message(&mut slack_message, b"test-secret").unwrap();
+        let slack_button = slack_message["blocks"][0]["elements"][0]["value"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let invoke = |platform: Option<&str>, button: &str, click: Value| {
+            let mut body = json!({
+                "button": button,
+                "idempotency_key": "mattermost-click-1",
+                "click": click,
+            });
+            if let Some(platform) = platform {
+                body["platform"] = json!(platform);
+            }
+            body
+        };
+        let mattermost_click = json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "action": "approve",
+            "channel_id": channel,
+            "post_id": "post-1",
+            "team_id": "team-1",
+            "user_id": "user-1",
+            "user_name": "Alex",
+            "trigger_id": "trigger-1"
+        });
+
+        let valid = build_router_with_app_state(AppState::unready(test_auth_with_mattermost()))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/workflows/actions/invoke")
+                    .header(header::AUTHORIZATION, "Bearer test-mattermostbot-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        invoke(
+                            Some("mattermost"),
+                            &mattermost_button,
+                            mattermost_click.clone(),
+                        )
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(valid.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        for (platform, button) in [
+            (Some("mattermost"), slack_button.as_str()),
+            (None, mattermost_button.as_str()),
+        ] {
+            let response =
+                build_router_with_app_state(AppState::unready(test_auth_with_mattermost()))
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri("/api/workflows/actions/invoke")
+                            .header(header::AUTHORIZATION, "Bearer test-mattermostbot-key")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                invoke(platform, button, mattermost_click.clone()).to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        let mut mismatched_click = mattermost_click;
+        mismatched_click["action"] = json!("reject");
+        let response = build_router_with_app_state(AppState::unready(test_auth_with_mattermost()))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/workflows/actions/invoke")
+                    .header(header::AUTHORIZATION, "Bearer test-mattermostbot-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        invoke(Some("mattermost"), &mattermost_button, mismatched_click)
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

@@ -314,6 +314,122 @@ Existing custom Slack action IDs continue to emit raw workflow events.
 The `centaur.workflow.action:` namespace is reserved for workflow buttons.
 `SLACK_API_URL` can target a local Slack emulator in the API and Slackbot.
 
+## Start Workflows From Mattermost Buttons
+
+Use `ctx.post_to_mattermost` for ordinary posts and
+`ctx.update_mattermost` to edit an existing post:
+
+```python
+post = await ctx.post_to_mattermost(
+    channel_id,
+    "Approve this release?",
+    root_id=thread_root_id,  # optional
+)
+await ctx.update_mattermost(post["id"], "The release was approved.")
+```
+
+`ctx.update_mattermost` replaces the post, like Slack's `chat.update`: pass
+`props` to keep attachments, because omitting it clears them (and with them any
+buttons, which is how a workflow retires its buttons after a click). An update
+cannot add workflow buttons, since it carries no channel to sign them against;
+post a new message with `ctx.mattermost_buttons` instead.
+
+Use `ctx.mattermost_buttons` to post one to five workflow buttons:
+
+```python
+from api.workflow_engine import Button
+
+await ctx.mattermost_buttons(
+    "release-review",
+    channel="abcdefghijklmnopqrstuvwxyz",  # 26-character Mattermost channel ID
+    text="Approve this release?",
+    workflow="review_release",
+    input={"release_id": "release-42"},
+    buttons={
+        "approve": Button("Approve", style="primary"),
+        "reject": Button("Reject", style="danger"),
+    },
+)
+```
+
+The Python API sends a Mattermost post with this `props` shape:
+
+```json
+{
+  "attachments": [{
+    "text": "",
+    "actions": [{
+      "id": "cw<group-id hex>0",
+      "name": "Approve",
+      "type": "button",
+      "style": "primary",
+      "integration": {
+        "context": {
+          "centaur_workflow_action": "centaur.workflow.action:<group-id>:approve",
+          "label": "Approve",
+          "value": "{\"workflow_name\":\"review_release\",\"input\":{\"release_id\":\"release-42\"}}"
+        }
+      }
+    }]
+  }]
+}
+```
+
+The Rust runtime signs each workflow action immediately before posting. It
+replaces the plaintext `value` with a `button` signature and adds the
+Mattermost actions integration URL. The signed claims include the platform,
+workflow button group, action, channel ID, workflow name, and input. A missing
+`MATTERMOST_WORKFLOW_ACTIONS_URL` rejects a post containing workflow buttons;
+ordinary posts do not need that variable.
+
+Action ids are `cw` plus the group ID's hex digits and the button index, so the
+bot can still recognize the group after Mattermost strips integrations from
+the posts it returns to clients.
+
+Mattermost invokes `POST /api/mattermost/actions`. The bot checks the team,
+channel, and post, then passes the signed button to
+`POST /api/workflows/actions/invoke` with `"platform": "mattermost"`, where
+api-rs verifies it and starts the run. Once the run is accepted, the clicked
+button row becomes `⏳ <label>: Processing…` (only the clicker sees that status
+when other buttons share the post). The receiving workflow gets the signed
+input plus:
+
+```json
+{
+  "platform": "mattermost",
+  "click": {
+    "id": "<group-id>",
+    "action": "approve",
+    "channel_id": "<channel-id>",
+    "post_id": "<post-id>",
+    "team_id": "<team-id>",
+    "user_id": "<user-id>",
+    "user_name": "<user-name>",
+    "trigger_id": "<trigger-id>"
+  }
+}
+```
+
+The verified click replaces any `click` value supplied in the signed input.
+Authorization remains the receiving workflow's responsibility; check the
+Mattermost user, team, channel, and action before performing the operation.
+Mattermost button signatures are derived from `CENTAUR_JWT_SIGNING_SECRET`,
+are bound to the `mattermost` platform and channel ID, and are rejected by the
+Slack verifier. Configure the runtime and bot with:
+
+- `MATTERMOST_BASE_URL`: Mattermost server URL used for `/api/v4/posts`.
+- `MATTERMOST_BOT_TOKEN`: bearer token for Mattermost post and update calls.
+- `MATTERMOST_WORKFLOW_ACTIONS_URL`: public
+  `https://<host>/api/mattermost/actions` callback URL for button clicks.
+
+Keep posting step names stable and unique. Action keys use letters, digits,
+underscores, or hyphens and contain at most 64 characters; labels contain at
+most 75 characters. The signed button and its workflow target must fit within
+2000 bytes. Do not place secrets in workflow input: the signed button carries
+it in readable form and is stored in Mattermost. Signatures do not expire, so receiving
+workflows should use business idempotency keys for operations that must happen
+only once.
+
 ## Schedule a workflow
 
 Workflows can run from schedule metadata declared beside the handler. Use this

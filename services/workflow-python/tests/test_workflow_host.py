@@ -11,6 +11,7 @@ import sys
 import tempfile
 import types
 import unittest
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
@@ -86,6 +87,10 @@ class RequestRpc(FakeRpc):
                 "run_id": "run-child",
                 "created": True,
             }
+        if message_type == "ctx.post_to_mattermost":
+            return {"id": "post-1", "channel_id": payload["channel"], "message": payload["text"]}
+        if message_type == "ctx.update_mattermost":
+            return {"id": payload["post_id"], "message": payload["text"]}
         if message_type == "ctx.post_to_slack":
             return {"channel": payload["channel"], "ts": "1710000000.000100"}
         if message_type == "ctx.sleep":
@@ -469,6 +474,121 @@ class WorkflowHostTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_mattermost_post_and_update_use_rpc_shapes(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="sample",
+        )
+
+        result = asyncio.run(
+            ctx.post_to_mattermost(
+                "abcdefghijklmnopqrstuvwxyz",
+                "A Mattermost post.",
+                root_id="root-1",
+                props={"attachments": []},
+            )
+        )
+        self.assertEqual(result["id"], "post-1")
+        asyncio.run(
+            ctx.update_mattermost(
+                "post-1",
+                "Updated Mattermost post.",
+                props={"attachments": []},
+            )
+        )
+        self.assertEqual(
+            rpc.requests,
+            [
+                {
+                    "type": "ctx.post_to_mattermost",
+                    "channel": "abcdefghijklmnopqrstuvwxyz",
+                    "text": "A Mattermost post.",
+                    "args": {"root_id": "root-1", "props": {"attachments": []}},
+                },
+                {
+                    "type": "ctx.update_mattermost",
+                    "post_id": "post-1",
+                    "text": "Updated Mattermost post.",
+                    "args": {"props": {"attachments": []}},
+                },
+            ],
+        )
+
+    def test_mattermost_buttons_build_attachment_actions(self) -> None:
+        from api.workflow_engine import Button
+
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="sample",
+        )
+        result = asyncio.run(
+            ctx.mattermost_buttons(
+                "review",
+                channel="abcdefghijklmnopqrstuvwxyz",
+                text="Proceed?",
+                workflow="review_release",
+                input={"release_id": "release-1"},
+                root_id="root-1",
+                buttons={
+                    "approve": Button("Approve", style="primary"),
+                    "reject": "Reject",
+                },
+            )
+        )
+        self.assertEqual(result["id"], "post-1")
+        post = next(request for request in rpc.requests if request["type"] == "ctx.post_to_mattermost")
+        self.assertEqual(post["channel"], "abcdefghijklmnopqrstuvwxyz")
+        self.assertEqual(post["text"], "Proceed?")
+        self.assertEqual(post["args"]["root_id"], "root-1")
+        actions = post["args"]["props"]["attachments"][0]["actions"]
+        group_hex = uuid.uuid5(uuid.NAMESPACE_URL, "task-456:review").hex
+        self.assertEqual(
+            [action["id"] for action in actions], [f"cw{group_hex}0", f"cw{group_hex}1"]
+        )
+        self.assertEqual([action["name"] for action in actions], ["Approve", "Reject"])
+        self.assertEqual([action["style"] for action in actions], ["primary", "default"])
+        for action in actions:
+            self.assertEqual(
+                json.loads(action["integration"]["context"]["value"]),
+                {"workflow_name": "review_release", "input": {"release_id": "release-1"}},
+            )
+            self.assertNotIn("url", action["integration"])
+
+    def test_mattermost_buttons_validate_channel_and_target(self) -> None:
+        host = load_workflow_host()
+        for kwargs in [
+            {"channel": "general"},
+            {"channel": "A" * 26},
+            {"text": ""},
+            {"buttons": {}},
+            {"input": {"large": "x" * 2000}},
+        ]:
+            rpc = RequestRpc()
+            ctx = host.WorkflowContext(
+                rpc,
+                run_id="run-123",
+                task_id="task-456",
+                workflow_name="sample",
+            )
+            args = {
+                "name": "review",
+                "channel": "abcdefghijklmnopqrstuvwxyz",
+                "text": "Proceed?",
+                "workflow": "review_release",
+                "buttons": {"approve": "Approve"},
+            }
+            args.update(kwargs)
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                asyncio.run(ctx.mattermost_buttons(**args))
 
     def test_create_pool_retries_transient_connection_failure(self) -> None:
         host = load_workflow_host()

@@ -168,8 +168,13 @@ impl ApiAuthConfig {
             if spec.workflow_events {
                 capabilities.push(Capability::WorkflowsEvents);
             }
-            if spec.identity == "slackbot" {
+            if spec.workflow_actions {
                 capabilities.push(Capability::WorkflowsActions);
+            }
+            if spec.workflow_writes {
+                capabilities.push(Capability::WorkflowsWrite);
+            }
+            if spec.identity == "slackbot" {
                 capabilities.push(Capability::SlackExternalTeamsRead);
             }
             callers.push(static_caller(
@@ -231,7 +236,12 @@ impl ApiAuthConfig {
             "mattermostbot",
             CallerClass::Ingress,
             mattermost_key.into(),
-            [Capability::SessionsRead, Capability::SessionsWrite],
+            [
+                Capability::SessionsRead,
+                Capability::SessionsWrite,
+                Capability::WorkflowsActions,
+                Capability::WorkflowsWrite,
+            ],
             Some(&["mattermost:"]),
         )];
         Self {
@@ -256,6 +266,14 @@ impl ApiAuthConfig {
         request: centaur_workflows::slack_buttons::Invocation,
     ) -> Result<centaur_workflows::CreateWorkflowRunRequest, ApiError> {
         centaur_workflows::slack_buttons::verify(request, self.jwt_secret.as_bytes())
+            .map_err(|error| ApiError::Forbidden(error.into()))
+    }
+
+    pub(crate) fn verify_mattermost_workflow_button(
+        &self,
+        request: centaur_workflows::mattermost_buttons::Invocation,
+    ) -> Result<centaur_workflows::CreateWorkflowRunRequest, ApiError> {
+        centaur_workflows::mattermost_buttons::verify(request, self.jwt_secret.as_bytes())
             .map_err(|error| ApiError::Forbidden(error.into()))
     }
 
@@ -466,18 +484,24 @@ const INGRESS_SPECS: &[IngressSpec] = &[
         identity: "slackbot",
         platform_prefixes: &["slack:"],
         workflow_events: true,
+        workflow_actions: true,
+        workflow_writes: false,
     },
     IngressSpec {
         env_var: "DISCORDBOT_API_KEY",
         identity: "discordbot",
         platform_prefixes: &["discord:"],
         workflow_events: false,
+        workflow_actions: false,
+        workflow_writes: false,
     },
     IngressSpec {
         env_var: "MATTERMOSTBOT_API_KEY",
         identity: "mattermostbot",
         platform_prefixes: &["mattermost:"],
         workflow_events: false,
+        workflow_actions: true,
+        workflow_writes: true,
     },
     IngressSpec {
         env_var: "GITHUBBOT_API_KEY",
@@ -489,18 +513,24 @@ const INGRESS_SPECS: &[IngressSpec] = &[
             "github-review:",
         ],
         workflow_events: true,
+        workflow_actions: false,
+        workflow_writes: false,
     },
     IngressSpec {
         env_var: "LINEARBOT_API_KEY",
         identity: "linearbot",
         platform_prefixes: &["linear:"],
         workflow_events: false,
+        workflow_actions: false,
+        workflow_writes: false,
     },
     IngressSpec {
         env_var: "TEAMSBOT_API_KEY",
         identity: "teamsbot",
         platform_prefixes: &["teams:"],
         workflow_events: false,
+        workflow_actions: false,
+        workflow_writes: false,
     },
 ];
 
@@ -510,6 +540,8 @@ struct IngressSpec {
     /// Every session thread-key prefix this ingress mints.
     platform_prefixes: &'static [&'static str],
     workflow_events: bool,
+    workflow_actions: bool,
+    workflow_writes: bool,
 }
 
 fn static_caller(
@@ -843,6 +875,8 @@ mod tests {
             .expect("mattermostbot ingress spec");
         assert_eq!(mattermostbot.env_var, "MATTERMOSTBOT_API_KEY");
         assert!(!mattermostbot.workflow_events);
+        assert!(mattermostbot.workflow_actions);
+        assert!(mattermostbot.workflow_writes);
         assert!(thread_key_matches_platform(
             mattermostbot.platform_prefixes,
             "mattermost:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4MTI"

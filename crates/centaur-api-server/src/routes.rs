@@ -2608,16 +2608,59 @@ async fn ingest_google_docs_sync_batch(
     })))
 }
 
+#[derive(Deserialize)]
+struct WorkflowActionInvocation {
+    #[serde(default)]
+    platform: Option<String>,
+    button: String,
+    click: Value,
+    idempotency_key: String,
+    #[serde(default)]
+    message: Option<Value>,
+}
+
 async fn invoke_workflow_button(
     State(state): State<AppState>,
-    Json(request): Json<centaur_workflows::slack_buttons::Invocation>,
+    Json(request): Json<WorkflowActionInvocation>,
 ) -> Result<Json<Value>, ApiError> {
-    let feedback =
-        centaur_workflows::slack_button_feedback::ButtonFeedback::from_invocation(&request);
-    let request = state.auth.verify_workflow_button(request)?;
-    let run = workflow_runtime(&state)?
-        .create_button_run(request, feedback)
-        .await?;
+    let platform = request
+        .platform
+        .clone()
+        .unwrap_or_else(|| "slack".to_owned());
+    let run = match platform.as_str() {
+        "slack" => {
+            let invocation = centaur_workflows::slack_buttons::Invocation {
+                button: request.button,
+                click: request.click,
+                idempotency_key: request.idempotency_key,
+                message: request.message,
+            };
+            let feedback =
+                centaur_workflows::slack_button_feedback::ButtonFeedback::from_invocation(
+                    &invocation,
+                );
+            let request = state.auth.verify_workflow_button(invocation)?;
+            workflow_runtime(&state)?
+                .create_button_run(request, feedback)
+                .await?
+        }
+        "mattermost" => {
+            let invocation = centaur_workflows::mattermost_buttons::Invocation {
+                button: request.button,
+                click: request.click,
+                idempotency_key: request.idempotency_key,
+            };
+            let request = state.auth.verify_mattermost_workflow_button(invocation)?;
+            workflow_runtime(&state)?
+                .create_button_run(request, None)
+                .await?
+        }
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "unsupported workflow button platform {other:?}"
+            )));
+        }
+    };
     Ok(Json(serde_json::to_value(run)?))
 }
 

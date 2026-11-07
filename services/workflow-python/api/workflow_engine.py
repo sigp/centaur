@@ -249,6 +249,81 @@ class WorkflowContext:
             "message": {**kwargs, "channel": channel, "ts": message_ts, "text": text},
         })
 
+    async def mattermost_buttons(
+        self, name: str, *, channel: str, text: str, workflow: str,
+        buttons: dict[str, str | Button], input: dict[str, Any] | None = None,
+        root_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Post workflow buttons to a Mattermost channel ID (buttons are signed against the ID)."""
+        normalized = {action: Button(button) if isinstance(button, str) else button
+                      for action, button in buttons.items()}
+        if (
+            not name.strip() or len(name) > 200 or name in self._action_names
+            or not re.fullmatch(r"[a-z0-9]{26}", channel) or not workflow.strip()
+            or not text.strip() or len(text) > 3000
+            or not 1 <= len(buttons) <= 5
+            or any(not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", action)
+                   or not isinstance(button, Button)
+                   or not button.label.strip() or len(button.label) > 75
+                   or button.style not in (None, "primary", "danger")
+                   for action, button in normalized.items())
+            or (input is not None and not isinstance(input, dict))
+        ):
+            raise ValueError(
+                "invalid Mattermost button configuration (channel must be a Mattermost channel ID) "
+                "or duplicate step name"
+            )
+        value = json.dumps({"workflow_name": workflow, "input": input or {}}, separators=(",", ":"))
+        if len(value.encode("utf-8")) > 2000:
+            raise ValueError("Mattermost button workflow and input must fit within 2000 bytes")
+        self._action_names.add(name)
+        group_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{self.task_id}:{name}"))
+        # Mattermost strips integrations from posts it returns to clients, so the
+        # action id (alphanumeric, visible) carries the group for click feedback.
+        id_prefix = "cw" + group_id.replace("-", "")
+        props = {"attachments": [{"text": "", "actions": [
+            {"id": f"{id_prefix}{index}", "name": button.label, "type": "button",
+             "style": button.style or "default",
+             "integration": {"context": {
+                 "centaur_workflow_action": f"centaur.workflow.action:{group_id}:{action}",
+                 "label": button.label,
+                 "value": value,
+             }}}
+            for index, (action, button) in enumerate(normalized.items())
+        ]}]}
+        return await self.step(f"{name}.post", lambda: self.post_to_mattermost(
+            channel, text, root_id=root_id, props=props,
+        ))
+
+    async def post_to_mattermost(
+        self, channel: str, text: str, *, root_id: str | None = None,
+        props: dict[str, Any] | None = None,
+    ) -> Any:
+        args: dict[str, Any] = {}
+        if root_id is not None:
+            args["root_id"] = root_id
+        if props is not None:
+            args["props"] = props
+        return await self._rpc.request({
+            "type": "ctx.post_to_mattermost",
+            "channel": channel,
+            "text": text,
+            "args": args,
+        })
+
+    async def update_mattermost(
+        self, post_id: str, text: str, *, props: dict[str, Any] | None = None,
+    ) -> Any:
+        args: dict[str, Any] = {}
+        if props is not None:
+            args["props"] = props
+        return await self._rpc.request({
+            "type": "ctx.update_mattermost",
+            "post_id": post_id,
+            "text": text,
+            "args": args,
+        })
+
     async def call_tool(self, tool: str, method: str, args: dict[str, Any] | None = None) -> Any:
         return await WorkflowToolManager(self._rpc).call_tool_raw(tool, method, args or {})
 
