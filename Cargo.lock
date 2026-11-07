@@ -604,6 +604,7 @@ dependencies = [
  "base64 0.23.1",
  "centaur-console-db",
  "centaur-iron-proxy",
+ "centaur-session-core",
  "reqwest",
  "serde",
  "serde_json",
@@ -730,6 +731,7 @@ dependencies = [
 name = "centaur-session-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "serde",
  "serde_json",
  "strum",

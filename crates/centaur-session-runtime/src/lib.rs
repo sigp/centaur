@@ -7027,7 +7027,7 @@ fn merge_session_context(
 }
 
 /// Build the structured per-turn session context for a thread, mirroring the
-/// `/api/session` response shape (`{ platform, <slack|discord|linear|github>: { .. } }`).
+/// `/api/session` response shape (`{ platform, <slack|discord|mattermost|linear|github>: { .. } }`).
 ///
 /// Resolved from the same [`ChatDestination`] the session-context route uses, so
 /// the structured context the agent sees in its input is consistent with what
@@ -7062,6 +7062,17 @@ fn session_context_for_thread(thread_key: &ThreadKey) -> Option<serde_json::Map<
                 discord.insert("thread_id".to_owned(), Value::String(thread_id));
             }
             ("discord", discord)
+        }
+        ChatDestination::Mattermost {
+            channel_id,
+            root_post_id,
+        } => {
+            let mut mattermost = serde_json::Map::new();
+            mattermost.insert("channel_id".to_owned(), Value::String(channel_id));
+            if let Some(root_post_id) = root_post_id {
+                mattermost.insert("root_post_id".to_owned(), Value::String(root_post_id));
+            }
+            ("mattermost", mattermost)
         }
         ChatDestination::Linear {
             issue_id,
@@ -9184,6 +9195,51 @@ mod tests {
         assert_eq!(value["session_context"]["discord"]["channel_id"], "222");
         assert_eq!(value["session_context"]["discord"]["thread_id"], "333");
         assert!(value["session_context"].get("slack").is_none());
+    }
+
+    #[test]
+    fn input_line_with_session_context_adds_mattermost_thread_context() {
+        let thread_key = ThreadKey::parse(
+            "mattermost:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4MTI:MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1u",
+        )
+        .unwrap();
+        let trace = SessionTraceContext::new(None, None);
+
+        let line = input_line_with_session_context(&thread_key, &trace, None, r#"{"type":"user"}"#);
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(value["session_context"]["platform"], "mattermost");
+        assert_eq!(
+            value["session_context"]["mattermost"]["channel_id"],
+            "abcdefghijklmnopqrstuvwx12"
+        );
+        assert_eq!(
+            value["session_context"]["mattermost"]["root_post_id"],
+            "0123456789abcdefghijklmn"
+        );
+        assert!(value["session_context"].get("discord").is_none());
+    }
+
+    #[test]
+    fn input_line_prepends_mattermost_chat_surface_note_to_user_content() {
+        let thread_key =
+            ThreadKey::parse("mattermost:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4MTI").unwrap();
+        let trace = SessionTraceContext::new(None, None);
+
+        let line = input_line_with_session_context(
+            &thread_key,
+            &trace,
+            None,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+        let content = value["message"]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 2);
+        let note = content[0]["text"].as_str().unwrap();
+        assert!(note.contains("Mattermost"));
+        assert!(note.contains("abcdefghijklmnopqrstuvwx12"));
+        assert_eq!(content[1]["text"], "hi");
     }
 
     #[test]

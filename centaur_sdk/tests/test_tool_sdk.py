@@ -12,6 +12,7 @@ from centaur_sdk import (
     current_discord_thread,
     current_github_thread,
     current_linear_thread,
+    current_mattermost_thread,
     current_session_context,
     current_slack_thread,
     reset_tool_context,
@@ -201,6 +202,74 @@ def test_current_chat_destination_tags_platform(monkeypatch: pytest.MonkeyPatch)
             "guild_id": "111",
             "channel_id": "222",
             "thread_id": "333",
+        }
+    finally:
+        reset_tool_context(token)
+
+def _mattermost_context(
+    thread_key: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    include_root: bool = True,
+):
+    root = b',"root_post_id":"0123456789abcdefghijklmn"' if include_root else b""
+    payload = (
+        b'{"thread_key":"'
+        + thread_key.encode()
+        + b'","platform":"mattermost","mattermost":{"channel_id":"abcdefghijklmnopqrstuvwx12"'
+        + root
+        + b"}}"
+    )
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda _request, timeout: _fake_context_response(payload)()
+    )
+    return set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key=thread_key,
+            secrets={"CENTAUR_API_URL": "http://api:8000"},
+        )
+    )
+
+
+def test_current_mattermost_thread_returns_api_mattermost_destination(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    token = _mattermost_context(
+        "mattermost:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4MTI:MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1u",
+        monkeypatch,
+    )
+    try:
+        assert current_mattermost_thread() == {
+            "channel_id": "abcdefghijklmnopqrstuvwx12",
+            "root_post_id": "0123456789abcdefghijklmn",
+        }
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_mattermost_thread_omits_root_for_channel_context(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    token = _mattermost_context("mattermost:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4MTI", monkeypatch, include_root=False)
+    try:
+        assert current_mattermost_thread() == {"channel_id": "abcdefghijklmnopqrstuvwx12"}
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_chat_destination_tags_mattermost_platform(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    token = _mattermost_context(
+        "mattermost:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4MTI:MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1u",
+        monkeypatch,
+    )
+    try:
+        assert current_chat_destination() == {
+            "platform": "mattermost",
+            "channel_id": "abcdefghijklmnopqrstuvwx12",
+            "root_post_id": "0123456789abcdefghijklmn",
         }
     finally:
         reset_tool_context(token)

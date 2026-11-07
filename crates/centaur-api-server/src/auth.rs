@@ -222,6 +222,24 @@ impl ApiAuthConfig {
             api_clients_enabled: true,
         }
     }
+    #[cfg(test)]
+    pub(crate) fn testing_with_mattermost_ingress(
+        mattermost_key: impl Into<String>,
+        jwt_secret: impl Into<String>,
+    ) -> Self {
+        let callers = vec![static_caller(
+            "mattermostbot",
+            CallerClass::Ingress,
+            mattermost_key.into(),
+            [Capability::SessionsRead, Capability::SessionsWrite],
+            Some(&["mattermost:"]),
+        )];
+        Self {
+            static_callers: Arc::new(callers),
+            jwt_secret: Arc::from(jwt_secret.into()),
+            api_clients_enabled: true,
+        }
+    }
 
     /// Enables or disables API clients, overriding the environment.
     pub fn with_api_clients_enabled(mut self, enabled: bool) -> Self {
@@ -453,6 +471,12 @@ const INGRESS_SPECS: &[IngressSpec] = &[
         env_var: "DISCORDBOT_API_KEY",
         identity: "discordbot",
         platform_prefixes: &["discord:"],
+        workflow_events: false,
+    },
+    IngressSpec {
+        env_var: "MATTERMOSTBOT_API_KEY",
+        identity: "mattermostbot",
+        platform_prefixes: &["mattermost:"],
         workflow_events: false,
     },
     IngressSpec {
@@ -809,6 +833,24 @@ mod tests {
                 "{thread_key}"
             );
         }
+    }
+
+    #[test]
+    fn mattermostbot_ingress_is_scoped_to_mattermost_thread_keys() {
+        let mattermostbot = INGRESS_SPECS
+            .iter()
+            .find(|spec| spec.identity == "mattermostbot")
+            .expect("mattermostbot ingress spec");
+        assert_eq!(mattermostbot.env_var, "MATTERMOSTBOT_API_KEY");
+        assert!(!mattermostbot.workflow_events);
+        assert!(thread_key_matches_platform(
+            mattermostbot.platform_prefixes,
+            "mattermost:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4MTI"
+        ));
+        assert!(!thread_key_matches_platform(
+            mattermostbot.platform_prefixes,
+            "discord:111:222"
+        ));
     }
 
     #[test]

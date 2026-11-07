@@ -98,6 +98,11 @@ class PrincipalTest < ActiveSupport::TestCase
     assert_includes principal.errors[:kind], "can't be blank"
   end
 
+  test "mattermost channel is a valid principal kind" do
+    principal = Principal.new(default_attrs(kind: "mattermost_channel"))
+    assert_predicate principal, :valid?
+  end
+
   test "Slack identity fields must use canonical formats" do
     {
       slack_user_id: %w[U0123456789 W0123456789 USLACK],

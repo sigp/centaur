@@ -51,8 +51,9 @@ pub struct CreateSessionResponse {
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionContextResponse {
     pub thread_key: ThreadKey,
-    /// The chat surface the agent is operating on: `slack`, `discord`, `linear`,
-    /// `github`, or `unknown` for threads that are not platform-addressable.
+    /// The chat surface the agent is operating on: `slack`, `discord`,
+    /// `mattermost`, `linear`, `github`, or `unknown` for threads that are not
+    /// platform-addressable.
     pub platform: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -60,6 +61,8 @@ pub struct SessionContextResponse {
     pub slack: Option<SlackThreadContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discord: Option<DiscordThreadContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mattermost: Option<MattermostThreadContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub linear: Option<LinearThreadContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,6 +81,13 @@ pub struct DiscordThreadContext {
     pub channel_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MattermostThreadContext {
+    pub channel_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_post_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

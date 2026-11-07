@@ -1210,8 +1210,9 @@ system-managed `infra` role.
 | `effective_slack_channel_permissions` | response only | Direct permissions merged with permissions inherited from assigned roles. |
 
 Known kinds are `unknown`, `user`, `console_user`, `workflow`,
-`slack_channel`, `slack_dm`, `discord_channel`, `linear_issue`, `teams_user`,
-and `teams_conversation`. Use one of these values for the `kind` field.
+`slack_channel`, `slack_dm`, `discord_channel`, `mattermost_channel`,
+`linear_issue`, `teams_user`, and `teams_conversation`. Use one of these
+values for the `kind` field.
 
 ### Operations
 

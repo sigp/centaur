@@ -3,6 +3,7 @@
 //! A session is the public control-plane object for one ongoing agent
 //! conversation. `thread_key` is the canonical identifier.
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -117,7 +118,7 @@ fn validate_thread_key(value: &str) -> Result<(), ThreadKeyError> {
 
 /// The chat surface a thread is delivered to, parsed from its thread key.
 ///
-/// Slack, Discord, Linear, and GitHub all encode the destination — where a reply
+/// Slack, Discord, Mattermost, Linear, and GitHub all encode the destination — where a reply
 /// (and, where the surface supports it, an uploaded file) lands — directly in the
 /// key. Resolving it in one place lets the API session context, the per-turn
 /// context line the agent reads, and any caller that needs a posting destination
@@ -133,6 +134,13 @@ pub enum ChatDestination {
         guild_id: String,
         channel_id: String,
         thread_id: Option<String>,
+    },
+    /// A Mattermost channel or thread. Keys are the chat-adapter-mattermost
+    /// thread id verbatim: `mattermost:<base64url channel id>[:<base64url root
+    /// post id>]`. The ids here are the decoded Mattermost ids.
+    Mattermost {
+        channel_id: String,
+        root_post_id: Option<String>,
     },
     /// A Linear issue thread. The reply lands as a comment on the issue (nested
     /// under `comment_id` when the turn came in on a comment thread). Unlike
@@ -173,11 +181,12 @@ impl GithubThreadKind {
 
 impl ChatDestination {
     /// The platform identifier surfaced to the agent (`slack` / `discord` /
-    /// `linear` / `github`).
+    /// `mattermost` / `linear` / `github`).
     pub fn platform(&self) -> &'static str {
         match self {
             Self::Slack { .. } => "slack",
             Self::Discord { .. } => "discord",
+            Self::Mattermost { .. } => "mattermost",
             Self::Linear { .. } => "linear",
             Self::Github { .. } => "github",
         }
@@ -220,6 +229,19 @@ impl ChatDestination {
                     "[chat surface: Discord · channel {channel_id}{thread} (guild {guild_id}). \
                      Centaur delivers your reply to this thread automatically — do not repost it with the discord tool. \
                      Send files here with `discord upload`.]"
+                )
+            }
+            Self::Mattermost {
+                channel_id,
+                root_post_id,
+            } => {
+                let thread = root_post_id
+                    .as_deref()
+                    .map(|id| format!(" · thread {id}"))
+                    .unwrap_or_default();
+                format!(
+                    "[chat surface: Mattermost · channel {channel_id}{thread}. \
+                     Centaur delivers your reply to this thread automatically.]"
                 )
             }
             Self::Linear {
@@ -269,7 +291,8 @@ impl ThreadKey {
     /// threads, or githubbot's synthetic `github-review:` sessions). The Slack
     /// arms are kept byte-for-byte compatible with the historical
     /// session-context parser so existing Slack behavior is preserved; Discord
-    /// keys are `discord:<guild>:<channel>[:<thread>]`, Linear keys are
+    /// keys are `discord:<guild>:<channel>[:<thread>]`, Mattermost keys are
+    /// `mattermost:<base64url channel>[:<base64url root post>]`, Linear keys are
     /// `linear:<issue>[:c:<comment>][:s:<agent_session>]` (mirroring the
     /// linearbot chat-SDK `encodeThreadId` shape), and GitHub keys are
     /// `github:<owner>/<repo>:<pr>[:rc:<review_comment>]` or
@@ -317,6 +340,21 @@ impl ThreadKey {
                 thread_id,
             });
         }
+        if let Some(rest) = key.strip_prefix("mattermost:") {
+            let mut segments = rest.split(':');
+            let channel_id = decode_mattermost_id(segments.next()?)?;
+            let root_post_id = match segments.next() {
+                Some(segment) => Some(decode_mattermost_id(segment)?),
+                None => None,
+            };
+            if segments.next().is_some() {
+                return None;
+            }
+            return Some(ChatDestination::Mattermost {
+                channel_id,
+                root_post_id,
+            });
+        }
         if let Some(rest) = key.strip_prefix("linear:") {
             let segments = rest.split(':').collect::<Vec<_>>();
             let (issue_id, comment_id, agent_session_id) = match segments.as_slice() {
@@ -359,6 +397,21 @@ impl ThreadKey {
 /// Slack conversation ids start with `C` (channel), `D` (DM), or `G` (group).
 fn is_slack_conversation_id(value: &str) -> bool {
     matches!(value.as_bytes().first(), Some(b'C' | b'D' | b'G'))
+}
+
+/// Decode one base64url (RFC 4648, no padding) segment of a Mattermost thread
+/// key into a Mattermost id. Mattermost ids are `[a-z0-9]`, so anything else
+/// (including an empty id or non-UTF-8 bytes) is rejected.
+fn decode_mattermost_id(segment: &str) -> Option<String> {
+    let bytes = URL_SAFE_NO_PAD.decode(segment).ok()?;
+    if bytes.is_empty()
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 #[derive(
@@ -555,6 +608,7 @@ pub fn empty_object() -> Value {
 
 #[cfg(test)]
 mod tests {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::str::FromStr;
 
     use super::{ChatDestination, GithubThreadKind, HarnessType, ThreadKey};
@@ -629,6 +683,91 @@ mod tests {
                 channel_id: "222".to_owned(),
                 thread_id: None,
             }
+        );
+    }
+
+    #[test]
+    fn chat_destination_resolves_mattermost_channel_and_thread_keys() {
+        let channel_id = "abcdefghijklmnopqrstuvwx12";
+        let root_post_id = "0123456789abcdefghijklmn";
+        let channel = URL_SAFE_NO_PAD.encode(channel_id);
+        let root = URL_SAFE_NO_PAD.encode(root_post_id);
+
+        let with_thread = ThreadKey::parse(format!("mattermost:{channel}:{root}"))
+            .unwrap()
+            .chat_destination()
+            .unwrap();
+        assert_eq!(
+            with_thread,
+            ChatDestination::Mattermost {
+                channel_id: channel_id.to_owned(),
+                root_post_id: Some(root_post_id.to_owned()),
+            }
+        );
+        assert_eq!(with_thread.platform(), "mattermost");
+        assert_eq!(
+            with_thread.context_line(),
+            format!(
+                "[chat surface: Mattermost · channel {channel_id} · thread {root_post_id}. \
+                 Centaur delivers your reply to this thread automatically.]"
+            )
+        );
+
+        let channel_only = ThreadKey::parse(format!("mattermost:{channel}"))
+            .unwrap()
+            .chat_destination()
+            .unwrap();
+        assert_eq!(
+            channel_only,
+            ChatDestination::Mattermost {
+                channel_id: channel_id.to_owned(),
+                root_post_id: None,
+            }
+        );
+        assert_eq!(
+            channel_only.context_line(),
+            format!(
+                "[chat surface: Mattermost · channel {channel_id}. \
+                 Centaur delivers your reply to this thread automatically.]"
+            )
+        );
+    }
+
+    #[test]
+    fn mattermost_destination_rejects_malformed_segments() {
+        let channel = URL_SAFE_NO_PAD.encode("abcdefghijklmnopqrstuvwx12");
+        assert!(
+            ThreadKey::parse("mattermost:not-base64!")
+                .unwrap()
+                .chat_destination()
+                .is_none()
+        );
+        assert!(
+            ThreadKey::parse(format!("mattermost:{}", URL_SAFE_NO_PAD.encode("ABC")))
+                .unwrap()
+                .chat_destination()
+                .is_none()
+        );
+        assert!(
+            ThreadKey::parse(format!(
+                "mattermost:{channel}:{}",
+                URL_SAFE_NO_PAD.encode("!")
+            ))
+            .unwrap()
+            .chat_destination()
+            .is_none()
+        );
+        assert!(
+            ThreadKey::parse(format!("mattermost:{channel}:root:extra"))
+                .unwrap()
+                .chat_destination()
+                .is_none()
+        );
+        assert!(
+            ThreadKey::parse(format!("mattermost:{channel}:"))
+                .unwrap()
+                .chat_destination()
+                .is_none()
         );
     }
 

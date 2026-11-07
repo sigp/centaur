@@ -4,8 +4,9 @@
 //! the principal is the conversation: a Discord **channel** (every thread in it
 //! shares one principal), a Linear **issue** (every agent session on it shares
 //! one principal), a Microsoft Teams **channel/conversation** (or **user** for
-//! a personal/user-scoped run when the acting user is known), or — for Slack —
-//! a **user** for a 1:1 DM and a **channel** for a multi-party channel/group
+//! a personal/user-scoped run when the acting user is known), a Mattermost
+//! **channel** (including DM and group-message channels), or — for Slack — a
+//! **user** for a 1:1 DM and a **channel** for a multi-party channel/group
 //! thread. The Slack thread key is
 //! ``<source>:[<team_id>:]<conversation_id>[:<thread_ts>]`` — segments are
 //! identified by their Slack prefix rather than position, because the optional
@@ -23,6 +24,7 @@ use std::collections::BTreeMap;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use centaur_session_core::{ChatDestination, ThreadKey};
 use thiserror::Error;
 
 use crate::models::PrincipalInput;
@@ -31,6 +33,7 @@ use crate::util::{managed_labels, slugify};
 const SLACK_DM_KIND: &str = "slack_dm";
 const SLACK_CHANNEL_KIND: &str = "slack_channel";
 const DISCORD_CHANNEL_KIND: &str = "discord_channel";
+const MATTERMOST_CHANNEL_KIND: &str = "mattermost_channel";
 const GITHUB_USER_KIND: &str = "github_user";
 const GITHUB_THREAD_PREFIXES: &[&str] = &[
     "github:",
@@ -138,6 +141,30 @@ pub fn derive_principal_with_slack_team(
                 .map(|name| format!("Discord Channel #{name}"))
                 .unwrap_or_else(|| format!("Discord Channel {key_id} (guild {guild_id})")),
             kind: Some(DISCORD_CHANNEL_KIND.to_owned()),
+            slack_user_id: None,
+            slack_channel_id: None,
+            slack_team_id: None,
+            labels,
+        });
+    }
+
+    // Mattermost sessions key on the channel so every thread in a channel
+    // (including DM and group-message channels) shares one principal. The
+    // session-core parser enforces the adapter's base64url and Mattermost-id
+    // rules, so malformed keys fall through to the generic thread principal.
+    if let Some(ChatDestination::Mattermost { channel_id, .. }) =
+        ThreadKey::parse(thread_key.to_owned())
+            .ok()
+            .and_then(|key| key.chat_destination())
+    {
+        let mut labels = BTreeMap::new();
+        labels.insert("mattermost_channel_id".to_owned(), channel_id.clone());
+        return Ok(PrincipalRef {
+            foreign_id: format!("mattermost-channel-{}", slugify(&channel_id)),
+            name: display_name
+                .map(|name| format!("Mattermost Channel ~{name}"))
+                .unwrap_or_else(|| format!("Mattermost Channel {channel_id}")),
+            kind: Some(MATTERMOST_CHANNEL_KIND.to_owned()),
             slack_user_id: None,
             slack_channel_id: None,
             slack_team_id: None,
@@ -643,6 +670,104 @@ mod tests {
         );
         assert_eq!(thread_a.kind.as_deref(), Some("discord_channel"));
         assert!(!thread_a.labels.contains_key("kind"));
+    }
+
+    #[test]
+    fn mattermost_sessions_key_on_the_channel() {
+        let channel_id = "abcdefghijklmnopqrstuvwx12";
+        let root_a = "0123456789abcdefghijklmn";
+        let root_b = "fedcba9876543210ponmlkji";
+        let channel = URL_SAFE_NO_PAD.encode(channel_id);
+        let thread_a = derive_principal(
+            &format!("mattermost:{channel}:{}", URL_SAFE_NO_PAD.encode(root_a)),
+            None,
+            None,
+        );
+        let thread_b = derive_principal(
+            &format!("mattermost:{channel}:{}", URL_SAFE_NO_PAD.encode(root_b)),
+            None,
+            None,
+        );
+        assert_eq!(
+            thread_a.foreign_id,
+            "mattermost-channel-abcdefghijklmnopqrstuvwx12"
+        );
+        assert_eq!(thread_a.foreign_id, thread_b.foreign_id);
+        assert_eq!(
+            thread_a.name,
+            "Mattermost Channel abcdefghijklmnopqrstuvwx12"
+        );
+        assert_eq!(
+            thread_a
+                .labels
+                .get("mattermost_channel_id")
+                .map(String::as_str),
+            Some(channel_id)
+        );
+        assert_eq!(thread_a.kind.as_deref(), Some("mattermost_channel"));
+        assert_eq!(thread_a.slack_user_id, None);
+        assert_eq!(thread_a.slack_channel_id, None);
+        assert_eq!(thread_a.slack_team_id, None);
+    }
+
+    #[test]
+    fn mattermost_dm_style_channel_ids_use_the_channel_principal() {
+        let channel_id = "dmabcdefghijklmnopqrstuv";
+        let key = format!("mattermost:{}", URL_SAFE_NO_PAD.encode(channel_id));
+        let principal = derive_principal(&key, Some("mattermost-user"), None);
+        assert_eq!(
+            principal.foreign_id,
+            "mattermost-channel-dmabcdefghijklmnopqrstuv"
+        );
+        assert_eq!(
+            principal.name,
+            "Mattermost Channel dmabcdefghijklmnopqrstuv"
+        );
+        assert_eq!(principal.kind.as_deref(), Some("mattermost_channel"));
+        assert_eq!(
+            principal
+                .labels
+                .get("mattermost_channel_id")
+                .map(String::as_str),
+            Some(channel_id)
+        );
+        assert_eq!(principal.slack_user_id, None);
+        assert_eq!(principal.slack_channel_id, None);
+        assert_eq!(principal.slack_team_id, None);
+    }
+
+    #[test]
+    fn mattermost_conversation_name_overrides_display_name_but_not_the_key() {
+        let channel_id = "abcdefghijklmnopqrstuvwx12";
+        let key = format!("mattermost:{}", URL_SAFE_NO_PAD.encode(channel_id));
+        let principal = derive_principal(&key, None, Some("ops-alerts"));
+        assert_eq!(
+            principal.foreign_id,
+            "mattermost-channel-abcdefghijklmnopqrstuvwx12"
+        );
+        assert_eq!(principal.name, "Mattermost Channel ~ops-alerts");
+        assert_eq!(principal.slack_user_id, None);
+        assert_eq!(principal.slack_channel_id, None);
+        assert_eq!(principal.slack_team_id, None);
+    }
+
+    #[test]
+    fn malformed_mattermost_keys_fall_back_to_generic_principals() {
+        for thread_key in [
+            "mattermost:not-base64!",
+            "mattermost:QUJD",
+            "mattermost:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4MTI:root:extra",
+        ] {
+            let principal = derive_principal(thread_key, Some("user"), None);
+            assert_eq!(
+                principal.foreign_id,
+                format!("thread-{}", slugify(thread_key))
+            );
+            assert_eq!(principal.kind, None);
+            assert_eq!(principal.slack_user_id, None);
+            assert_eq!(principal.slack_channel_id, None);
+            assert_eq!(principal.slack_team_id, None);
+        }
     }
 
     #[test]

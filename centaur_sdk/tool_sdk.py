@@ -122,9 +122,10 @@ def current_thread_key() -> str:
 def current_session_context() -> dict[str, Any]:
     """Return API-owned context for the current thread.
 
-    For Slack-originated sessions this includes ``slack.channel_id`` and
-    ``slack.thread_ts``. The API remains the source of truth so warm pooled
-    sandboxes do not need per-thread environment mutation.
+    For chat-originated sessions this includes the platform-specific
+    destination ids (for example ``slack.channel_id``/``thread_ts`` or
+    ``mattermost.channel_id``/``root_post_id``). The API remains the source of
+    truth so warm pooled sandboxes do not need per-thread environment mutation.
     """
     thread_key = current_thread_key()
     base_url = secret("CENTAUR_API_URL", "http://api:8000").rstrip("/")
@@ -169,6 +170,25 @@ def current_discord_thread() -> dict[str, str]:
     }
     if discord.get("thread_id"):
         destination["thread_id"] = str(discord["thread_id"])
+    return destination
+
+
+def current_mattermost_thread() -> dict[str, str]:
+    """Return the current Mattermost destination.
+
+    ``{"channel_id": ..., "root_post_id": ...}`` (``root_post_id`` is omitted
+    for a channel-level context). Raises if the current thread is not a
+    Mattermost thread.
+    """
+    context = current_session_context()
+    mattermost = context.get("mattermost")
+    if not isinstance(mattermost, dict) or not mattermost.get("channel_id"):
+        raise RuntimeError(
+            f"current thread is not a Mattermost thread: {context.get('thread_key')!r}"
+        )
+    destination = {"channel_id": str(mattermost["channel_id"])}
+    if mattermost.get("root_post_id"):
+        destination["root_post_id"] = str(mattermost["root_post_id"])
     return destination
 
 
@@ -222,11 +242,13 @@ def current_github_thread() -> dict[str, str | int]:
 def current_chat_destination() -> dict[str, str | int]:
     """Return the current chat surface in a platform-agnostic shape.
 
-    Always includes ``platform`` (``"slack"`` / ``"discord"`` / ``"linear"`` /
-    ``"github"``) plus that platform's destination ids (Slack:
-    ``channel_id``/``thread_ts``; Discord: ``guild_id``/``channel_id``/``thread_id``;
-    Linear: ``issue_id``/``comment_id``/``agent_session_id``; GitHub:
-    ``owner``/``repo``/``number``/``kind``/``review_comment_id``). Prefer this
+    Always includes ``platform`` (``"slack"`` / ``"discord"`` /
+    ``"mattermost"`` / ``"linear"`` / ``"github"``) plus that platform's
+    destination ids (Slack: ``channel_id``/``thread_ts``; Discord:
+    ``guild_id``/``channel_id``/``thread_id``; Mattermost:
+    ``channel_id``/``root_post_id``; Linear: ``issue_id``/``comment_id``/
+    ``agent_session_id``; GitHub: ``owner``/``repo``/``number``/``kind``/
+    ``review_comment_id``). Prefer this
     over the platform-specific helpers when writing tooling that should work on
     any chat surface. Raises if the current thread is not a recognized chat
     surface.
@@ -237,6 +259,8 @@ def current_chat_destination() -> dict[str, str | int]:
         return {"platform": "slack", **current_slack_thread()}
     if platform == "discord":
         return {"platform": "discord", **current_discord_thread()}
+    if platform == "mattermost":
+        return {"platform": "mattermost", **current_mattermost_thread()}
     if platform == "linear":
         return {"platform": "linear", **current_linear_thread()}
     if platform == "github":

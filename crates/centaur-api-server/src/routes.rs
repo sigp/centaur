@@ -60,8 +60,8 @@ use crate::{
         DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
         ExecuteSessionResponse, GithubThreadContext, InterruptSessionExecutionRequest,
         InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
-        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
-        stream_error_sse,
+        MattermostThreadContext, OnHarnessConflict, SessionContextResponse, SessionSseEvent,
+        SlackThreadContext, stream_error_sse,
     },
 };
 
@@ -732,7 +732,7 @@ async fn get_session_context(
         .map(ChatDestination::platform)
         .unwrap_or("unknown")
         .to_owned();
-    let (slack, discord, linear, github) = match destination {
+    let (slack, discord, mattermost, linear, github) = match destination {
         Some(ChatDestination::Slack {
             channel_id,
             thread_ts,
@@ -741,6 +741,7 @@ async fn get_session_context(
                 channel_id,
                 thread_ts,
             }),
+            None,
             None,
             None,
             None,
@@ -758,12 +759,27 @@ async fn get_session_context(
             }),
             None,
             None,
+            None,
+        ),
+        Some(ChatDestination::Mattermost {
+            channel_id,
+            root_post_id,
+        }) => (
+            None,
+            None,
+            Some(MattermostThreadContext {
+                channel_id,
+                root_post_id,
+            }),
+            None,
+            None,
         ),
         Some(ChatDestination::Linear {
             issue_id,
             comment_id,
             agent_session_id,
         }) => (
+            None,
             None,
             None,
             Some(LinearThreadContext {
@@ -783,6 +799,7 @@ async fn get_session_context(
             None,
             None,
             None,
+            None,
             Some(GithubThreadContext {
                 owner,
                 repo,
@@ -791,7 +808,7 @@ async fn get_session_context(
                 review_comment_id,
             }),
         ),
-        None => (None, None, None, None),
+        None => (None, None, None, None, None),
     };
     let title = match runtime.session_title(&thread_key).await {
         Ok(title) => title,
@@ -810,6 +827,7 @@ async fn get_session_context(
         platform,
         slack,
         discord,
+        mattermost,
         linear,
         github,
     }))

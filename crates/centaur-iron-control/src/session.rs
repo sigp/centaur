@@ -43,6 +43,7 @@ impl<'a> SessionPrincipalMetadata<'a> {
             conversation_name: metadata
                 .get("slack_conversation_name")
                 .or_else(|| metadata.get("discord_conversation_name"))
+                .or_else(|| metadata.get("mattermost_conversation_name"))
                 .or_else(|| metadata.get("linear_conversation_name"))
                 .or_else(|| metadata.get("teams_conversation_name"))
                 .and_then(Value::as_str),
@@ -399,6 +400,17 @@ mod tests {
             })))
             .conversation_name,
             Some("Casey Harper")
+        );
+    }
+
+    #[test]
+    fn session_principal_metadata_accepts_mattermost_name() {
+        assert_eq!(
+            SessionPrincipalMetadata::from_session_metadata(Some(&json!({
+                "mattermost_conversation_name": "ops-alerts"
+            })))
+            .conversation_name,
+            Some("ops-alerts")
         );
     }
 

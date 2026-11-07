@@ -64,6 +64,10 @@ mod tests {
         ApiAuthConfig::testing_with_slack_ingress("test-slackbot-key", "test-secret")
     }
 
+    fn test_auth_with_mattermost() -> ApiAuthConfig {
+        ApiAuthConfig::testing_with_mattermost_ingress("test-mattermostbot-key", "test-secret")
+    }
+
     fn console_token() -> String {
         encode(
             &Header::new(Algorithm::HS256),
@@ -462,6 +466,33 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn mattermost_ingress_key_is_scoped_to_mattermost_sessions() {
+        let authorized = "Bearer test-mattermostbot-key";
+        for (thread_key, expected) in [
+            (
+                "mattermost%3AYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4MTI",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            ("discord%3A123%3A456", StatusCode::FORBIDDEN),
+        ] {
+            let response =
+                build_router_with_app_state(AppState::unready(test_auth_with_mattermost()))
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri(format!("/api/session/{thread_key}"))
+                            .header(header::AUTHORIZATION, authorized)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(r#"{"harness_type":"codex"}"#))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            assert_eq!(response.status(), expected, "{thread_key}");
         }
     }
 
@@ -935,6 +966,46 @@ mod tests {
         assert_eq!(body["discord"]["channel_id"], "222");
         assert_eq!(body["discord"]["thread_id"], "333");
         assert!(body.get("slack").is_none());
+        assert!(body.get("linear").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_context_exposes_mattermost_channel_and_root_post() {
+        let pool =
+            PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test").unwrap();
+        let app = build_router_with_runtime(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session/mattermost%3AYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4MTI%3AMDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1u")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["thread_key"],
+            "mattermost:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4MTI:MDEyMzQ1Njc4OWFiY2RlZmdoaWprbG1u"
+        );
+        assert_eq!(body["platform"], "mattermost");
+        assert_eq!(
+            body["mattermost"]["channel_id"],
+            "abcdefghijklmnopqrstuvwx12"
+        );
+        assert_eq!(
+            body["mattermost"]["root_post_id"],
+            "0123456789abcdefghijklmn"
+        );
+        assert!(body.get("discord").is_none());
         assert!(body.get("linear").is_none());
     }
 
