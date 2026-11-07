@@ -217,13 +217,48 @@ Execution tuning:
 | `mattermostbot.serverEgress.cidrs` | Helm value. | Optional destination address ranges. Empty permits the configured port to any address. |
 | `mattermostbot.serverEgress.podSelector`, `mattermostbot.serverEgress.namespace` | Helm values. | Optional in-cluster Mattermost pod labels and namespace. Use this for a Mattermost Service/pod instead of CIDRs. |
 | `mattermostbot.extraEnv`, `mattermostbot.resources` | Helm values. | Additional container environment and resource requests/limits. |
+| `OPENAI_API_KEY` | Optional key in `secretManager.existingSecretName`. | Shared fallback key for the `llm` message-override strategy and the OpenAI proactivity classifier. |
+| `MATTERMOSTBOT_DEFAULT_HARNESS` | Chart-rendered from `sandbox.harnessEngine`. | Base harness for new Mattermost threads without an explicit flag or channel default; defaults to `codex`. |
+| `MATTERMOSTBOT_ENABLED_HARNESSES` | `mattermostbot.extraEnv`; unset means unrestricted. | Comma-separated harness wire values allowed by Mattermost inline flags and channel defaults. |
+| `MATTERMOSTBOT_ACK_REACTION_ENABLED` | `mattermostbot.ackReactionEnabled`, default `true`. | Enables the acknowledgement reaction on mentioned posts that start a turn. Mattermost permission failures disable this reaction kind for the running process. |
+| `MATTERMOSTBOT_ACK_REACTION` | `mattermostbot.ackReaction`, default `eyes`. | Mattermost emoji name for acknowledgement reactions. |
+| `MATTERMOSTBOT_STEERING_REACTION_ENABLED` | `mattermostbot.steeringReactionEnabled`, default `false`. | Enables reactions on accepted mentioned follow-ups while an execution is active. |
+| `MATTERMOSTBOT_STEERING_REACTION` | `mattermostbot.steeringReaction`, default `hourglass_flowing_sand`. | Mattermost emoji name for steering reactions. |
+| `MATTERMOSTBOT_RESPONSE_METADATA_MODE` | `mattermostbot.responseMetadataMode`, default `first`. | Model footer mode: `first` on the reply to a thread's first turn, `always` on every reply, or `never`. |
+| `MATTERMOSTBOT_RESPONSE_SERVICE_TIER_ENABLED` | `mattermostbot.responseServiceTierEnabled`, default `false`. | Includes the Codex service tier in a rendered model footer when available. |
+| `MATTERMOSTBOT_CHANNEL_DEFAULTS` | `mattermostbot.channelDefaults`, rendered only when non-empty. | JSON object keyed by 26-character lowercase Mattermost channel IDs. Values may set `persona`, `harness`, `model`, `provider`, and `reasoning` below explicit or sticky thread flags and above the deployment default. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_STRATEGY` | `mattermostbot.messageOverridesStrategy.mode`, default `flags`. | Chooses deterministic inline `flags` parsing or OpenAI Decisions API `llm` classification. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_MODEL` | `mattermostbot.messageOverridesStrategy.model`, default `gpt-6-luna`. | Model used by the `llm` message-override classifier. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_BASE_URL` | `mattermostbot.messageOverridesStrategy.openaiBaseUrl`. | OpenAI-compatible base URL for `llm` message-override classification. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_API_KEY` | `mattermostbot.extraEnv`; falls back to `OPENAI_API_KEY`. | Optional dedicated key for `llm` message-override classification. |
+| `MATTERMOSTBOT_MESSAGE_OVERRIDES_TIMEOUT_MS` | `mattermostbot.messageOverridesStrategy.timeoutMs`. | Deadline for the `llm` message-override decision. |
+| `MATTERMOSTBOT_PROACTIVITY_ENABLED` | `mattermostbot.proactivity.enabled`, default `false`. | Enables mention-gated classifier decisions for unmentioned follow-ups and operator rules for proactive channel replies. |
+| `MATTERMOSTBOT_PROACTIVITY_CLASSIFIER` | `mattermostbot.proactivity.classifier`, default `openai`. | Proactivity decision backend; `openai` uses the OpenAI Decisions API. |
+| `MATTERMOSTBOT_PROACTIVITY_MODEL` | `mattermostbot.proactivity.model`, default `gpt-6-luna`. | Model used for proactive decisions. |
+| `MATTERMOSTBOT_PROACTIVITY_OPENAI_BASE_URL` | `mattermostbot.proactivity.openaiBaseUrl`. | OpenAI-compatible base URL for proactive decisions. |
+| `MATTERMOSTBOT_PROACTIVITY_OPENAI_API_KEY` | `mattermostbot.extraEnv`; falls back to `OPENAI_API_KEY`. | Optional dedicated key for the proactivity classifier. |
+| `MATTERMOSTBOT_PROACTIVITY_TIMEOUT_MS` | `mattermostbot.proactivity.timeoutMs`, default `2000`. | Proactivity classifier deadline; a late or failed decision means no reply. |
+| `MATTERMOSTBOT_PROACTIVITY_DEBOUNCE_MS` | `mattermostbot.proactivity.debounceMs`, rendered only when above `0`. | Quiet period before an idle-thread burst is classified; zero classifies each post immediately. |
+| `MATTERMOSTBOT_PROACTIVITY_RULES_DIR` | Chart-mounted ConfigMap when `defaultRules` or `channelRules` is non-empty. | Directory containing `default.json` and per-channel `<channelId>.json` rule arrays. |
+| `CODEX_CUSTOM_PROVIDERS` | `codex.customProviders`, rendered when non-empty. | Shared custom OpenAI-compatible Codex provider catalog used by Mattermost harness selection. |
+| `CLAUDE_MODEL`, `CODEX_MODEL`, `CODEX_MODEL_REASONING_EFFORT`, `CENTAUR_PI_MODEL`, `CENTAUR_OMP_MODEL` | Mirrored from matching `sandbox.extraEnv` entries unless `mattermostbot.extraEnv` overrides them. | Keeps Mattermost model footers aligned with the harness configuration used by sandboxes. |
+| `mattermostbot.ackReactionEnabled`, `mattermostbot.ackReaction` | Helm values; defaults `true`, `eyes`. | Configure the acknowledgement reaction and Mattermost emoji name. |
+| `mattermostbot.steeringReactionEnabled`, `mattermostbot.steeringReaction` | Helm values; defaults `false`, `hourglass_flowing_sand`. | Configure the steering reaction and Mattermost emoji name. |
+| `mattermostbot.responseMetadataMode`, `mattermostbot.responseServiceTierEnabled` | Helm values; defaults `first`, `false`. | Configure model-footer frequency and whether Codex service tier is included. |
+| `mattermostbot.channelDefaults` | Helm value; default `{}`. | Per-channel defaults keyed by 26-character Mattermost channel ID. |
+| `mattermostbot.messageOverridesStrategy.mode`, `.model`, `.openaiBaseUrl`, `.timeoutMs` | Helm values; defaults `flags`, `gpt-6-luna`, `https://api.openai.com/v1`, `1500`. | Configure deterministic flags or `llm` message classification. |
+| `mattermostbot.proactivity.enabled`, `.classifier`, `.model`, `.openaiBaseUrl`, `.timeoutMs`, `.debounceMs` | Helm values; defaults `false`, `openai`, `gpt-6-luna`, `https://api.openai.com/v1`, `2000`, `0`. | Configure classifier-backed proactive replies and burst debounce. |
+| `mattermostbot.proactivity.defaultRules`, `.channelRules` | Helm values; defaults `[]`, `{}`. | Configure up to 20 uniquely named rules per list; channel lists replace the default list. |
+| `mattermostbot.metrics.scrapeAnnotations`, `.path`, `.annotations` | Helm values; defaults `true`, `/metrics`, `{}`. | Configure Prometheus/VictoriaMetrics scrape annotations; the endpoint remains on port 3001. |
 
 Mattermostbot is a singleton deployment with a `Recreate` strategy: two pods
 using one Mattermost bot token would both consume every websocket event. The
-NetworkPolicy admits only `/health` probes, permits api-rs and Postgres, and
-relies on the chart-wide DNS policy for DNS. Its Mattermost egress defaults to
-TCP 443 anywhere, and can be restricted with `serverEgress.cidrs` or an
-in-cluster `serverEgress.podSelector`.
+NetworkPolicy admits health probes and annotation-based metrics scrapes on port
+3001, permits api-rs and Postgres, and relies on the chart-wide DNS policy for
+DNS. Its Mattermost egress defaults to TCP 443 anywhere, and can be restricted
+with `serverEgress.cidrs` or an in-cluster `serverEgress.podSelector`. When
+proactivity or the `llm` message-override strategy is enabled, the policy also
+permits TCP 443 for the configured OpenAI-compatible endpoint.
 
 ## Teamsbot
 

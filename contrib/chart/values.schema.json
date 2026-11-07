@@ -593,6 +593,93 @@
         }
       }
     },
+    "mattermostbot": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": {
+          "type": "object",
+          "properties": {
+            "repository": { "type": "string" },
+            "tag": { "type": "string" },
+            "pullPolicy": { "type": "string" }
+          }
+        },
+        "userName": { "type": "string" },
+        "serverUrl": { "type": "string" },
+        "teamAllowlist": { "type": "string" },
+        "serverEgress": {
+          "type": "object",
+          "properties": {
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "cidrs": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "podSelector": { "type": "object" },
+            "namespace": { "type": "string" }
+          }
+        },
+        "ackReactionEnabled": { "type": "boolean" },
+        "ackReaction": { "type": "string", "minLength": 1 },
+        "steeringReactionEnabled": { "type": "boolean" },
+        "steeringReaction": { "type": "string", "minLength": 1 },
+        "responseMetadataMode": {
+          "type": "string",
+          "enum": ["first", "always", "never"]
+        },
+        "responseServiceTierEnabled": { "type": "boolean" },
+        "channelDefaults": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[a-z0-9]{26}$" },
+          "additionalProperties": { "type": "object" }
+        },
+        "messageOverridesStrategy": {
+          "type": "object",
+          "properties": {
+            "mode": { "type": "string", "enum": ["flags", "llm"] },
+            "model": { "type": "string", "minLength": 1 },
+            "openaiBaseUrl": { "type": "string" },
+            "timeoutMs": { "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": false
+        },
+        "proactivity": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "classifier": { "type": "string", "minLength": 1 },
+            "model": { "type": "string", "minLength": 1 },
+            "openaiBaseUrl": { "type": "string" },
+            "timeoutMs": { "type": "integer", "minimum": 1 },
+            "debounceMs": { "type": "integer", "minimum": 0 },
+            "defaultRules": { "$ref": "#/definitions/slackbotv2ProactivityRules" },
+            "channelRules": {
+              "type": "object",
+              "propertyNames": { "pattern": "^[a-z0-9]{26}$" },
+              "additionalProperties": { "$ref": "#/definitions/slackbotv2ProactivityRules" }
+            }
+          },
+          "additionalProperties": false
+        },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "scrapeAnnotations": { "type": "boolean" },
+            "path": { "type": "string" },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            }
+          }
+        },
+        "extraEnv": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "resources": { "type": "object" }
+      }
+    },
     "externalDatabase": {
       "type": "object",
       "properties": {

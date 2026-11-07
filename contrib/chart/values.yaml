@@ -1039,6 +1039,99 @@ mattermostbot:
     #   app.kubernetes.io/name: mattermost
     # Namespace of those pods; requires podSelector. Empty means the release namespace.
     namespace: ""
+  # React to mentioned posts that start a turn, then remove the reaction after the
+  # assistant response is posted, so slow turns visibly register. Uses Mattermost emoji
+  # names (no colons). The bot account needs permission to add reactions in the channel;
+  # mattermostbot disables reactions for the running process if Mattermost refuses.
+  ackReactionEnabled: true
+  ackReaction: eyes
+  # React to mentioned follow-ups while an execution is active, then remove their
+  # reactions after the assistant response is posted. Mattermost refusing the reaction
+  # disables the feature for the running process.
+  steeringReactionEnabled: false
+  steeringReaction: hourglass_flowing_sand
+  # Append model, harness, and reasoning effort to the reply to a thread's first
+  # turn (first), every reply (always), or none (never). Rendered as a trailing
+  # markdown line, or as its own short reply when it would not fit in
+  # MATTERMOSTBOT_MAX_POST_CHARS.
+  responseMetadataMode: first
+  # Include the Codex service tier when a response metadata footer is rendered.
+  # This does not cause the footer to appear on additional responses.
+  responseServiceTierEnabled: false
+  # Per-channel default persona / harness / model / provider / reasoning, keyed by
+  # Mattermost channel id (26 characters of [a-z0-9]; find it in the channel's
+  # View Info dialog or with GET /api/v4/teams/<team id>/channels/name/<name>). Each
+  # value is an object of optional persona / harness / model / provider / reasoning
+  # fields, using the same vocabulary as the inline flags (harness: claude|codex|
+  # nanocodex|amp, provider: bedrock|meta, model accepts Claude aliases like opus).
+  # A model is only meaningful within a harness, so name the harness alongside it.
+  # Applied when a post in that channel carries no explicit/sticky per-thread flag,
+  # below such a flag and above the deployment default harness, and forwarded onto the
+  # harness input line so it takes effect. reasoning only affects the codex harness.
+  # persona names a deployed persona and applies when a thread's session is created,
+  # like --persona.
+  # Example:
+  #   channelDefaults:
+  #     c1x8r7q5nbfd7p3kgqyzy4w9ho: { persona: eng, harness: claude, model: opus, reasoning: high }
+  #     9zqeb1rc4tdkpmj9xw3a5nyh6e: { reasoning: low }
+  channelDefaults: {}
+  # Message overrides strategy for post text. "flags" keeps the deterministic
+  # --model/--claude/-rsn strategy. "llm" classifies the message with the OpenAI
+  # Decisions API (which supports only gpt-6-luna), allowing natural language requests
+  # such as "use max effort and the sol model". In llm mode, set OPENAI_API_KEY in the
+  # shared secret or provide MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_API_KEY via
+  # extraEnv.
+  messageOverridesStrategy:
+    mode: flags
+    model: gpt-6-luna
+    openaiBaseUrl: https://api.openai.com/v1
+    timeoutMs: 1500
+  # Proactive replies without a mention. Once mentioned in a thread, the bot replies to
+  # later unmentioned posts there that its built-in rules accept; unmentioned follow-ups
+  # reach a running turn only when proactivity accepts them. Operator rules remove the
+  # need for a mention: the bot replies to any unmentioned post in the channel that meets
+  # a rule's `when`, starting a thread under a top-level post (a reply whose root_id is
+  # that post). Rules are checked in order and the first match wins; its optional
+  # `context` tells the agent how to respond, once per rule per thread. A stop command
+  # silences proactive replies in its thread until the next mention. The openai
+  # classifier reads OPENAI_API_KEY from the shared secret, or
+  # MATTERMOSTBOT_PROACTIVITY_OPENAI_API_KEY via extraEnv.
+  proactivity:
+    enabled: false
+    classifier: openai
+    model: gpt-6-luna
+    openaiBaseUrl: https://api.openai.com/v1
+    timeoutMs: 2000
+    # Milliseconds of quiet an idle thread waits for before classifying, so a post sent
+    # in parts (a name, then context) gets one decision and one turn that sees every
+    # part. Every proactive reply waits this long; 0 classifies each post at once.
+    # Later parts steer the turn when the classifier accepts them.
+    debounceMs: 0
+    # Rules are mounted from a ConfigMap, so `when` and `context` can be long and span
+    # lines. Rules for every channel; empty means no rule matching by default.
+    defaultRules: []
+    # Rules keyed by Mattermost channel id (26 characters of [a-z0-9]). Each list
+    # replaces defaultRules in its channel; an empty list turns rule matching off there.
+    # A list holds at most 20 rules with unique names. Example:
+    #   channelRules:
+    #     c1x8r7q5nbfd7p3kgqyzy4w9ho:
+    #       - name: incident
+    #         when: |
+    #           Questions about an active incident: outages, rollbacks, and
+    #           alerts for services we own.
+    #         context: |
+    #           Check the service's dashboards and recent deploys first, then
+    #           reply in a few lines with what changed and a suggested next step.
+    #       - name: general
+    #         when: A direct question about a service we own.
+    #     9zqeb1rc4tdkpmj9xw3a5nyh6e: []
+    channelRules: {}
+  metrics:
+    # mattermostbot serves Prometheus text metrics at /metrics on port 3001. This flag
+    # only controls scrape annotations for Prometheus/VictoriaMetrics-style discovery.
+    scrapeAnnotations: true
+    path: /metrics
+    annotations: {}
   extraEnv: {}
   resources: {}
 

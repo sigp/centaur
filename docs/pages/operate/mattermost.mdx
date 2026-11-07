@@ -22,6 +22,11 @@ A Mattermost administrator must create the bot account:
 4. Add the bot account to every public or private channel where it should
    operate. It must have permission to read posts and post replies.
 
+For acknowledgement and steering reactions, the bot account also needs
+permission to add and remove reactions in each channel. Mattermost channel IDs
+are 26-character lowercase alphanumeric strings; use the ID, not the channel
+name, in channel-keyed settings.
+
 The allowlist uses Mattermost **team IDs**, not team names. As an administrator
 or with a suitable Mattermost token, list teams with the Mattermost API:
 
@@ -68,7 +73,9 @@ mattermostbot:
 Use either destination CIDRs or an in-cluster pod selector when you need to
 restrict egress. The chart-wide NetworkPolicy already permits DNS. The
 Mattermost policy also permits the api-rs service and the configured Postgres
-state store, and admits only health probes on port 3001.
+state store, and admits health probes and annotation-based metric scrapes on
+port 3001. If proactivity or the `llm` message-override strategy is enabled,
+it adds TCP 443 egress for the configured OpenAI-compatible endpoint.
 
 ## Provide secrets and deploy
 
@@ -138,6 +145,148 @@ kubectl -n centaur logs -l app.kubernetes.io/component=mattermostbot --tail=50
 
 The deployment has exactly one replica and uses `Recreate`. Two pods using the
 same Mattermost bot token would each receive every websocket event.
+
+## Stop a turn and choose a harness
+
+Mention the bot and send a stop request to interrupt the active execution:
+
+```text
+@centaur stop
+@centaur cancel this turn
+```
+
+The stop parser also accepts `kill`, `end`, and common inflected forms, with
+optional words such as `please`, `now`, or `the run`. A stop request is only
+recognized when it mentions the bot; it does not accidentally treat an
+ordinary post containing the word “stop” as a command.
+
+The same mention can carry inline controls. Flags are removed before the post
+reaches the harness:
+
+- `--claude` or `--claude-code`, `--codex`, `--nanocodex`, `--amp`, `--pi`,
+  and `--omp` select a harness.
+- `--bedrock`, `--meta`, or `--provider <name>` select a Codex provider.
+- `--persona <id>` (or `--persona=<id>`) selects the persona when the thread
+  session is created.
+- `--model <name>` (or `--model=<name>`) selects a model, and
+  `--fable`, `--opus`, `--sonnet`, and `--haiku` are Claude model shortcuts.
+- `-rsn <effort>` (or `-rsn=<effort>`) sets per-turn reasoning effort.
+
+Harness, model, and provider choices stick to the Mattermost thread. An
+explicit harness flag on a thread pinned to another harness restarts that
+thread on the requested harness. The deployment default is Codex unless
+`sandbox.harnessEngine` or `MATTERMOSTBOT_DEFAULT_HARNESS` changes it.
+`MATTERMOSTBOT_ENABLED_HARNESSES`, supplied through `mattermostbot.extraEnv`,
+can restrict the harnesses available to inline flags and channel defaults.
+
+## Channel defaults and reactions
+
+`mattermostbot.channelDefaults` is a JSON object keyed by a 26-character
+Mattermost channel ID. Each value may contain `persona`, `harness`, `model`,
+`provider`, and `reasoning`, using the same vocabulary as the inline flags:
+
+```yaml
+mattermostbot:
+  channelDefaults:
+    0123456789abcdefghijklmnop:
+      harness: claude
+      model: opus
+      reasoning: high
+```
+
+A channel default applies when a post has no explicit or sticky thread choice,
+below an explicit choice and above the deployment default. A persona applies
+when a session is created. Use an empty object to leave channel defaults
+disabled.
+
+The chart enables acknowledgement reactions by default:
+`ackReactionEnabled: true` uses the Mattermost `eyes` emoji after a mentioned
+post starts a turn and removes it after the answer is posted.
+`steeringReactionEnabled: false` can be enabled to use
+`hourglass_flowing_sand` on accepted follow-ups while a turn is running.
+Set `ackReaction` and `steeringReaction` to other Mattermost emoji names when
+needed. The bot must be allowed to add reactions; if Mattermost rejects a
+reaction, that reaction kind is disabled for the running process and the bot
+logs the failure once.
+
+## Mention gating and proactive replies
+
+Mattermost operation is mention-gated. A post that does not mention the bot
+never reaches a running turn on its own; the next mention in the thread brings
+it in as context. A mentioned follow-up during a turn steers that turn.
+
+With proactivity enabled, an unmentioned follow-up in a thread where the bot
+was mentioned (or answered on a rule match) goes to a classifier, and an
+accepted post is handled like a mentioned follow-up: it starts a turn or
+steers the running one. A classifier failure or timeout means no reply. Only a
+mention can stop a turn, and a stop silences proactive replies in its thread
+until the next mention.
+
+Proactivity and the `llm` override strategy both call an OpenAI-compatible
+Decisions API endpoint. Enable proactivity with:
+
+```yaml
+mattermostbot:
+  proactivity:
+    enabled: true
+    classifier: openai
+    model: gpt-6-luna
+    timeoutMs: 2000
+    debounceMs: 500
+```
+
+Set `messageOverridesStrategy.mode: llm` to also read harness, model, and
+reasoning requests from plain language, not only from flags.
+
+`OPENAI_API_KEY` comes from the infra Secret. For a separate key, set
+`MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_API_KEY` or
+`MATTERMOSTBOT_PROACTIVITY_OPENAI_API_KEY` through `mattermostbot.extraEnv`.
+The matching `openaiBaseUrl` values select an OpenAI-compatible endpoint.
+`debounceMs` waits for a quiet period before classifying an idle-thread burst;
+zero classifies each post immediately.
+
+Operator rules can make a channel proactive without a prior mention. Rules
+are arrays of at most 20 uniquely named entries with `when` and optional
+`context` fields:
+
+```yaml
+mattermostbot:
+  proactivity:
+    enabled: true
+    defaultRules:
+      - name: incident
+        when: Questions about an active incident in a service we own.
+        context: Check dashboards and recent deploys before replying.
+    channelRules:
+      0123456789abcdefghijklmnop: []
+```
+
+`defaultRules` applies to every channel. A `channelRules` entry replaces it
+for that channel; an empty list disables rule matching there. A matched rule
+can start a reply thread under a top-level post (`root_id` is the post ID),
+and its context is sent on the first execution it starts in that thread (and
+again after a harness restart).
+The chart mounts `default.json` and `<channelId>.json` from a ConfigMap and
+sets `MATTERMOSTBOT_PROACTIVITY_RULES_DIR` automatically when rules are
+configured.
+
+## Model footer and metrics
+
+Set `responseMetadataMode` to `first` (the reply to the thread's first turn),
+`always` (every reply), or `never` (no replies). When enabled, the trailing
+Mattermost markdown line shows the effective model, harness, and reasoning
+effort. If it would exceed `MATTERMOSTBOT_MAX_POST_CHARS`, the bot posts the
+footer as a short reply instead. `responseServiceTierEnabled` includes the
+Codex service tier in the footer when one is available. Model values mirrored
+from `sandbox.extraEnv` (`CLAUDE_MODEL`, `CODEX_MODEL`,
+`CODEX_MODEL_REASONING_EFFORT`, `CENTAUR_PI_MODEL`, and `CENTAUR_OMP_MODEL`)
+are overridden by matching `mattermostbot.extraEnv` entries.
+
+Mattermostbot always exposes Prometheus text at `GET /metrics` on port `3001`.
+The chart's `mattermostbot.metrics.scrapeAnnotations` (default `true`) adds
+`prometheus.io/scrape`, `prometheus.io/path`, and `prometheus.io/port`
+annotations; `metrics.path` changes the path and `metrics.annotations` adds or
+overrides annotation values.
 
 ## Supported surface
 

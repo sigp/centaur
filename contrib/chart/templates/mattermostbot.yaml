@@ -3,6 +3,42 @@
 {{- fail "mattermostbot.serverUrl is required when mattermostbot.enabled=true" }}
 {{- end }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+{{- $proactivity := .Values.mattermostbot.proactivity -}}
+{{- $proactivityRules := and $proactivity.enabled (or $proactivity.defaultRules $proactivity.channelRules) -}}
+{{- $mattermostMetricsAnnotations := dict -}}
+{{- if .Values.mattermostbot.metrics.scrapeAnnotations -}}
+{{- $mattermostMetricsAnnotations = dict "prometheus.io/scrape" "true" "prometheus.io/path" .Values.mattermostbot.metrics.path "prometheus.io/port" "3001" -}}
+{{- $mattermostMetricsAnnotations = mergeOverwrite $mattermostMetricsAnnotations (.Values.mattermostbot.metrics.annotations | default dict) -}}
+{{- end -}}
+{{- if $proactivityRules }}
+{{- /* The bot runs with no rules at all if any list repeats a name, so fail here. */ -}}
+{{- $ruleLists := dict "default" ($proactivity.defaultRules | default list) -}}
+{{- range $channel, $rules := $proactivity.channelRules }}{{- $_ := set $ruleLists $channel ($rules | default list) -}}{{- end }}
+{{- range $key, $rules := $ruleLists }}
+{{- $names := dict -}}
+{{- range $rules }}
+{{- if hasKey $names (trim .name) }}{{- fail (printf "mattermostbot.proactivity: %s rules repeat the name %q" $key (trim .name)) }}{{- end }}
+{{- $_ := set $names (trim .name) true -}}
+{{- end }}
+{{- end }}
+# Proactivity rules as JSON files the bot reads at boot from
+# MATTERMOSTBOT_PROACTIVITY_RULES_DIR: default.json for every channel and
+# <CHANNEL_ID>.json per channel (an empty list turns rule matching off there).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "mattermostbot") }}-proactivity-rules
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "mattermostbot") | nindent 4 }}
+data:
+{{- if $proactivity.defaultRules }}
+  default.json: {{ $proactivity.defaultRules | toJson | quote }}
+{{- end }}
+{{- range $channel, $rules := $proactivity.channelRules }}
+  {{ printf "%s.json" $channel }}: {{ $rules | default list | toJson | quote }}
+{{- end }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,6 +58,12 @@ spec:
     metadata:
       annotations:
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+{{- if $proactivityRules }}
+        checksum/proactivity-rules: {{ dict "default" $proactivity.defaultRules "channels" $proactivity.channelRules | toJson | sha256sum }}
+{{- end }}
+{{- with $mattermostMetricsAnnotations }}
+{{ toYaml . | nindent 8 }}
+{{- end }}
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "mattermostbot") | nindent 8 }}
     spec:
@@ -40,6 +82,10 @@ spec:
               value: "3001"
             - name: CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
+            # New threads without an explicit --claude/--amp/--codex/
+            # --nanocodex flag run the deployment's default harness.
+            - name: MATTERMOSTBOT_DEFAULT_HARNESS
+              value: {{ .Values.sandbox.harnessEngine | quote }}
             - name: MATTERMOST_BASE_URL
               value: {{ .Values.mattermostbot.serverUrl | quote }}
             - name: MATTERMOST_BOT_TOKEN
@@ -57,10 +103,76 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sOPENAI_API_KEY" .Values.secretManager.envPrefix }}
+                  optional: true
             - name: MATTERMOSTBOT_USER_NAME
               value: {{ .Values.mattermostbot.userName | quote }}
             - name: MATTERMOSTBOT_TEAM_ALLOWLIST
               value: {{ .Values.mattermostbot.teamAllowlist | quote }}
+            - name: MATTERMOSTBOT_ACK_REACTION_ENABLED
+              value: {{ .Values.mattermostbot.ackReactionEnabled | quote }}
+            - name: MATTERMOSTBOT_ACK_REACTION
+              value: {{ .Values.mattermostbot.ackReaction | quote }}
+            - name: MATTERMOSTBOT_STEERING_REACTION_ENABLED
+              value: {{ .Values.mattermostbot.steeringReactionEnabled | quote }}
+            - name: MATTERMOSTBOT_STEERING_REACTION
+              value: {{ .Values.mattermostbot.steeringReaction | quote }}
+            - name: MATTERMOSTBOT_RESPONSE_METADATA_MODE
+              value: {{ .Values.mattermostbot.responseMetadataMode | quote }}
+            - name: MATTERMOSTBOT_RESPONSE_SERVICE_TIER_ENABLED
+              value: {{ .Values.mattermostbot.responseServiceTierEnabled | quote }}
+            - name: MATTERMOSTBOT_MESSAGE_OVERRIDES_STRATEGY
+              value: {{ .Values.mattermostbot.messageOverridesStrategy.mode | quote }}
+            - name: MATTERMOSTBOT_MESSAGE_OVERRIDES_MODEL
+              value: {{ .Values.mattermostbot.messageOverridesStrategy.model | quote }}
+            - name: MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_BASE_URL
+              value: {{ .Values.mattermostbot.messageOverridesStrategy.openaiBaseUrl | quote }}
+            - name: MATTERMOSTBOT_MESSAGE_OVERRIDES_TIMEOUT_MS
+              value: {{ .Values.mattermostbot.messageOverridesStrategy.timeoutMs | quote }}
+            - name: MATTERMOSTBOT_PROACTIVITY_ENABLED
+              value: {{ .Values.mattermostbot.proactivity.enabled | quote }}
+{{- if .Values.mattermostbot.proactivity.enabled }}
+            - name: MATTERMOSTBOT_PROACTIVITY_CLASSIFIER
+              value: {{ .Values.mattermostbot.proactivity.classifier | quote }}
+{{- if gt (int .Values.mattermostbot.proactivity.debounceMs) 0 }}
+            - name: MATTERMOSTBOT_PROACTIVITY_DEBOUNCE_MS
+              value: {{ .Values.mattermostbot.proactivity.debounceMs | quote }}
+{{- end }}
+            - name: MATTERMOSTBOT_PROACTIVITY_MODEL
+              value: {{ .Values.mattermostbot.proactivity.model | quote }}
+            - name: MATTERMOSTBOT_PROACTIVITY_OPENAI_BASE_URL
+              value: {{ .Values.mattermostbot.proactivity.openaiBaseUrl | quote }}
+{{- if $proactivityRules }}
+            - name: MATTERMOSTBOT_PROACTIVITY_RULES_DIR
+              value: /etc/mattermostbot/proactivity-rules
+{{- end }}
+            - name: MATTERMOSTBOT_PROACTIVITY_TIMEOUT_MS
+              value: {{ .Values.mattermostbot.proactivity.timeoutMs | quote }}
+{{- end }}
+{{- if .Values.mattermostbot.channelDefaults }}
+            # Per-channel default harness / model / provider / reasoning, keyed
+            # by Mattermost channel id (each value is an object of optional
+            # persona/harness/model/provider/reasoning fields).
+            - name: MATTERMOSTBOT_CHANNEL_DEFAULTS
+              value: {{ .Values.mattermostbot.channelDefaults | toJson | quote }}
+{{- end }}
+{{- if .Values.codex.customProviders }}
+            - name: CODEX_CUSTOM_PROVIDERS
+              value: {{ .Values.codex.customProviders | toJson | quote }}
+{{- end }}
+{{- range $name := tuple "CLAUDE_MODEL" "CODEX_MODEL" "CODEX_MODEL_REASONING_EFFORT" "CENTAUR_PI_MODEL" "CENTAUR_OMP_MODEL" }}
+{{- if and (hasKey $.Values.sandbox.extraEnv $name) (not (hasKey $.Values.mattermostbot.extraEnv $name)) }}
+            # Mirror the deployer's harness default override (sandbox.extraEnv)
+            # so the model footer names the model/reasoning policy sandboxes run.
+            # mattermostbot.extraEnv wins if it sets the same variable.
+            - name: {{ $name }}
+              value: {{ index $.Values.sandbox.extraEnv $name | toString | quote }}
+{{- end }}
+{{- end }}
 {{- range $name, $value := .Values.mattermostbot.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}
@@ -90,6 +202,16 @@ spec:
             runAsGroup: 1000
           resources:
 {{ toYaml .Values.mattermostbot.resources | nindent 12 }}
+{{- if $proactivityRules }}
+          volumeMounts:
+            - name: proactivity-rules
+              mountPath: /etc/mattermostbot/proactivity-rules
+              readOnly: true
+      volumes:
+        - name: proactivity-rules
+          configMap:
+            name: {{ include "centaur.componentName" (dict "root" . "component" "mattermostbot") }}-proactivity-rules
+{{- end }}
 ---
 apiVersion: v1
 kind: Service

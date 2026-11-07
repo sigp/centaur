@@ -18,6 +18,8 @@ name: sigp release
       - contrib/chart/**
       - services/console/**
       - services/mattermostbot/**
+      # The mattermostbot image copies harness/ for its footer's default models.
+      - harness/**
       - packages/**
       - package.json
       - pnpm-lock.yaml

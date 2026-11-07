@@ -541,7 +541,9 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Only health probes reach mattermostbot; the websocket connection is outbound.
+    # Health probes and annotation-based Prometheus scrapes from the configured
+    # ingress source namespaces reach mattermostbot; the websocket connection
+    # and OpenAI-compatible classifier calls are outbound.
     - from:
 {{- range $ingressSourceNamespaces }}
         - namespaceSelector:
@@ -593,6 +595,13 @@ spec:
     - ports:
         - protocol: TCP
           port: {{ .Values.mattermostbot.serverEgress.port }}
+{{- end }}
+{{- if and (or .Values.mattermostbot.proactivity.enabled (eq .Values.mattermostbot.messageOverridesStrategy.mode "llm")) (or (ne (int .Values.mattermostbot.serverEgress.port) 443) .Values.mattermostbot.serverEgress.cidrs .Values.mattermostbot.serverEgress.podSelector) }}
+    # OpenAI-compatible classifier/override API egress. The Mattermost server rule
+    # above is not sufficient when it uses another port or a restricted destination.
+    - ports:
+        - protocol: TCP
+          port: 443
 {{- end }}
 ---
 {{- end }}
