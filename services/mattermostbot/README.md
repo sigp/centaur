@@ -1,11 +1,18 @@
 # mattermostbot
 
-Mattermost chat ingress for the Centaur agent. The service uses Chat SDK's `chat-adapter-mattermost` WebSocket transport, forwards allowlisted mentions and subscribed-thread follow-ups to api-rs, and renders each reply in the same Mattermost thread in the background so the thread lock is released while a turn runs.
+Mattermost chat ingress for the Centaur agent. The service uses Chat SDK's `chat-adapter-mattermost` WebSocket transport, forwards allowlisted mentions and mention-gated subscribed-thread follow-ups to api-rs, and renders each reply in the same Mattermost thread in the background so the thread lock is released while a turn runs.
 
 ## Behavior
 
 - A mentioned stop command (`stop`, `cancel`, `kill`, or `end`, with common
   polite variants) interrupts the api-rs execution and never starts a new turn.
+
+- Unmentioned posts in a subscribed thread are not forwarded or used to steer a
+  running turn. The next mention refreshes the thread context and includes every
+  post since the last forwarded one. Proactive replies are the later exception.
+- A turn-starting mention gets the configured acknowledgement reaction. A
+  mentioned follow-up can get the optional steering reaction; each reaction is
+  removed after the response (or a failure) is posted.
 - Inline flags select the harness, model, provider, persona, and per-turn
   reasoning (`--codex`, `--claude`, `--model <id>`, `--provider <id>`,
   `--persona <id>`, `-rsn <effort>`). Flags are removed from the current
@@ -40,6 +47,10 @@ Run one replica per bot token. Two consumers on one Mattermost token receive the
 | `MATTERMOSTBOT_MESSAGE_OVERRIDES_OPENAI_API_KEY` | No | Decisions API key; falls back to `OPENAI_API_KEY`. |
 | `MATTERMOSTBOT_MESSAGE_OVERRIDES_TIMEOUT_MS` | No | Decisions request timeout. |
 | `MATTERMOSTBOT_CHANNEL_DEFAULTS` | No | JSON map keyed by Mattermost channel id. |
+| `MATTERMOSTBOT_ACK_REACTION_ENABLED` | No | Turn-start acknowledgement; defaults to `true`. |
+| `MATTERMOSTBOT_ACK_REACTION` | No | Mattermost emoji name; defaults to `eyes`. |
+| `MATTERMOSTBOT_STEERING_REACTION_ENABLED` | No | Mentioned follow-up acknowledgement; defaults to `false`. |
+| `MATTERMOSTBOT_STEERING_REACTION` | No | Mattermost emoji name; defaults to `hourglass_flowing_sand`. |
 | `CLAUDE_MODEL` / `CODEX_MODEL` | No | Deployment-configured default model metadata. |
 | `CODEX_MODEL_REASONING_EFFORT` | No | Deployment-configured Codex/Nanocodex reasoning default. |
 | `CENTAUR_PI_MODEL` / `CENTAUR_OMP_MODEL` | No | Deployment-configured Pi/OMP default model metadata. |

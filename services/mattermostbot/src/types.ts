@@ -144,6 +144,14 @@ export type MattermostbotOptions = {
   harnessDefaultReasoning?: Record<string, string>;
   /** Strategy for resolving message-level harness/model/provider/reasoning overrides. */
   messageOverridesStrategy?: MessageOverridesStrategy;
+  /** React to mentions that start a turn. */
+  ackReactionEnabled?: boolean;
+  /** Mattermost emoji name used for turn-start acknowledgements. */
+  ackReactionName?: string;
+  /** React to mentioned follow-ups that are forwarded into an active turn. */
+  steeringReactionEnabled?: boolean;
+  /** Mattermost emoji name used for active-turn acknowledgements. */
+  steeringReactionName?: string;
   botToken: string;
   fetch?: MattermostbotFetch;
   idleTimeoutMs?: number;

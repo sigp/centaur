@@ -74,6 +74,16 @@ const options: MattermostbotOptions = {
       }
     : {},
   messageOverridesStrategy: createMessageOverridesStrategy(),
+  ackReactionEnabled: booleanEnv("MATTERMOSTBOT_ACK_REACTION_ENABLED", true),
+  ackReactionName: stringEnv("MATTERMOSTBOT_ACK_REACTION", "eyes"),
+  steeringReactionEnabled: booleanEnv(
+    "MATTERMOSTBOT_STEERING_REACTION_ENABLED",
+    false,
+  ),
+  steeringReactionName: stringEnv(
+    "MATTERMOSTBOT_STEERING_REACTION",
+    "hourglass_flowing_sand",
+  ),
   idleTimeoutMs: optionalNumberEnv("SESSION_IDLE_TIMEOUT_MS"),
   logger,
   maxDurationMs: optionalNumberEnv("SESSION_MAX_DURATION_MS"),
@@ -171,6 +181,13 @@ function optionalNumberEnv(name: string): number | undefined {
     throw new Error(`${name} must be a positive integer`);
   }
   return parsed;
+}
+function booleanEnv(name: string, fallback: boolean): boolean {
+  const value = optionalEnv(name);
+  if (!value) return fallback;
+  if (["1", "true", "yes", "on"].includes(value.toLowerCase())) return true;
+  if (["0", "false", "no", "off"].includes(value.toLowerCase())) return false;
+  throw new Error(`${name} must be a boolean`);
 }
 
 function log(level: string, message: string, data?: unknown): void {

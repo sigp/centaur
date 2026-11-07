@@ -111,6 +111,26 @@ export async function collectInitialContext(
   return serialized;
 }
 
+/**
+ * Refreshes a mentioned thread with posts that arrived since the last
+ * forwarded message. Mattermost history includes the bot's rendered replies;
+ * those are already assistant turns in api-rs and must not be appended again.
+ */
+export async function collectMentionContext(
+  thread: { allMessages: AsyncIterable<Message> },
+  currentMessage: Message,
+  options?: MattermostbotOptions,
+): Promise<MattermostbotApiMessage[]> {
+  const messages = await collectInitialContext(thread, currentMessage, options);
+  const currentTime = currentMessage.metadata.dateSent.getTime();
+  return messages.filter((message) => {
+    if (message.id === currentMessage.id) return true;
+    if (message.author.isMe) return false;
+    const messageTime = Date.parse(message.timestamp);
+    return !Number.isFinite(messageTime) || messageTime <= currentTime;
+  });
+}
+
 function stripInlineDirectiveText(text: string): string {
   const persona = extractPersonaOverride(text);
   return extractMessageOverrides(persona.cleanedText).cleanedText;

@@ -95,6 +95,13 @@ type Harness = {
   edits: Record<string, unknown>[];
   eventRequests: Array<{ executionId: string | null; threadKey: string }>;
   executes: Record<string, unknown>[];
+  reactions: Array<{
+    emoji: string;
+    method: "add" | "remove";
+    postId: string;
+  }>;
+  refuseReactionAdds: number;
+  refuseReactionRemoves: number;
   /** Number of upcoming append requests to answer with 503. */
   failAppends: number;
   /** Number of upcoming thread-history requests to answer with HTTP 500. */
@@ -137,6 +144,9 @@ function startHarness(): Harness {
     edits: [],
     eventRequests: [],
     executes: [],
+    reactions: [],
+    refuseReactionAdds: 0,
+    refuseReactionRemoves: 0,
     failAppends: 0,
     failEvents: false,
     failHistory: 0,
@@ -261,6 +271,37 @@ function startHarness(): Harness {
           team_id: "team-allowed",
           type: "O",
         });
+      }
+      if (url.pathname === "/api/v4/reactions" && request.method === "POST") {
+        const body = (await request.json()) as {
+          emoji_name?: string;
+          post_id?: string;
+        };
+        harness.reactions.push({
+          emoji: String(body.emoji_name ?? ""),
+          method: "add",
+          postId: String(body.post_id ?? ""),
+        });
+        if (harness.refuseReactionAdds > 0) {
+          harness.refuseReactionAdds -= 1;
+          return new Response("reaction denied", { status: 403 });
+        }
+        return Response.json({});
+      }
+      const reactionMatch = url.pathname.match(
+        /^\/api\/v4\/users\/[^/]+\/posts\/([^/]+)\/reactions\/([^/]+)$/,
+      );
+      if (reactionMatch && request.method === "DELETE") {
+        harness.reactions.push({
+          emoji: decodeURIComponent(reactionMatch[2] ?? ""),
+          method: "remove",
+          postId: reactionMatch[1] ?? "",
+        });
+        if (harness.refuseReactionRemoves > 0) {
+          harness.refuseReactionRemoves -= 1;
+          return new Response("reaction denied", { status: 403 });
+        }
+        return new Response(null, { status: 204 });
       }
       if (url.pathname.startsWith("/api/v4/files/") && request.method === "GET") {
         harness.fileRequests.push({
@@ -591,7 +632,7 @@ describe("Mattermost reliability", () => {
     await waitFor(() => h.posts.length === 1);
     expect(appendedIds(h)).toContain(ROOT_ID);
 
-    h.sendPosted(makePost("followup1", "also look at the logs", ROOT_ID));
+    h.sendPosted(makePost("followup1", "@centaur also look at the logs", ROOT_ID));
     await waitFor(() => appendedIds(h).includes("followup1"));
 
     // The follow-up must not have started a second execution.
@@ -601,6 +642,160 @@ describe("Mattermost reliability", () => {
     await waitFor(async () => (await threadState(state))?.activeExecution === false);
     expect(h.botPostTexts().join("\n")).toContain("first streamed reply");
     expect(h.executes).toHaveLength(1);
+  });
+
+  it("holds an unmentioned follow-up until the next mention refreshes context", async () => {
+    harness = startHarness();
+    const h = harness;
+    h.hold = newGate();
+    const state = createMemoryState();
+    await startBotAndConnect({ state });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur hello"));
+    await waitFor(() => h.eventRequests.length === 1);
+    await waitFor(() => h.posts.length === 1);
+
+    h.sendPosted(makePost("unmentioned-followup", "also look at the logs", ROOT_ID));
+    await sleep(50);
+    expect(appendedIds(h)).toEqual([ROOT_ID]);
+    expect(h.executes).toHaveLength(1);
+
+    h.sendPosted(
+      makePost("mentioned-followup", "@centaur now include those logs", ROOT_ID),
+    );
+    await waitFor(() => appendedIds(h).includes("unmentioned-followup"));
+    expect(appendedIds(h)).toContain("mentioned-followup");
+    expect(h.executes).toHaveLength(1);
+
+    h.hold.release();
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+  });
+
+  it("adds the ack reaction at turn start and removes it after the reply", async () => {
+    harness = startHarness();
+    const h = harness;
+    h.hold = newGate();
+    const state = createMemoryState();
+    await startBotAndConnect({ state });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur take a while"));
+    await waitFor(() =>
+      h.reactions.some(
+        (reaction) =>
+          reaction.method === "add" &&
+          reaction.emoji === "eyes" &&
+          reaction.postId === ROOT_ID,
+      ),
+    );
+    expect(
+      h.reactions.some(
+        (reaction) => reaction.method === "remove" && reaction.postId === ROOT_ID,
+      ),
+    ).toBe(false);
+
+    h.hold.release();
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    await waitFor(() =>
+      h.reactions.some(
+        (reaction) => reaction.method === "remove" && reaction.postId === ROOT_ID,
+      ),
+    );
+  });
+
+  it("disables a reaction kind for the process when Mattermost refuses it", async () => {
+    harness = startHarness();
+    const h = harness;
+    h.refuseReactionAdds = 1;
+    const state = createMemoryState();
+    await startBotAndConnect({ state });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur first"));
+    await waitFor(() => h.botPostTexts().length === 1);
+    h.sendPosted(makePost("rootsecond", "@centaur second"));
+    await waitFor(() => h.botPostTexts().length === 2);
+
+    // The refused add is the only attempt: no removal of a reaction that was
+    // never added, and no add on the later turn.
+    expect(h.reactions).toEqual([{ emoji: "eyes", method: "add", postId: ROOT_ID }]);
+  });
+
+  it("adds a steering reaction only when enabled and removes it after the turn", async () => {
+    harness = startHarness();
+    const h = harness;
+    h.hold = newGate();
+    const state = createMemoryState();
+    await startBotAndConnect({ steeringReactionEnabled: true, state });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur start work"));
+    await waitFor(() => h.eventRequests.length === 1);
+    await waitFor(() => h.posts.length === 1);
+
+    const steeringId = "steering-1";
+    h.sendPosted(makePost(steeringId, "@centaur also check the logs", ROOT_ID));
+    await waitFor(() =>
+      h.reactions.some(
+        (reaction) =>
+          reaction.method === "add" &&
+          reaction.emoji === "hourglass_flowing_sand" &&
+          reaction.postId === steeringId,
+      ),
+    );
+    expect(
+      h.reactions.some(
+        (reaction) => reaction.method === "remove" && reaction.postId === steeringId,
+      ),
+    ).toBe(false);
+
+    h.hold.release();
+    await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    await waitFor(() =>
+      h.reactions.some(
+        (reaction) => reaction.method === "remove" && reaction.postId === steeringId,
+      ),
+    );
+  });
+
+  it("keeps a steering reaction when an append retry starts a new execution", async () => {
+    harness = startHarness();
+    const h = harness;
+    h.hold = newGate();
+    const state = createMemoryState();
+    await startBotAndConnect({
+      forwardRetryDelaysMs: [500],
+      steeringReactionEnabled: true,
+      state,
+    });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur start work"));
+    await waitFor(() => h.eventRequests.length === 1);
+    await waitFor(() => h.posts.length === 1);
+    await waitFor(() => h.appends.length === 1);
+    h.failAppends = 1;
+
+    const steeringId = "steering-retry";
+    h.sendPosted(makePost(steeringId, "@centaur retry as the next turn", ROOT_ID));
+    await waitFor(() =>
+      h.reactions.some(
+        (reaction) =>
+          reaction.method === "add" &&
+          reaction.emoji === "hourglass_flowing_sand" &&
+          reaction.postId === steeringId,
+      ),
+    );
+    h.hold.release();
+    // Hold the upgraded turn so its reaction can be checked while it runs.
+    const upgradedTurn = newGate();
+    h.hold = upgradedTurn;
+    await waitFor(() => h.executes.length === 2);
+    await waitFor(() => h.eventRequests.length === 2);
+    const steeringReactions = () =>
+      h.reactions
+        .filter((reaction) => reaction.postId === steeringId)
+        .map((reaction) => reaction.method);
+    expect(steeringReactions()).toEqual(["add"]);
+    upgradedTurn.release();
+    await waitFor(() => steeringReactions().length === 2);
+    expect(steeringReactions()).toEqual(["add", "remove"]);
   });
 
   it("retries a transient 503 on append and completes the turn", async () => {
@@ -756,6 +951,11 @@ describe("Mattermost reliability", () => {
       h.botPostTexts().join("\n").includes("Streaming retries exhausted"),
     );
     await waitFor(async () => (await threadState(state))?.activeExecution === false);
+    await waitFor(() =>
+      h.reactions.some(
+        (reaction) => reaction.method === "remove" && reaction.postId === ROOT_ID,
+      ),
+    );
 
     // Initial attempt + 2 retries, all idempotent on the message id.
     expect(h.executes).toHaveLength(3);

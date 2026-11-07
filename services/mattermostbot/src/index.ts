@@ -42,6 +42,7 @@ import {
 } from "./response-context";
 import {
   collectInitialContext,
+  collectMentionContext,
   executeSessionTurn,
   forwardToSessionApi,
   interruptSessionExecution,
@@ -74,6 +75,11 @@ import {
   takeMessageChunk,
   traceLog,
 } from "./utils";
+import {
+  createReactionController,
+  type ReactionAck,
+  type ReactionController,
+} from "./reactions";
 
 export type {
   ForwardSessionInput,
@@ -236,6 +242,7 @@ export function createMattermostbot(
     userName: options.userName ?? "centaur",
     websocket: options.websocket,
   });
+  const reactions = createReactionController(options, adapter);
   const state = options.state ?? createDefaultState(options, logger);
   const chat = new Chat<
     { mattermost: MattermostAdapter },
@@ -272,22 +279,23 @@ export function createMattermostbot(
       mode: "execute",
       executionLimiter,
       options,
+      reactions,
       state,
     });
   });
 
   chat.onSubscribedMessage(async (thread, message) => {
     if (!(await isAllowedMattermostMessage(message, options, logger))) return;
-    if (
-      message.isMention === true &&
-      (await handleStopCommand(thread, message, options))
-    ) {
+    if (message.isMention !== true) {
+      await handleUnmentionedMessage(thread, message, options);
       return;
     }
+    if (await handleStopCommand(thread, message, options)) return;
     await syncThreadMessageToSession(thread, message, {
-      mode: message.isMention === true ? "execute" : "append",
+      mode: "execute",
       executionLimiter,
       options,
+      reactions,
       state,
     });
   });
@@ -302,7 +310,7 @@ export function createMattermostbot(
   });
 
   if (options.recoverRenderObligationsOnStart !== false) {
-    scheduleRenderObligationRecovery(chat, state, options);
+    scheduleRenderObligationRecovery(chat, state, options, reactions);
   }
 
   return { app, chat, adapter };
@@ -345,6 +353,26 @@ function createDefaultState(
     client: pool,
     keyPrefix: options.stateKeyPrefix ?? "centaur-mattermostbot",
     logger: stateLogger,
+  });
+}
+
+/**
+ * Single hook for an unmentioned subscribed-thread post. Mention gating keeps
+ * it out of the session for now; the proactive classifier can decide here in
+ * a later slice whether to hand it to the normal mention flow.
+ */
+async function handleUnmentionedMessage(
+  thread: Thread<MattermostbotThreadState>,
+  message: ChatMessage,
+  options: MattermostbotOptions,
+): Promise<void> {
+  traceLog(options, "mattermostbot_subscribed_message_without_mention_ignored", {
+    includeContext: false,
+    messageId: message.id,
+    mode: "append",
+    openStream: false,
+    startedAtMs: nowMs(),
+    threadId: thread.id,
   });
 }
 
@@ -411,6 +439,9 @@ async function syncThreadMessageToSession(
     executionLimiter: TeamExecutionLimiter;
     mode: MattermostbotMessageMode;
     options: MattermostbotOptions;
+    reactionAck?: ReactionAck;
+    reactions: ReactionController;
+    retryAttempt?: number;
     state: StateAdapter;
   },
 ): Promise<void> {
@@ -427,6 +458,7 @@ async function syncThreadMessageToSession(
       options.activeExecutionTtlMs ?? DEFAULT_ACTIVE_EXECUTION_TTL_MS,
     ) &&
     !executedIds.has(message.id);
+  let reactionAck = input.reactionAck;
 
   let releaseExecutionSlot: (() => void) | null = null;
   const parsedChannel = await fetchMattermostChannel(
@@ -454,6 +486,8 @@ async function syncThreadMessageToSession(
   try {
     const includeContext =
       shouldStartExecution && state.historyForwarded !== true;
+    const refreshContext =
+      message.isMention === true && state.historyForwarded === true;
     const trace: MattermostbotTrace = {
       includeContext,
       messageId: message.id,
@@ -562,7 +596,12 @@ async function syncThreadMessageToSession(
       options.harnessDefaultReasoning,
     );
 
-    if (forwardedIds.has(message.id) && !shouldStartExecution && !includeContext) {
+    if (
+      forwardedIds.has(message.id) &&
+      !shouldStartExecution &&
+      !includeContext &&
+      !refreshContext
+    ) {
       return;
     }
     if (shouldStartExecution && isContentlessApiMessage(serialized)) {
@@ -572,23 +611,36 @@ async function syncThreadMessageToSession(
       });
       return;
     }
+    if (shouldStartExecution && !reactionAck) {
+      reactionAck = input.reactions.begin(thread, message, "ack");
+    }
 
     let messages: MattermostbotApiMessage[];
-    if (includeContext) {
+    if (includeContext || refreshContext) {
       try {
-        messages = await collectInitialContext(thread, message, options);
+        messages = refreshContext
+          ? await collectMentionContext(thread, message, options)
+          : await collectInitialContext(thread, message, options);
       } catch (error) {
-        logger.error("mattermostbot_history_fetch_failed", {
+        if (!refreshContext) {
+          logger.error("mattermostbot_history_fetch_failed", {
+            error: errorMessage(error),
+            message_id: message.id,
+            thread_id: thread.id,
+          });
+          await thread
+            .post(
+              "I couldn't read this thread's history, so I didn't start a turn. Check that I can read this channel, then mention me again.",
+            )
+            .catch(() => undefined);
+          return;
+        }
+        logger.warn("mattermostbot_mention_context_degraded", {
           error: errorMessage(error),
           message_id: message.id,
           thread_id: thread.id,
         });
-        await thread
-          .post(
-            "I couldn't read this thread's history, so I didn't start a turn. Check that I can read this channel, then mention me again.",
-          )
-          .catch(() => undefined);
-        return;
+        messages = [serialized];
       }
       const current = messages.find((item) => item.id === serialized.id);
       if (current) current.text = serialized.text;
@@ -604,9 +656,17 @@ async function syncThreadMessageToSession(
       Boolean(explicitOverrides.harnessType) &&
       Boolean(pinnedHarness) &&
       pinnedHarness !== effectiveHarnessType;
-    const messagesToAppend = (harnessRestart ? messages : messages).filter(
+    const messagesToAppend = messages.filter(
       (item) => harnessRestart || !forwardedIds.has(item.id),
     );
+    if (
+      !shouldStartExecution &&
+      message.isMention === true &&
+      messagesToAppend.some((item) => item.id === message.id) &&
+      !reactionAck
+    ) {
+      reactionAck = input.reactions.begin(thread, message, "steering");
+    }
     const conversationName = await resolveMattermostConversationName(
       options,
       thread.id,
@@ -648,6 +708,10 @@ async function syncThreadMessageToSession(
         historyForwarded: latest.historyForwarded || includeContext,
         lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
       });
+      if (!shouldStartExecution && latest.activeExecution === true && reactionAck) {
+        input.reactions.hold(reactionAck);
+        reactionAck = undefined;
+      }
     };
 
     const commitExecutionStarted = async (
@@ -693,18 +757,58 @@ async function syncThreadMessageToSession(
         );
       }
     };
+    const finishReaction = (): void => {
+      const ack = reactionAck;
+      reactionAck = undefined;
+      if (ack) backgroundWaitUntil(input.reactions.complete(ack));
+    };
+
 
     if (!shouldStartExecution) {
-      if (messagesToAppend.length > 0) {
-        await withTransientSessionApiRetry(
-          () =>
-            forwardToSessionApi(options, forwardInput, {
-              onMessagesAppended: commitMessagesAppended,
-            }),
-          options,
-          trace,
-        );
+      if (messagesToAppend.length === 0) {
+        finishReaction();
+        return;
       }
+      try {
+        await forwardToSessionApi(options, forwardInput, {
+          onMessagesAppended: commitMessagesAppended,
+        });
+      } catch (error) {
+        const delays = options.forwardRetryDelaysMs ?? FORWARD_RETRY_DELAYS_MS;
+        const attempt = input.retryAttempt ?? 0;
+        const delayMs = delays[attempt];
+        if (delayMs === undefined || !isRetryableSessionApiError(error)) throw error;
+        // As slackbotv2's handoff retry: wait in the background, then recompute
+        // eligibility, so a steer whose turn ended meanwhile starts the next
+        // turn and keeps its reaction until that turn's reply is posted.
+        traceLog(options, "mattermostbot_forward_retry_scheduled", trace, {
+          attempt: attempt + 1,
+          delay_ms: delayMs,
+          error: errorMessage(error),
+        });
+        const retryReaction = reactionAck;
+        reactionAck = undefined;
+        backgroundWaitUntil(
+          (async () => {
+            await sleep(delayMs);
+            await syncThreadMessageToSession(thread, message, {
+              ...input,
+              reactionAck: retryReaction,
+              retryAttempt: attempt + 1,
+            });
+          })().catch((retryError: unknown) => {
+            traceLog(options, "mattermostbot_forward_retry_failed", trace, {
+              attempt: attempt + 1,
+              error: errorMessage(retryError),
+            });
+            if (retryReaction) {
+              backgroundWaitUntil(input.reactions.complete(retryReaction));
+            }
+          }),
+        );
+        return;
+      }
+      finishReaction();
       return;
     }
 
@@ -739,6 +843,7 @@ async function syncThreadMessageToSession(
         activeExecutionStartedAt: null,
         lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
       });
+      finishReaction();
       return;
     }
     handoffStarted = true;
@@ -750,6 +855,8 @@ async function syncThreadMessageToSession(
       () => lastEventId,
       includeContext,
       renderLease,
+      input.reactions,
+      reactionAck,
       trace,
       commitExecutionStarted,
       releaseExecutionSlot ?? undefined,
@@ -762,15 +869,27 @@ async function syncThreadMessageToSession(
     });
     await renderLease.release?.();
     const latest = (await thread.state) ?? {};
-    await thread.setState({
-      activeExecution: false,
-      activeExecutionStartedAt: null,
-      lastEventId: latest.lastEventId ?? 0,
-    });
+    if (shouldStartExecution) {
+      await thread.setState({
+        activeExecution: false,
+        activeExecutionStartedAt: null,
+        lastEventId: latest.lastEventId ?? 0,
+      });
+    }
+    if (reactionAck) {
+      const ack = reactionAck;
+      reactionAck = undefined;
+      backgroundWaitUntil(input.reactions.complete(ack));
+    }
     await thread
       .post(`Centaur could not complete this turn: ${errorMessage(error)}`)
       .catch(() => undefined);
   } finally {
+    if (!handoffStarted && reactionAck) {
+      const ack = reactionAck;
+      reactionAck = undefined;
+      backgroundWaitUntil(input.reactions.complete(ack));
+    }
     if (!handoffStarted) releaseExecutionSlot?.();
   }
 }
@@ -783,12 +902,15 @@ function scheduleExecutionRender(
   getLastEventId: () => number,
   isInitialExecution: boolean,
   renderLease: { release: (() => Promise<void>) | null },
+  reactions: ReactionController,
+  reactionAck?: ReactionAck,
   trace?: MattermostbotTrace,
   onExecutionStarted?: (
     execution: MattermostbotExecuteSessionResponse,
   ) => Promise<void>,
   onSettled?: () => void,
 ): void {
+  if (reactionAck) reactions.hold(reactionAck);
   const promise = (async () => {
     try {
       let attempt = 0;
@@ -834,6 +956,7 @@ function scheduleExecutionRender(
       }
     } finally {
       await renderLease.release?.();
+      backgroundWaitUntil(reactions.completeThread(thread.id));
       onSettled?.();
     }
   })();
@@ -1112,20 +1235,29 @@ function scheduleRenderObligationRecovery(
   chat: Chat<Record<string, Adapter>, MattermostbotThreadState>,
   state: StateAdapter,
   options: MattermostbotOptions,
+  reactions: ReactionController,
 ): void {
-  backgroundWaitUntil(recoverRenderObligationsWithRetry(chat, state, options));
+  backgroundWaitUntil(
+    recoverRenderObligationsWithRetry(chat, state, options, reactions),
+  );
 }
 
 async function recoverRenderObligationsWithRetry(
   chat: Chat<Record<string, Adapter>, MattermostbotThreadState>,
   state: StateAdapter,
   options: MattermostbotOptions,
+  reactions: ReactionController,
 ): Promise<void> {
   try {
     await state.connect();
     let attempt = 0;
     while (true) {
-      const deferredCount = await recoverRenderObligations(chat, state, options);
+      const deferredCount = await recoverRenderObligations(
+        chat,
+        state,
+        options,
+        reactions,
+      );
       if (deferredCount === 0) return;
       await sleep(renderRetryDelayMs(options, attempt));
       attempt += 1;
@@ -1141,6 +1273,7 @@ async function recoverRenderObligations(
   chat: Chat<Record<string, Adapter>, MattermostbotThreadState>,
   state: StateAdapter,
   options: MattermostbotOptions,
+  reactions: ReactionController,
 ): Promise<number> {
   await chat.initialize();
   const indexedThreadIds = await state.getList<string>(
@@ -1167,6 +1300,7 @@ async function recoverRenderObligations(
             chat,
             state,
             options,
+            reactions,
             threadId,
             leasedObligation,
           )
@@ -1196,6 +1330,7 @@ async function recoverRenderObligation(
   chat: Chat<Record<string, Adapter>, MattermostbotThreadState>,
   _state: StateAdapter,
   options: MattermostbotOptions,
+  reactions: ReactionController,
   threadId: string,
   obligation: MattermostbotRenderObligation,
 ): Promise<boolean> {
@@ -1241,6 +1376,7 @@ async function recoverRenderObligation(
       lastEventId,
       renderObligation: null,
     });
+    await reactions.completeRecovered(threadId, obligation.message.id);
     return false;
   }
 
@@ -1268,6 +1404,7 @@ async function recoverRenderObligation(
       lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
       ...(rendered ? { renderObligation: null } : {}),
     });
+    await reactions.completeRecovered(threadId, obligation.message.id);
   }
   return false;
 }
