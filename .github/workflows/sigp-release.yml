@@ -237,7 +237,13 @@ jobs:
               echo "missing upstream image: $source (HTTP $status)" >&2
               exit 1
             fi
-            docker buildx imagetools create --tag "$target" "$source"
+            # GHCR can briefly deny the first push into a package it just
+            # created, so retry before failing.
+            for attempt in 1 2 3; do
+              docker buildx imagetools create --tag "$target" "$source" && break
+              [[ $attempt -lt 3 ]] || exit 1
+              sleep $((attempt * 20))
+            done
           done < <(.github/scripts/chart-images.sh list contrib/chart/values.yaml)
 
   chart:
