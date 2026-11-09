@@ -5,8 +5,8 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
 ## Invariants
 
 - Run exactly one replica per bot token. Multiple websocket consumers receive the same events and execute turns twice; deploy with `replicas: 1` and `Recreate`.
-- The team allowlist is fail-closed. An empty or unset `MATTERMOSTBOT_TEAM_ALLOWLIST` leaves the bot inert. Direct-message (`D`) and group-message (`G`) channels are always denied.
-- The adapter's thread ID is the Centaur thread key verbatim: `mattermost:<base64url channel id>[:<base64url root post id>]`. Do not invent a second key format.
+- The team allowlist is fail-closed. An empty or unset `MATTERMOSTBOT_TEAM_ALLOWLIST` leaves the bot inert. Entries may be Mattermost team names or IDs. Direct-message (`D`) channels are allowed only when `MATTERMOSTBOT_DIRECT_MESSAGES=true`; group-message (`G`) channels are always denied.
+- When api-rs rejects a session for an unapproved Mattermost principal, post exactly one short admission notice and do not retry the turn.
 - The service ignores its own posts and ignores other bot/webhook posts unless the author ID is in `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST`.
 - `/health` is 200 only while the adapter's websocket is open. REST/API failures do not make the service appear healthy.
 - Mattermost uses background post-and-edit streaming. The handler only performs
@@ -102,7 +102,8 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
 | `CLAUDE_MODEL`, `CODEX_MODEL` | No | Deployment model defaults. |
 | `CODEX_MODEL_REASONING_EFFORT` | No | Codex/Nanocodex default reasoning. |
 | `CENTAUR_PI_MODEL`, `CENTAUR_OMP_MODEL` | No | Pi/OMP deployment model defaults. |
-| `MATTERMOSTBOT_TEAM_ALLOWLIST` | Yes to do anything | Comma/space-separated Mattermost team IDs. Empty means inert. |
+| `MATTERMOSTBOT_TEAM_ALLOWLIST` | Yes to do anything | Comma/space-separated Mattermost team names or IDs. Empty means inert. |
+| `MATTERMOSTBOT_DIRECT_MESSAGES` | No | Allow one-to-one (`D`) direct-message channels when `true`; group (`G`) messages remain denied. |
 | `MATTERMOSTBOT_SLASH_COMMAND_TOKENS` | No | Comma/space-separated slash-command tokens. Unset or empty disables `/api/mattermost/commands`; keep secret. |
 | `MATTERMOSTBOT_SLASH_WORKFLOWS` | No | Comma/space-separated workflow names allowed by `/centaur run`; empty disables `run`. |
 | `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST` | No | Comma/space-separated bot author IDs allowed to trigger or append. Empty means all bot posts are ignored. |
@@ -118,7 +119,10 @@ Mattermostbot is Centaur's Mattermost chat ingress. It connects to the Mattermos
 1. In **System Console → Integrations → Bot Accounts**, create a bot account and copy its token into `MATTERMOST_BOT_TOKEN`.
 2. Ensure bot accounts, the REST API, and websocket gateway are enabled.
 3. Add the bot account to each channel it should serve. Mattermost websocket events are limited to channels the account can access.
-4. Record the team IDs and set `MATTERMOSTBOT_TEAM_ALLOWLIST`; the service intentionally does nothing until this is set.
+4. Record team IDs or names and set `MATTERMOSTBOT_TEAM_ALLOWLIST`; the service
+   intentionally does nothing until this is set. Set
+   `MATTERMOSTBOT_DIRECT_MESSAGES=true` only when one-to-one direct messages
+   should be accepted; group messages remain denied.
 5. Give the bot permission to read channel history and create/edit posts.
 
 6. In Mattermost **Product menu → Integrations → Slash Commands**, create

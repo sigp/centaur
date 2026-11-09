@@ -93,9 +93,12 @@ type Harness = {
   appendAttempts: Record<string, unknown>[];
   appends: Record<string, unknown>[];
   baseUrl: string;
+  channelTeamId?: string;
+  channelType: "D" | "G" | "O";
   creates: Record<string, unknown>[];
-  /** Optional api-rs session-create payload for persona reconciliation tests. */
+  /** Optional api-rs session-create response for admission tests. */
   createResponse?: Record<string, unknown>;
+  createStatus: number;
   edits: Record<string, unknown>[];
   eventRequests: Array<{ executionId: string | null; threadKey: string }>;
   executes: Record<string, unknown>[];
@@ -145,13 +148,16 @@ function startHarness(): Harness {
     appendAttempts: [],
     appends: [],
     baseUrl: "",
+    channelTeamId: "team-allowed",
+    channelType: "O",
     botPostTexts: () =>
       botPostIds.map((id) => String(stored.get(id)?.message ?? "")),
     close: () => server.stop(true),
     creates: [],
+    createStatus: 200,
     edits: [],
-    eventRequests: [],
     executes: [],
+    eventRequests: [],
     reactions: [],
     refuseReactionAdds: 0,
     refuseReactionRemoves: 0,
@@ -173,7 +179,7 @@ function startHarness(): Harness {
         JSON.stringify({
           event: "posted",
           data: {
-            channel_type: "O",
+            channel_type: harness.channelType,
             post: JSON.stringify(post),
             sender_name: "alice",
           },
@@ -217,6 +223,14 @@ function startHarness(): Harness {
         const suffix = pieces[3] ?? "";
         if (request.method === "POST" && !suffix) {
           harness.creates.push((await request.json()) as Record<string, unknown>);
+          if (harness.createStatus !== 200) {
+            return Response.json(
+              harness.createResponse ?? {
+                code: "session_principal_not_preapproved",
+              },
+              { status: harness.createStatus, statusText: "Forbidden" },
+            );
+          }
           return Response.json({ ok: true, ...(harness.createResponse ?? {}) });
         }
         if (request.method === "POST" && suffix === "messages") {
@@ -301,8 +315,17 @@ function startHarness(): Harness {
           id: CHANNEL_ID,
           name: "ops",
           display_name: "Ops",
-          team_id: "team-allowed",
-          type: "O",
+          ...(harness.channelTeamId
+            ? { team_id: harness.channelTeamId }
+            : {}),
+          type: harness.channelType,
+        });
+      }
+      if (url.pathname === "/api/v4/teams/team-allowed") {
+        return Response.json({
+          id: "team-allowed",
+          name: "ops",
+          display_name: "Ops",
         });
       }
       if (url.pathname === "/api/v4/reactions" && request.method === "POST") {
@@ -519,6 +542,36 @@ describe("Mattermost reliability", () => {
     expect(JSON.stringify(h.executes)).toContain("claude-opus-5-5");
     expect(JSON.stringify(h.executes)).toContain("amazon-bedrock");
     expect(JSON.stringify(h.executes)).toContain("high");
+  });
+  it("posts one short reply when api-rs refuses an unapproved session", async () => {
+    harness = startHarness();
+    const h = harness;
+    h.createStatus = 403;
+    const state = createMemoryState();
+    await startBotAndConnect({ state });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur start work"));
+    await waitFor(() => h.botPostTexts().length === 1);
+
+    expect(h.botPostTexts()).toEqual([
+      "Centaur isn't enabled for this channel yet.",
+    ]);
+    expect(h.creates).toHaveLength(1);
+    expect(h.appends).toHaveLength(0);
+    expect(h.executes).toHaveLength(0);
+  });
+  it("handles one-to-one direct messages when explicitly enabled", async () => {
+    harness = startHarness();
+    const h = harness;
+    h.channelType = "D";
+    h.channelTeamId = undefined;
+    const state = createMemoryState();
+    await startBotAndConnect({ directMessages: true, state });
+
+    h.sendPosted(makePost(ROOT_ID, "@centaur direct request"));
+    await waitFor(() => h.executes.length === 1);
+    expect(h.creates).toHaveLength(1);
+    expect(h.executes).toHaveLength(1);
   });
   it("downloads Mattermost files with the bot token and forwards their bytes to api-rs", async () => {
     harness = startHarness();

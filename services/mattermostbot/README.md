@@ -4,6 +4,14 @@ Mattermost chat ingress for the Centaur agent. The service uses Chat SDK's `chat
 
 ## Behavior
 
+- Team admission is fail-closed: `MATTERMOSTBOT_TEAM_ALLOWLIST` accepts
+  Mattermost team names or IDs, and an empty value leaves the bot inert.
+- One-to-one direct-message channels are denied by default. Set
+  `MATTERMOSTBOT_DIRECT_MESSAGES=true` to allow `D` channels; group-message
+  (`G`) channels remain denied.
+- If api-rs refuses a session because the channel is not admitted, the bot
+  posts one short `Centaur isn't enabled for this channel yet.` reply.
+
 - A mentioned stop command (`stop`, `cancel`, `kill`, or `end`, with common
   polite variants) interrupts the api-rs execution and never starts a new turn.
 - Mention gating: an unmentioned post in a subscribed thread does not reach the
@@ -88,7 +96,8 @@ Run one replica per bot token. Two consumers on one Mattermost token receive the
 | `CLAUDE_MODEL` / `CODEX_MODEL` | No | Deployment-configured default model metadata. |
 | `CODEX_MODEL_REASONING_EFFORT` | No | Deployment-configured Codex/Nanocodex reasoning default. |
 | `CENTAUR_PI_MODEL` / `CENTAUR_OMP_MODEL` | No | Deployment-configured Pi/OMP default model metadata. |
-| `MATTERMOSTBOT_TEAM_ALLOWLIST` | Yes to do anything | Comma/space-separated team IDs. Empty means inert. |
+| `MATTERMOSTBOT_TEAM_ALLOWLIST` | Yes to do anything | Comma/space-separated Mattermost team names or IDs. Empty means inert. |
+| `MATTERMOSTBOT_DIRECT_MESSAGES` | No | Allow one-to-one (`D`) direct-message channels when `true`; group (`G`) messages remain refused. |
 | `MATTERMOSTBOT_SLASH_COMMAND_TOKENS` | No | Comma/space-separated slash-command tokens. Unset or empty disables `/api/mattermost/commands`. Keep secret. |
 | `MATTERMOSTBOT_SLASH_WORKFLOWS` | No | Comma/space-separated workflow names allowed by `/centaur run`; empty disables `run`. |
 | `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST` | No | Comma/space-separated bot author IDs allowed to trigger or append. |
@@ -141,7 +150,10 @@ parentheses; a dash means no labels:
 1. Open **System Console → Integrations → Bot Accounts**, create a bot account, and store its token as `MATTERMOST_BOT_TOKEN`.
 2. Ensure bot accounts, the REST API, and the WebSocket gateway are enabled.
 3. Add the bot account to each channel it should serve and grant permission to read history and create/edit posts.
-4. Record the team IDs and set `MATTERMOSTBOT_TEAM_ALLOWLIST`. The ingress intentionally ignores every event until this is set.
+4. Record team IDs or names and set `MATTERMOSTBOT_TEAM_ALLOWLIST`. The ingress
+   intentionally ignores every event until this is set. Set
+   `MATTERMOSTBOT_DIRECT_MESSAGES=true` to accept one-to-one DMs; group
+   messages remain refused.
 5. Set `MATTERMOSTBOT_API_KEY` and `MATTERMOSTBOT_DATABASE_URL` from the deployment secret store.
 
 6. Under **Product menu → Integrations → Slash Commands**, create `/centaur`

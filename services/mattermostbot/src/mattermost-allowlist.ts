@@ -10,6 +10,12 @@ export type MattermostChannelRecord = {
   team_id?: string;
 };
 
+export type MattermostTeamRecord = {
+  id: string;
+  name?: string;
+  display_name?: string;
+};
+
 export type ParsedMattermostThreadKey = {
   channelId?: string;
   rootPostId?: string;
@@ -22,6 +28,11 @@ type ChannelCacheEntry = {
   expiresAt: number;
 };
 const channelCache = new Map<string, ChannelCacheEntry>();
+type TeamCacheEntry = {
+  team?: MattermostTeamRecord;
+  expiresAt: number;
+};
+const teamCache = new Map<string, TeamCacheEntry>();
 
 /** Decode the adapter's verbatim `mattermost:<b64url>[:<b64url>]` key. */
 export function parseMattermostThreadKey(
@@ -77,6 +88,33 @@ export function isMattermostTeamAllowed(
   );
 }
 
+export function isMattermostDirectMessagesEnabled(
+  options: MattermostbotOptions,
+): boolean {
+  return (
+    options.directMessages ??
+    ["1", "true", "yes", "on"].includes(
+      process.env.MATTERMOSTBOT_DIRECT_MESSAGES?.trim().toLowerCase() ?? "",
+    )
+  );
+}
+
+export async function isMattermostTeamRecordAllowed(
+  channel: Pick<MattermostChannelRecord, "team_id">,
+  options: MattermostbotOptions,
+): Promise<boolean> {
+  const teamId = channel.team_id;
+  if (!teamId) return false;
+  const allowlist = resolveMattermostTeamAllowlist(options);
+  if (allowlist.includes(teamId)) return true;
+  const team = await fetchMattermostTeam(options, teamId).catch(
+    () => undefined,
+  );
+  // Team names are unique URL slugs; display names are not, and any team admin
+  // can set one, so they never match.
+  return Boolean(team?.name && allowlist.includes(team.name));
+}
+
 /**
  * Fail-closed message authorization. Channel data is read from REST rather
  * than trusting the adapter's websocket cache, which intentionally stores only
@@ -119,7 +157,11 @@ export async function isAllowedMattermostMessage(
     return false;
   }
 
-  if (channel.type === "D" || channel.type === "G") {
+  const directMessages = isMattermostDirectMessagesEnabled(options);
+  if (
+    channel.type === "G" ||
+    (channel.type === "D" && !directMessages)
+  ) {
     logger.warn("mattermostbot_message_ignored_direct_or_group", {
       channel_type: channel.type,
       message_id: message.id,
@@ -127,8 +169,10 @@ export async function isAllowedMattermostMessage(
     });
     return false;
   }
-
-  if (!channel.team_id || !allowlist.includes(channel.team_id)) {
+  if (
+    channel.type !== "D" &&
+    !(await isMattermostTeamRecordAllowed(channel, options))
+  ) {
     logger.warn("mattermostbot_message_ignored_team_not_allowlisted", {
       message_id: message.id,
       team_id: channel.team_id,
@@ -209,9 +253,46 @@ export async function fetchMattermostChannel(
   return channel;
 }
 
+export async function fetchMattermostTeam(
+  options: MattermostbotOptions,
+  teamId: string,
+): Promise<MattermostTeamRecord> {
+  const base = options.baseUrl.replace(/\/$/, "");
+  const cacheKey = `${base}\0${teamId}`;
+  const cached = teamCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    if (!cached.team) throw new Error("Mattermost team lookup unavailable");
+    return cached.team;
+  }
+
+  const fetchFn = options.fetch ?? fetch;
+  let response: Response;
+  try {
+    response = await fetchFn(
+      `${base}/api/v4/teams/${encodeURIComponent(teamId)}`,
+      { headers: { authorization: `Bearer ${options.botToken}` } },
+    );
+  } catch (error) {
+    teamCache.set(cacheKey, { expiresAt: Date.now() + CHANNEL_MISS_TTL_MS });
+    throw error;
+  }
+  if (!response.ok) {
+    teamCache.set(cacheKey, { expiresAt: Date.now() + CHANNEL_MISS_TTL_MS });
+    throw new Error(`Mattermost team lookup failed: ${response.status}`);
+  }
+  const team = (await response.json()) as MattermostTeamRecord;
+  teamCache.set(cacheKey, {
+    team,
+    expiresAt: Date.now() + CHANNEL_CACHE_TTL_MS,
+  });
+  return team;
+}
+
 export function clearMattermostChannelCacheForTests(): void {
   channelCache.clear();
+  teamCache.clear();
 }
+
 
 export function splitMattermostEnvList(value: string | undefined): string[] {
   return splitEnvList(value);

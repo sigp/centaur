@@ -24,6 +24,8 @@ import {
   fetchMattermostChannel,
   isAllowedMattermostMessage,
   isMattermostAllowlistEmpty,
+  isMattermostDirectMessagesEnabled,
+  isMattermostTeamRecordAllowed,
   resolveMattermostConversationName,
   resolveMattermostTeamAllowlist,
 } from "./mattermost-allowlist";
@@ -54,6 +56,7 @@ import {
   interruptSessionExecution,
   isContentlessApiMessage,
   isRetryableSessionApiError,
+  isSessionPrincipalAdmissionDenied,
   openSessionEventStream,
   serializeMessage,
   sessionStreamError,
@@ -121,9 +124,12 @@ export {
   clearMattermostChannelCacheForTests,
   encodeMattermostThreadKey,
   fetchMattermostChannel,
+  fetchMattermostTeam,
   isAllowedMattermostMessage,
   isMattermostAllowlistEmpty,
   isMattermostBotMessage,
+  isMattermostDirectMessagesEnabled,
+  isMattermostTeamRecordAllowed,
   parseMattermostThreadKey,
   resolveMattermostConversationName,
   resolveMattermostTeamAllowlist,
@@ -952,10 +958,21 @@ async function authorizedMattermostChannel(
     () => undefined,
   );
   if (!channel) return undefined;
-  if (channel.type === "D" || channel.type === "G") return undefined;
-  const allowlist = resolveMattermostTeamAllowlist(options);
-  if (!channel.team_id || !allowlist.includes(channel.team_id)) return undefined;
-  if (requestTeamId !== undefined && channel.team_id !== requestTeamId) {
+  if (
+    resolveMattermostTeamAllowlist(options).length === 0 ||
+    channel.type === "G" ||
+    (channel.type === "D" && !isMattermostDirectMessagesEnabled(options))
+  ) {
+    return undefined;
+  }
+  if (
+    requestTeamId !== undefined &&
+    channel.team_id !== undefined &&
+    channel.team_id !== requestTeamId
+  ) {
+    return undefined;
+  }
+  if (channel.type !== "D" && !(await isMattermostTeamRecordAllowed(channel, options))) {
     return undefined;
   }
   return channel;
@@ -1803,6 +1820,16 @@ async function syncThreadMessageToSession(
       const ack = reactionAck;
       reactionAck = undefined;
       backgroundWaitUntil(input.reactions.complete(ack));
+    }
+    if (isSessionPrincipalAdmissionDenied(error)) {
+      logger.warn("mattermostbot_session_admission_denied", {
+        message_id: message.id,
+        thread_id: thread.id,
+      });
+      await thread
+        .post("Centaur isn't enabled for this channel yet.")
+        .catch(() => undefined);
+      return;
     }
     await thread
       .post(`Centaur could not complete this turn: ${errorMessage(error)}`)

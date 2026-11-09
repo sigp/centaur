@@ -62,6 +62,16 @@ export function isRetryableSessionApiError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return error.name === "AbortError" || error.name === "TypeError";
 }
+
+export function isSessionPrincipalAdmissionDenied(error: unknown): boolean {
+  if (!(error instanceof SessionApiError) || error.status !== 403) return false;
+  try {
+    const body: unknown = JSON.parse(error.body);
+    return isJsonObject(body) && body.code === "session_principal_not_preapproved";
+  } catch {
+    return false;
+  }
+}
 type ForwardSessionApiCallbacks = {
   onExecutionStarted?(
     execution: MattermostbotExecuteSessionResponse,

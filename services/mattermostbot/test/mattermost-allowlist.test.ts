@@ -110,7 +110,7 @@ describe("Mattermost allowlist", () => {
     expect(denied).toBe(false);
   });
 
-  it("denies direct-message and group-message channels", async () => {
+  it("denies direct-message and group-message channels by default", async () => {
     clearMattermostChannelCacheForTests();
     expect(
       await isAllowedMattermostMessage(
@@ -123,10 +123,31 @@ describe("Mattermost allowlist", () => {
     expect(
       await isAllowedMattermostMessage(
         message(),
-        options(channelFetch("G")),
+        options(channelFetch("D"), { directMessages: true }),
+        logger,
+      ),
+    ).toBe(true);
+    clearMattermostChannelCacheForTests();
+    expect(
+      await isAllowedMattermostMessage(
+        message(),
+        options(channelFetch("G"), { directMessages: true }),
         logger,
       ),
     ).toBe(false);
+  });
+
+  it("accepts an allowlisted team name as well as its id", async () => {
+    clearMattermostChannelCacheForTests();
+    expect(
+      await isAllowedMattermostMessage(
+        message(),
+        options(channelFetch("O", "team-allowed"), {
+          teamAllowlist: ["ops"],
+        }),
+        logger,
+      ),
+    ).toBe(true);
   });
 
   it("denies the bot's own post and non-allowlisted bot posts", async () => {

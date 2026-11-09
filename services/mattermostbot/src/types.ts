@@ -219,8 +219,13 @@ export type MattermostbotOptions = {
    */
   slashWorkflows?: readonly string[];
   /**
-   * Mattermost team ids the bot serves. Fail-closed: empty/unset means the bot
-   * ignores every message; DMs and group messages are always denied.
+   * Whether one-to-one Mattermost direct messages are accepted. Group
+   * messages remain denied. Defaults to false.
+   */
+  directMessages?: boolean;
+  /**
+   * Mattermost team names or ids the bot serves. Fail-closed: empty/unset
+   * means the bot ignores every message; DMs still require this setting.
    */
   teamAllowlist?: readonly string[];
   /**

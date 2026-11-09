@@ -24,9 +24,9 @@ Use these as the main extension points:
 | `postgres.enabled`, `externalDatabase.*` | Replaces the bundled PostgreSQL with an external server such as RDS or Cloud SQL, scopes NetworkPolicy egress to it, and selects the company-context text-search backend. See [Use an External PostgreSQL](/deploying-in-production#use-an-external-postgresql). |
 | `slackbot.extraEnv` | Slackbot HTTP, Slack, feedback, and cross-org behavior. |
 | `mattermostbot.enabled`, `mattermostbot.image.*`, `mattermostbot.userName` | Helm values enable and configure the singleton Mattermost websocket ingress. |
-| `mattermostbot.serverUrl`, `mattermostbot.teamAllowlist` | Helm values set the Mattermost base URL and comma/space-separated team IDs; both are required for useful Mattermost ingress operation. |
+| `mattermostbot.serverUrl`, `mattermostbot.teamAllowlist` | Helm values set the Mattermost base URL and comma/space-separated team names or IDs; both are required for useful Mattermost ingress operation. |
 | `mattermostbot.serverEgress.*` | Helm values scope Mattermost NetworkPolicy egress by TCP port, CIDRs, or an in-cluster pod selector; default is TCP 443 to any address. |
-| `mattermostbot.extraEnv` | Helm values provide optional Mattermostbot environment overrides, including `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST` and `MATTERMOSTBOT_STATE_KEY_PREFIX`. |
+| `mattermostbot.extraEnv` | Helm values provide optional Mattermostbot environment overrides, including `MATTERMOSTBOT_DIRECT_MESSAGES`, `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST`, and `MATTERMOSTBOT_STATE_KEY_PREFIX`. |
 | `mattermostbot.publicUrl` | Helm value; defaults to empty and falls back to `https://<ingress.host>` when `mattermostbot.ingress` is enabled with a host. Public HTTPS origin for Mattermost slash-command and workflow-action callbacks. |
 | `mattermostbot.ingress.enabled`, `.className`, `.annotations`, `.host`, `.tls` | Helm values; ingress is disabled by default. Exposes only `/api/mattermost` to the Mattermost bot Service on port `3001`; health and metrics stay private. |
 | `mattermostbot.slashCommands.workflows` | Helm value; defaults to `[]`. Workflow names allowed by `/centaur run <workflow> [JSON]`; rendered as `MATTERMOSTBOT_SLASH_WORKFLOWS`. |
@@ -220,7 +220,8 @@ Execution tuning:
 | `MATTERMOSTBOT_SLASH_COMMAND_TOKENS` | `secretManager.existingSecretName`; optional. | Slash-command token accepted by the bot's `/api/mattermost/commands` route. |
 | `MATTERMOSTBOT_DATABASE_URL` | `DATABASE_URL` in `secretManager.existingSecretName`. | Chat SDK Postgres state store. |
 | `MATTERMOSTBOT_USER_NAME` | `mattermostbot.userName`. | Bot username used for Mattermost adapter setup; defaults to `centaur`. |
-| `MATTERMOSTBOT_TEAM_ALLOWLIST` | `mattermostbot.teamAllowlist`. | Comma/space-separated Mattermost team IDs. The bot remains inert until this is set; direct messages and group messages are denied. |
+| `MATTERMOSTBOT_TEAM_ALLOWLIST` | `mattermostbot.teamAllowlist`. | Comma/space-separated Mattermost team names or IDs. The bot remains inert until this is set. |
+| `MATTERMOSTBOT_DIRECT_MESSAGES` | `mattermostbot.extraEnv`. | When `true`, allow one-to-one (`D`) direct-message channels; group (`G`) messages remain denied. |
 | `MATTERMOSTBOT_TRIGGER_BOT_ALLOWLIST`, `MATTERMOSTBOT_STATE_KEY_PREFIX` | `mattermostbot.extraEnv`. | Optional trigger-bot allowlist and Postgres state namespace overrides. |
 | `mattermostbot.serverEgress.port` | Helm value, default `443`. | Mattermost server TCP port allowed by the bot NetworkPolicy. Set it for a non-HTTPS or nonstandard server port. |
 | `mattermostbot.serverEgress.cidrs` | Helm value. | Optional destination address ranges. Empty permits the configured port to any address. |

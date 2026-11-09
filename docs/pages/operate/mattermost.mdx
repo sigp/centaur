@@ -7,8 +7,9 @@ description: Configure the Mattermost chat ingress for Centaur.
 
 Centaur's Mattermost ingress connects to Mattermost over its websocket API and
 forwards allowed channel messages to `api-rs`. It creates one Centaur principal
-per Mattermost channel, including direct-message channels (although the bot
-does not accept DMs).
+per Mattermost channel, including direct-message channels. Direct messages are
+denied by default and can be enabled for one-to-one channels only; group
+messages remain denied.
 
 ## Create the Mattermost bot account
 
@@ -27,16 +28,18 @@ permission to add and remove reactions in each channel. Mattermost channel IDs
 are 26-character lowercase alphanumeric strings; use the ID, not the channel
 name, in channel-keyed settings.
 
-The allowlist uses Mattermost **team IDs**, not team names. As an administrator
-or with a suitable Mattermost token, list teams with the Mattermost API:
+The allowlist uses Mattermost **team IDs or names**. As an administrator or
+with a suitable Mattermost token, list teams with the Mattermost API:
 
 ```sh
 curl -sS -H "Authorization: Bearer $MATTERMOST_BOT_TOKEN" \
   "$MATTERMOST_BASE_URL/api/v4/teams" | jq -r '.[] | [.id, .name] | @tsv'
 ```
 
-Use the IDs for the teams that Centaur may serve. The bot ignores all messages
-until at least one team ID is present in the allowlist.
+Use either the IDs or the names for the teams that Centaur may serve. The bot
+ignores all messages until at least one allowlist entry is present. If api-rs
+rejects a session because its Mattermost principal is not admitted, the bot
+posts one short `Centaur isn't enabled for this channel yet.` reply.
 
 ## Configure the chart
 
@@ -47,7 +50,9 @@ mattermostbot:
   enabled: true
   userName: centaur
   serverUrl: https://mattermost.example.com
-  teamAllowlist: "TEAM_ID_1 TEAM_ID_2"
+  teamAllowlist: "TEAM_ID_1 TEAM_NAME_2"
+  extraEnv:
+    MATTERMOSTBOT_DIRECT_MESSAGES: "true"
   serverEgress:
     port: 443
     # Optional: restrict the server destination. NetworkPolicy cannot match
@@ -155,16 +160,18 @@ provide these keys in the Secret named by `secretManager.existingSecretName`:
   `MATTERMOSTBOT_DATABASE_URL`)
 
 For the `sigp/centaur` fork, the fork release workflow publishes the chart to
-`oci://ghcr.io/sigp/centaur/charts/centaur:<version>-sigp-<sha7>`. It publishes
-the changed images at these immutable references:
+`oci://ghcr.io/sigp/centaur/charts/centaur:<version>-sigp-<sha7>` and stamps
+each chart-deployable project image to
+`ghcr.io/sigp/centaur/<image>:<commit sha>`. The controller and bundled
+PostgreSQL keep their upstream/system image references.
 
-- `ghcr.io/sigp/centaur/centaur-api-rs:<commit sha>`
-- `ghcr.io/sigp/centaur/centaur-console:<commit sha>`
-- `ghcr.io/sigp/centaur/centaur-mattermostbot:<commit sha>`
-
-The other components remain upstream images at the fork's base commit. Deploy a
-fork release by selecting the OCI chart version and overriding only the three
-fork-built images:
+The workflow builds `centaur-api-rs`, `centaur-console`, `centaur-agent`, and
+`centaur-mattermostbot`. It mirrors `centaur-iron-proxy`,
+`centaur-proxy-sync`, `centaur-token-broker`, `centaur-company-context`,
+`centaur-slackbotv2`, `centaur-linearbot`, `centaur-githubbot`,
+`centaur-discordbot`, and `centaur-teamsbot` from the fork's upstream
+merge-base. Select the OCI chart version and apply the Mattermost values
+overlay; the release chart already contains the immutable image references:
 
 ```sh
 COMMIT_SHA=0123456789abcdef0123456789abcdef01234567
@@ -173,13 +180,7 @@ helm upgrade --install centaur \
   oci://ghcr.io/sigp/centaur/charts/centaur \
   --version "${CHART_VERSION}-sigp-${COMMIT_SHA::7}" \
   --namespace centaur --create-namespace \
-  -f mattermost-values.yaml \
-  --set apiRs.image.repository=ghcr.io/sigp/centaur/centaur-api-rs \
-  --set apiRs.image.tag="$COMMIT_SHA" \
-  --set console.image.repository=ghcr.io/sigp/centaur/centaur-console \
-  --set console.image.tag="$COMMIT_SHA" \
-  --set mattermostbot.image.repository=ghcr.io/sigp/centaur/centaur-mattermostbot \
-  --set mattermostbot.image.tag="$COMMIT_SHA"
+  -f mattermost-values.yaml
 ```
 
 For an upstream checkout, the local chart command below is sufficient.
