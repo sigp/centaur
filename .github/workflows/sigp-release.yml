@@ -282,7 +282,10 @@ jobs:
           helm package "$chart_dir" \
             --version "$version" \
             --destination "$RUNNER_TEMP"
-          helm package "$chart_dir/charts/agent-sandbox" \
+          .github/scripts/chart-images.sh controller \
+            "$chart_dir" "$RUNNER_TEMP/agent-sandbox"
+          helm lint "$RUNNER_TEMP/agent-sandbox"
+          helm package "$RUNNER_TEMP/agent-sandbox" \
             --version "$version" \
             --destination "$RUNNER_TEMP"
           printf '%s' "$GHCR_TOKEN" | helm registry login "$REGISTRY" \

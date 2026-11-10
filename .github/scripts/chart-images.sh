@@ -7,6 +7,12 @@
 #       Rewrite a release copy of a chart so project images and repoCache.image
 #       point at the release registry/tag. The standalone agent-sandbox values
 #       file gets the parent chart's agentSandbox.image.tag.
+#   chart-images.sh controller <stamped-chart-dir> <out-dir>
+#       Copy the stamped agent-sandbox subchart to <out-dir> for release on its
+#       own, with its CRDs moved from crds/ into templates/ (annotated
+#       helm.sh/resource-policy: keep). Helm never upgrades files in crds/; the
+#       parent chart upgrades them from a hook that only runs when it installs
+#       the controller itself, so the standalone chart must own them.
 #
 # Needs yq v4 (preinstalled on GitHub's ubuntu runners).
 set -euo pipefail
@@ -49,8 +55,25 @@ stamp)
   TAG="$parent_tag" yq -i '.image.tag = strenv(TAG)' \
     "$chart/charts/agent-sandbox/values.yaml"
   ;;
+controller)
+  [[ $# -eq 3 ]] || { echo "usage: $0 controller <stamped-chart-dir> <out-dir>" >&2; exit 2; }
+  source_dir="$2/charts/agent-sandbox"
+  out=$3
+  rm -rf "$out"
+  cp -a "$source_dir" "$out"
+  if grep -l '{{' "$out"/crds/*.yaml >/dev/null 2>&1; then
+    echo "a CRD contains '{{' and can't move into templates/ as-is" >&2
+    exit 1
+  fi
+  mkdir -p "$out/templates/crds"
+  for crd in "$out"/crds/*.yaml; do
+    yq -i '.metadata.annotations."helm.sh/resource-policy" = "keep"' "$crd"
+    mv "$crd" "$out/templates/crds/"
+  done
+  rmdir "$out/crds"
+  ;;
 *)
-  echo "usage: $0 list <values.yaml> | stamp <chart-dir> <image-prefix> <tag>" >&2
+  echo "usage: $0 list <values.yaml> | stamp <chart-dir> <image-prefix> <tag> | controller <stamped-chart-dir> <out-dir>" >&2
   exit 2
   ;;
 esac
