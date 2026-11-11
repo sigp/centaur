@@ -95,19 +95,36 @@ for the full set of allowlist options.
 
 Session creation accepts optional `network_profile` and `sandbox_size` fields.
 Workflow calls use the same names as `ctx.run_agent(..., network_profile=...,
-sandbox_size=...)`. `network_profile: offline` keeps the sandbox's egress
-limited to its paired iron-proxy and configures that proxy with the
-deployment's `sandbox.offline.allowedHosts` plus Centaur's own API and Console
-hosts needed for sandbox JWTs; it cannot reach the public
-internet through the proxy. The sandbox NetworkPolicy still permits DNS to
-kube-system so it can resolve the proxy Service; clusters whose CoreDNS
-forwards arbitrary names should treat DNS queries as a separate metadata
-exfiltration channel and restrict CoreDNS upstreams or add a DNS policy when
-deploying offline sessions. `sandbox_size` selects a named
-`sandbox.sizeClasses` resource map (including CPU, memory, and ephemeral
-storage). Sessions with either non-default option do not use a warm-pool
-sandbox, and the selected options persist across pause and resume. Unknown
-size names are rejected.
+sandbox_size=...)`. `sandbox_size` selects a named `sandbox.sizeClasses`
+resource map (including CPU, memory, and ephemeral storage); unknown size
+names are rejected. Sessions with either non-default option do not use a
+warm-pool sandbox, and the selected options persist across pause and resume.
+
+`network_profile: offline` leaves a sandbox no route but its paired
+iron-proxy, and that proxy no route to the internet:
+
+- **The sandbox** may connect only to its proxy. It has no DNS: its pod is
+  labelled `centaur.ai/network-profile=offline`, which takes it out of the
+  chart's allow-DNS policy, its own policy has no DNS rule, and its resolver
+  is loopback (`dnsPolicy: None`). It addresses the proxy by the proxy
+  Service's ClusterIP. The label is the backend's: a caller can neither set
+  nor remove it.
+- **The proxy** forwards only the deployment's `sandbox.offline.allowedHosts`
+  plus Centaur's own API and Console hosts, which the sandbox's built-in
+  tools call. iron-proxy refuses any other host before resolving it, so a
+  name the sandbox makes up never reaches a resolver. The proxy's
+  NetworkPolicy grants cluster DNS, proxy-sync and the Console, and the chart
+  grants every proxy the API: no public internet, core database, 1Password,
+  company-context or observability egress. An in-cluster backend on the
+  allowlist (a model gateway, say) also needs a NetworkPolicy of yours that
+  selects iron-proxy pods (`centaur.ai/iron-proxy: "true"`) and admits it, as
+  it does for the default profile.
+
+Two limits. The boundary is NetworkPolicy, so it needs a CNI that enforces
+it. And a paused sandbox's proxy Service is deleted with the rest of its
+proxy, so a resume asks for the same ClusterIP again: if the cluster has
+given that address to another Service meanwhile, the resume fails and the
+session needs a new sandbox.
 
 ### Credentials
 

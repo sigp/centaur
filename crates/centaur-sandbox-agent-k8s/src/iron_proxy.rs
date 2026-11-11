@@ -3,7 +3,8 @@ use std::time::{Duration, SystemTime};
 
 use centaur_iron_proxy::{ProxyFragment, SourceKind, SourcePolicy};
 use centaur_sandbox_core::{
-    ResourceRequirements, SandboxError, SandboxId, SandboxResult, SandboxSpec,
+    ResourceRequirements, SandboxError, SandboxId, SandboxNetworkProfile, SandboxResult,
+    SandboxSpec,
 };
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvFromSource,
@@ -208,12 +209,24 @@ pub(crate) struct ResolvedIronProxy {
     // env, so it survives api-rs restarts and respects env overrides.
     management_api_key: String,
     observability_enabled: bool,
+    pub(crate) offline: bool,
+    // ClusterIP recorded on the Sandbox CR so a recreated Service keeps the
+    // address baked into the sandbox's proxy environment.
+    expected_cluster_ip: Option<String>,
+}
+
+impl ResolvedIronProxy {
+    pub(crate) fn set_proxy_host(&mut self, host: &str) {
+        self.proxy_host = host.to_owned();
+    }
 }
 
 struct ResolvedIronProxyRuntime {
     pg: Option<ResolvedPg>,
     replace_placeholders: BTreeMap<String, String>,
     observability_enabled: bool,
+    offline: bool,
+    cluster_ip: Option<String>,
 }
 
 /// The single Postgres listener the proxy multiplexes every upstream through.
@@ -253,6 +266,11 @@ impl AgentSandboxBackend {
         spec: &SandboxSpec,
     ) -> SandboxResult<Option<ResolvedIronProxy>> {
         if self.config.iron_proxy.is_none() {
+            if spec.network_profile == SandboxNetworkProfile::Offline {
+                return Err(SandboxError::InvalidSpec(
+                    "offline sandbox spec requires iron-proxy configuration".to_owned(),
+                ));
+            }
             return Ok(None);
         }
         // iron-control is the only mode: the proxy pulls its entire effective
@@ -277,6 +295,8 @@ impl AgentSandboxBackend {
                 pg,
                 replace_placeholders,
                 observability_enabled: spec.capabilities.observability_enabled,
+                offline: spec.network_profile == SandboxNetworkProfile::Offline,
+                cluster_ip: None,
             },
         )))
     }
@@ -352,14 +372,17 @@ impl AgentSandboxBackend {
             .cloned();
         let pg = self.resolved_pg_for_recreation(Some(&sandbox));
         let replace_placeholders = self.effective_replace_placeholders(&principal_id).await?;
+        let offline = annotations
+            .and_then(|annotations| annotations.get(crate::NETWORK_PROFILE_ANNOTATION))
+            .is_some_and(|value| value == "offline");
         let observability_enabled = sandbox_observability_enabled(&sandbox);
         let mut labels = BTreeMap::new();
-        if annotations
-            .and_then(|annotations| annotations.get(crate::NETWORK_PROFILE_ANNOTATION))
-            .is_some_and(|value| value == "offline")
-        {
+        if offline {
             labels.insert("network_profile".to_owned(), "offline".to_owned());
         }
+        let cluster_ip = annotations
+            .and_then(|annotations| annotations.get(crate::IRON_PROXY_CLUSTER_IP_ANNOTATION))
+            .cloned();
         Ok(Some(self.resolved_iron_proxy_for_principal(
             id,
             principal_id,
@@ -369,6 +392,8 @@ impl AgentSandboxBackend {
                 pg,
                 replace_placeholders,
                 observability_enabled,
+                offline,
+                cluster_ip,
             },
         )))
     }
@@ -381,6 +406,14 @@ impl AgentSandboxBackend {
         labels: BTreeMap<String, String>,
         runtime: ResolvedIronProxyRuntime,
     ) -> ResolvedIronProxy {
+        let offline = runtime.offline
+            || labels
+                .get("network_profile")
+                .is_some_and(|value| value == "offline");
+        let mut labels = labels;
+        if offline {
+            labels.insert("network_profile".to_owned(), "offline".to_owned());
+        }
         ResolvedIronProxy {
             proxy_host: iron_proxy_service_name(id),
             proxy_pod_name: new_iron_proxy_pod_name(id),
@@ -389,10 +422,12 @@ impl AgentSandboxBackend {
             principal_id,
             requester_principal_id,
             labels,
-            pg: runtime.pg,
+            pg: runtime.pg.filter(|_| !offline),
             replace_placeholders: runtime.replace_placeholders,
             management_api_key: new_proxy_management_api_key(),
-            observability_enabled: runtime.observability_enabled,
+            observability_enabled: runtime.observability_enabled && !offline,
+            offline,
+            expected_cluster_ip: runtime.cluster_ip.filter(|_| offline),
         }
     }
 
@@ -412,31 +447,59 @@ impl AgentSandboxBackend {
         &self,
         id: &SandboxId,
         resolved: Option<&ResolvedIronProxy>,
-    ) -> SandboxResult<()> {
+    ) -> SandboxResult<Option<String>> {
         let (Some(resolved), Some(iron_proxy)) = (resolved, self.config.iron_proxy.as_ref()) else {
-            return Ok(());
+            return Ok(None);
         };
         self.delete_iron_proxy_resources(id).await?;
         let sync = self.register_sync_proxy(id, resolved).await?;
-        self.services()
+        let created_service = self
+            .services()
             .create(
                 &PostParams::default(),
                 &build_iron_proxy_service(id, resolved),
             )
             .await
-            .map_err(|err| map_kube_error("create iron-proxy service", err))?;
-        let control_target = control_plane_egress_target(
-            &resolved.console_url,
-            &self.config.namespace,
-            iron_proxy.control_plane_pod_labels.clone(),
-        );
+            .map_err(|err| match (&resolved.expected_cluster_ip, &err) {
+                // A paused sandbox has no proxy Service (see `pause`), so the
+                // cluster may give its address away before the resume.
+                (Some(cluster_ip), kube::Error::Api(response)) if response.code == 422 => {
+                    SandboxError::backend_source(
+                        format!(
+                            "offline sandbox's proxy address {cluster_ip} is no longer free, so \
+                             its session needs a new sandbox"
+                        ),
+                        err,
+                    )
+                }
+                _ => map_kube_error("create iron-proxy service", err),
+            })?;
+        let cluster_ip = created_service
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.cluster_ip.clone())
+            .filter(|value| !value.is_empty());
+        if resolved.offline && cluster_ip.is_none() {
+            return Err(SandboxError::backend(
+                "offline iron-proxy Service did not receive a ClusterIP".to_owned(),
+            ));
+        }
         let proxy_sync_target = control_plane_egress_target(
             &sync.control_url,
             &self.config.namespace,
             iron_proxy.proxy_sync_pod_labels.clone(),
         );
-        let mut control_targets = vec![control_target, proxy_sync_target];
-        if let Some(url) = &iron_proxy.company_context_url {
+        let mut control_targets = vec![
+            proxy_sync_target,
+            control_plane_egress_target(
+                &resolved.console_url,
+                &self.config.namespace,
+                iron_proxy.control_plane_pod_labels.clone(),
+            ),
+        ];
+        if !resolved.offline
+            && let Some(url) = &iron_proxy.company_context_url
+        {
             control_targets.push(control_plane_egress_target(
                 url,
                 &self.config.namespace,
@@ -474,7 +537,7 @@ impl AgentSandboxBackend {
             )
             .await
             .map_err(|err| map_kube_error("create iron-proxy pod", err))?;
-        Ok(())
+        Ok(cluster_ip)
     }
 
     /// Wait until a proxy started by [`Self::start_iron_proxy_resources`] is
@@ -913,16 +976,30 @@ impl AgentSandboxBackend {
                 false
             });
         let mut effective_labels = labels.clone();
-        if sandbox.as_ref().and_then(|sandbox| {
+        let offline = effective_labels
+            .get("network_profile")
+            .is_some_and(|value| value == "offline")
+            || sandbox
+                .as_ref()
+                .and_then(|sandbox| {
+                    sandbox
+                        .metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|annotations| annotations.get(crate::NETWORK_PROFILE_ANNOTATION))
+                })
+                .is_some_and(|value| value == "offline");
+        if offline {
+            effective_labels.insert("network_profile".to_owned(), "offline".to_owned());
+        }
+        let cluster_ip = sandbox.as_ref().and_then(|sandbox| {
             sandbox
                 .metadata
                 .annotations
                 .as_ref()
-                .and_then(|annotations| annotations.get(crate::NETWORK_PROFILE_ANNOTATION))
-        }) == Some(&"offline".to_owned())
-        {
-            effective_labels.insert("network_profile".to_owned(), "offline".to_owned());
-        }
+                .and_then(|annotations| annotations.get(crate::IRON_PROXY_CLUSTER_IP_ANNOTATION))
+                .cloned()
+        });
         let resolved = self.resolved_iron_proxy_for_principal(
             id,
             principal_id,
@@ -932,6 +1009,8 @@ impl AgentSandboxBackend {
                 pg,
                 replace_placeholders,
                 observability_enabled,
+                offline,
+                cluster_ip,
             },
         );
         self.create_iron_proxy_resources(id, Some(&resolved))
@@ -1850,6 +1929,7 @@ fn build_iron_proxy_service(id: &SandboxId, resolved: &ResolvedIronProxy) -> Ser
         spec: Some(ServiceSpec {
             selector: Some(iron_proxy_labels(id, resolved.observability_enabled)),
             ports: Some(ports),
+            cluster_ip: resolved.expected_cluster_ip.clone(),
             ..Default::default()
         }),
         ..Default::default()
@@ -1867,13 +1947,20 @@ fn build_iron_proxy_network_policies(
     // whether or not it has observability.
     let proxy_labels = iron_proxy_labels(id, false);
     let sandbox_to_proxy_ports = sandbox_to_proxy_ports(resolved);
-    let sandbox_egress = vec![
-        egress_to(
+    let sandbox_egress = if resolved.offline {
+        vec![egress_to(
             vec![pod_peer(proxy_labels.clone())],
             sandbox_to_proxy_ports.clone(),
-        ),
-        dns_egress_rule(),
-    ];
+        )]
+    } else {
+        vec![
+            egress_to(
+                vec![pod_peer(proxy_labels.clone())],
+                sandbox_to_proxy_ports.clone(),
+            ),
+            dns_egress_rule(),
+        ]
+    };
     vec![
         NetworkPolicy {
             metadata: object_meta(
@@ -1904,7 +1991,11 @@ fn build_iron_proxy_network_policies(
                         ports: Some(vec![network_port(PROXY_MANAGEMENT_PORT)]),
                     },
                 ]),
-                egress: Some(proxy_egress_rules(iron_proxy, control_targets)),
+                egress: Some(if resolved.offline {
+                    control_egress_rules(control_targets)
+                } else {
+                    proxy_egress_rules(iron_proxy, control_targets)
+                }),
             }),
         },
         // Applies only once the proxy pod carries the observability label,
@@ -1927,13 +2018,14 @@ fn sandbox_to_proxy_ports(resolved: &ResolvedIronProxy) -> Vec<NetworkPolicyPort
         .collect()
 }
 
-fn proxy_egress_rules(
-    iron_proxy: &IronProxyConfig,
+/// Cluster DNS and the proxy's own control plane. This is every destination
+/// an offline proxy's policy grants: it resolves the hosts on its allowlist,
+/// and reaches the API through the chart's proxy-api-server policy. Another
+/// in-cluster backend on the allowlist needs an operator NetworkPolicy that
+/// selects iron-proxy pods, as it does for the default profile.
+fn control_egress_rules(
     control_targets: &[ControlPlaneEgressTarget],
 ) -> Vec<NetworkPolicyEgressRule> {
-    // Console and proxy-sync can use different pods and ports. Allow both
-    // explicitly; public upstream rules exclude private/cluster CIDRs.
-    let upstream_ports = vec![network_port(443), network_port(5432)];
     let mut rules = vec![dns_egress_rule()];
     for target in control_targets {
         rules.push(egress_to(
@@ -1941,6 +2033,17 @@ fn proxy_egress_rules(
             vec![network_port(target.port)],
         ));
     }
+    rules
+}
+
+fn proxy_egress_rules(
+    iron_proxy: &IronProxyConfig,
+    control_targets: &[ControlPlaneEgressTarget],
+) -> Vec<NetworkPolicyEgressRule> {
+    // Console and proxy-sync can use different pods and ports. Allow both
+    // explicitly; public upstream rules exclude private/cluster CIDRs.
+    let upstream_ports = vec![network_port(443), network_port(5432)];
+    let mut rules = control_egress_rules(control_targets);
     rules.push(egress_to(vec![public_ipv4_peer()], upstream_ports));
     if !iron_proxy.database_cidrs.is_empty() {
         rules.push(egress_to(
@@ -2536,6 +2639,8 @@ mod tests {
             replace_placeholders: BTreeMap::new(),
             management_api_key: "test-management-key".to_owned(),
             observability_enabled: true,
+            offline: false,
+            expected_cluster_ip: None,
         }
     }
 
@@ -2737,6 +2842,68 @@ mod tests {
         );
         let restricted_labels = iron_proxy_labels(&id, false);
         assert!(!restricted_labels.contains_key(OBSERVABILITY_ENABLED_LABEL));
+    }
+
+    #[test]
+    fn offline_proxy_uses_cluster_ip_and_sandbox_has_no_dns_egress() {
+        let id = SandboxId::new("asbx-test");
+        let mut resolved = resolved();
+        resolved.offline = true;
+        resolved.proxy_host = "10.43.2.17".to_owned();
+        resolved.expected_cluster_ip = Some("10.43.2.17".to_owned());
+
+        let mut spec = SandboxSpec::new("centaur-agent:latest");
+        apply_proxy_env(&mut spec, &resolved);
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == "HTTPS_PROXY")
+                .map(|env| env.value.as_str()),
+            Some("http://10.43.2.17:8080")
+        );
+
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let control = control_plane_egress_target(
+            "http://console:3000",
+            "centaur",
+            iron_proxy.control_plane_pod_labels.clone(),
+        );
+        let policies =
+            build_iron_proxy_network_policies(&id, &resolved, &iron_proxy, &[control], None);
+        let sandbox_egress = policies[0].spec.as_ref().unwrap().egress.as_ref().unwrap();
+        // The sandbox reaches its proxy and nothing else, cluster DNS included.
+        assert_eq!(sandbox_egress.len(), 1);
+        assert_eq!(
+            sandbox_egress[0].ports,
+            Some(vec![network_port(resolved.proxy_port)])
+        );
+        // Its proxy reaches cluster DNS and its control plane: no address
+        // range, so neither the internet nor the core database.
+        let proxy_egress = policies[1].spec.as_ref().unwrap().egress.as_ref().unwrap();
+        assert_eq!(
+            proxy_egress
+                .iter()
+                .map(|rule| rule.ports.clone().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![udp_port(53), network_port(53)],
+                vec![network_port(3000)]
+            ]
+        );
+        assert!(proxy_egress.iter().all(|rule| {
+            rule.to.as_ref().is_some_and(|peers| {
+                !peers.is_empty() && peers.iter().all(|peer| peer.ip_block.is_none())
+            })
+        }));
+
+        let service = build_iron_proxy_service(&id, &resolved);
+        assert_eq!(
+            service
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.cluster_ip.as_deref()),
+            Some("10.43.2.17")
+        );
     }
 
     #[test]

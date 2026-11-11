@@ -59,7 +59,11 @@ const IRON_CONTROL_PRINCIPAL_ANNOTATION: &str = "centaur.ai/iron-control-princip
 // Absent when the turn has no requester, so an annotation-vs-binding
 // comparison treats "absent" and "no requester" as equal.
 const IRON_CONTROL_REQUESTER_ANNOTATION: &str = "centaur.ai/iron-control-requester-principal";
+const NETWORK_PROFILE_LABEL: &str = "centaur.ai/network-profile";
 const NETWORK_PROFILE_ANNOTATION: &str = "centaur.ai/network-profile";
+// ClusterIP of the per-sandbox proxy. Offline pods use this address instead
+// of resolving the proxy Service name, and it must stay stable on resume.
+const IRON_PROXY_CLUSTER_IP_ANNOTATION: &str = "centaur.ai/iron-proxy-cluster-ip";
 const SANDBOX_SIZE_ANNOTATION: &str = "centaur.ai/sandbox-size";
 // RFC 3339 instant stamped when the sandbox is paused for idleness and cleared
 // on resume. This keeps suspended status observable across api-rs restarts.
@@ -630,7 +634,33 @@ impl SandboxBackend for AgentSandboxBackend {
     async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
         let id = SandboxId::new(next_sandbox_name());
         let mut spec = spec;
-        let resolved_iron_proxy = self.resolve_iron_proxy(&id, &spec).await?;
+        let mut resolved_iron_proxy = self.resolve_iron_proxy(&id, &spec).await?;
+        // An offline sandbox has no DNS, so it reaches its proxy by the
+        // Service's ClusterIP: the Service comes first, and its address goes
+        // into the sandbox's env and onto the Sandbox, for when the proxy is
+        // recreated.
+        let proxy_cluster_ip = match self
+            .start_iron_proxy_resources(&id, resolved_iron_proxy.as_ref())
+            .await
+        {
+            Ok(cluster_ip) => cluster_ip,
+            Err(err) => {
+                self.unwind_iron_proxy_resources(&id).await;
+                return Err(err);
+            }
+        };
+        let offline_proxy_ip = match (
+            resolved_iron_proxy
+                .as_mut()
+                .filter(|resolved| resolved.offline),
+            proxy_cluster_ip,
+        ) {
+            (Some(resolved), Some(cluster_ip)) => {
+                resolved.set_proxy_host(&cluster_ip);
+                Some(cluster_ip)
+            }
+            _ => None,
+        };
         if let Some(resolved) = &resolved_iron_proxy {
             iron_proxy::apply_proxy_env(&mut spec, resolved);
         }
@@ -638,18 +668,11 @@ impl SandboxBackend for AgentSandboxBackend {
         // proxy boot overlaps volume provisioning and scheduling. The egress
         // policies still exist before the sandbox pod; tools-bootstrap retries
         // until the proxy accepts connections.
-        if let Err(err) = self
-            .start_iron_proxy_resources(&id, resolved_iron_proxy.as_ref())
-            .await
-        {
-            self.unwind_iron_proxy_resources(&id).await;
-            return Err(err);
-        }
         if let Err(error) = self.create_sandbox_files_config_map(&id, &spec).await {
             self.unwind_iron_proxy_resources(&id).await;
             return Err(error);
         }
-        let sandbox = match build_agent_sandbox(&id, &spec, &self.config) {
+        let mut sandbox = match build_agent_sandbox(&id, &spec, &self.config) {
             Ok(sandbox) => sandbox,
             Err(error) => {
                 let _ = self.delete_sandbox_files_config_map(&id).await;
@@ -657,6 +680,13 @@ impl SandboxBackend for AgentSandboxBackend {
                 return Err(error);
             }
         };
+        if let Some(cluster_ip) = offline_proxy_ip {
+            sandbox
+                .metadata
+                .annotations
+                .get_or_insert_with(BTreeMap::new)
+                .insert(IRON_PROXY_CLUSTER_IP_ANNOTATION.to_owned(), cluster_ip);
+        }
         let created = match self
             .sandboxes()
             .create(&PostParams::default(), &sandbox)
@@ -1172,8 +1202,18 @@ fn build_agent_sandbox(
     labels.extend(spec.labels.clone());
     labels.insert(MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned());
     labels.insert(SANDBOX_ID_LABEL.to_owned(), id.as_str().to_owned());
-    if spec.capabilities.observability_enabled {
+    // This label is reserved for the backend: a caller cannot make an offline
+    // pod look like a normal pod (or make a normal pod lose its DNS policy).
+    labels.remove(NETWORK_PROFILE_LABEL);
+    if spec.network_profile == SandboxNetworkProfile::Offline {
+        labels.insert(NETWORK_PROFILE_LABEL.to_owned(), "offline".to_owned());
+    }
+    if spec.capabilities.observability_enabled
+        && spec.network_profile != SandboxNetworkProfile::Offline
+    {
         labels.insert(OBSERVABILITY_ENABLED_LABEL.to_owned(), "true".to_owned());
+    } else {
+        labels.remove(OBSERVABILITY_ENABLED_LABEL);
     }
     let mut pod_labels = labels.clone();
     pod_labels.insert(
@@ -1314,6 +1354,13 @@ fn build_agent_sandbox(
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
     });
+    if spec.network_profile == SandboxNetworkProfile::Offline {
+        // The sandbox has no DNS permission and its proxy is an IP literal.
+        // A loopback resolver also prevents accidental use of the cluster
+        // resolver if a future policy is broadened.
+        pod_spec["dnsPolicy"] = json!("None");
+        pod_spec["dnsConfig"] = json!({ "nameservers": ["127.0.0.1"] });
+    }
     insert_optional(&mut pod_spec, "hostUsers", config.host_users);
     // fsGroup makes bootstrap emptyDirs and the state PVC writable by the agent UID.
     if repo_cache_tools.is_some() || config.state_volume.is_some() {
@@ -2161,6 +2208,23 @@ mod tests {
                 .spec
                 .service_account_name
                 .is_none()
+        );
+    }
+    #[test]
+    fn offline_sandbox_template_has_reserved_label_and_no_cluster_dns() {
+        let mut spec = SandboxSpec::new("centaur-agent:latest");
+        spec.network_profile = SandboxNetworkProfile::Offline;
+        spec.labels
+            .insert(NETWORK_PROFILE_LABEL.to_owned(), "default".to_owned());
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod = serde_json::to_value(&sandbox.spec.pod_template).unwrap();
+        assert_eq!(pod["metadata"]["labels"][NETWORK_PROFILE_LABEL], "offline");
+        assert_eq!(pod["spec"]["dnsPolicy"], "None");
+        assert_eq!(
+            pod["spec"]["dnsConfig"]["nameservers"],
+            serde_json::json!(["127.0.0.1"])
         );
     }
 

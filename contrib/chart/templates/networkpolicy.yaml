@@ -20,7 +20,12 @@ metadata:
   labels:
 {{ include "centaur.labels" . | nindent 4 }}
 spec:
-  podSelector: {}
+  podSelector:
+    matchExpressions:
+      - key: centaur.ai/network-profile
+        operator: NotIn
+        values:
+          - offline
   policyTypes:
     - Egress
   egress:
