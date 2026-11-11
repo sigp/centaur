@@ -25,9 +25,8 @@ use centaur_sandbox_manager::{
     WarmPoolManager,
 };
 use centaur_session_core::{
-    ChatDestination, ExecutionStatus, HarnessType, MessageRole, SandboxNetworkProfile,
-    SandboxOptions,
-    SandboxCapabilities as SessionSandboxCapabilities,
+    ChatDestination, ExecutionStatus, HarnessType, MessageRole,
+    SandboxCapabilities as SessionSandboxCapabilities, SandboxNetworkProfile, SandboxOptions,
     SandboxRepoCacheAccess as SessionRepoCacheAccess, Session, SessionEvent, SessionExecution,
     SessionMessageInput, ThreadKey,
 };
@@ -1674,6 +1673,7 @@ impl SessionRuntime {
     }
 
     /// Create or load a session with immutable per-session sandbox options.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_or_get_session_with_principal_and_options(
         &self,
         thread_key: &ThreadKey,
@@ -1709,6 +1709,7 @@ impl SessionRuntime {
         sandbox_options: SandboxOptions,
         admission: SessionPrincipalAdmission,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.validate_sandbox_options(&sandbox_options)?;
 
         let principal_foreign_id = match principal_foreign_id {
             Some(foreign_id) if foreign_id.trim().is_empty() => {
@@ -1752,17 +1753,33 @@ impl SessionRuntime {
                 }
             };
             let desired_capabilities = sandbox_capabilities_from_principal(&registered_principal);
-            // A session's persona is fixed by the first successful create.
-            // Use the stored persona before the requested one so later persona
-            // flags cannot change or invalidate an existing thread. Its
-            // context is resolved once from the post-create session below.
+            // A session's persona and sandbox options are fixed by the first
+            // successful create. Check the options before creating or
+            // restarting the session so a conflict cannot restart a sandbox
+            // before returning the immutable-options error.
             let existing = match self.store.get_session(thread_key).await {
-                Ok(session) => Some((session.persona_id, session.harness_type)),
+                Ok(session) => Some((
+                    session.persona_id,
+                    session.harness_type,
+                    session.sandbox_options,
+                )),
                 Err(SessionStoreError::NotFound { .. }) => None,
                 Err(error) => return Err(error.into()),
             };
-            let existing_harness = existing.as_ref().map(|(_, harness)| harness.clone());
-            let persona_resolution = match existing.map(|(persona_id, _)| persona_id) {
+            if let Some((_, _, existing_sandbox_options)) = existing.as_ref()
+                && !sandbox_options.is_default()
+                && existing_sandbox_options != &sandbox_options
+            {
+                return Err(SessionRuntimeError::BadRequest(format!(
+                    "session sandbox options are immutable; requested network_profile={} sandbox_size={:?}, existing network_profile={} sandbox_size={:?}",
+                    sandbox_options.network_profile.as_str(),
+                    sandbox_options.sandbox_size,
+                    existing_sandbox_options.network_profile.as_str(),
+                    existing_sandbox_options.sandbox_size,
+                )));
+            }
+            let existing_harness = existing.as_ref().map(|(_, harness, _)| harness.clone());
+            let persona_resolution = match existing.map(|(persona_id, _, _)| persona_id) {
                 Some(persona_id) => PersonaResolution {
                     context: None,
                     persona_id,
@@ -4542,7 +4559,10 @@ impl SandboxRuntime {
         runtime
     }
 
-    pub fn with_size_classes(mut self, size_classes: BTreeMap<String, ResourceRequirements>) -> Self {
+    pub fn with_size_classes(
+        mut self,
+        size_classes: BTreeMap<String, ResourceRequirements>,
+    ) -> Self {
         self.size_classes = size_classes;
         self
     }
@@ -4556,7 +4576,11 @@ impl SandboxRuntime {
         {
             return Err(SessionRuntimeError::BadRequest(format!(
                 "unknown sandbox_size {size:?}; configured size classes: {}",
-                self.size_classes.keys().cloned().collect::<Vec<_>>().join(", ")
+                self.size_classes
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
         Ok(())

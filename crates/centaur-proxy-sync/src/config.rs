@@ -32,24 +32,28 @@ pub(crate) async fn build_config(
         proxy.requester_principal_id,
     )
     .await?;
-    if proxy
-        .labels
-        .get("network_profile")
-        .and_then(Value::as_str)
-        == Some("offline")
-    {
-        let hosts = offline_allowlist_hosts(
-            &state.offline_allowed_hosts,
-            &state.api_hosts,
-            state.console_host.as_deref(),
-        );
-        config
-            .transforms
-            .insert(0, offline_allowlist_transform(&hosts));
-    }
     append_api_jwt(state, proxy, &mut config, now).await?;
     append_sandbox_jwt(state, proxy, &mut config, now)?;
     Ok(config)
+}
+
+/// Prepend the default-deny allowlist to an offline proxy's config. Applied to
+/// every offline proxy, including unassigned ones, so none can forward anywhere
+/// but the configured hosts.
+pub(crate) fn apply_offline_allowlist(
+    config: &mut Config,
+    proxy: &ProxyRecord,
+    offline_hosts: &[String],
+    api_hosts: &[String],
+    console_host: Option<&str>,
+) {
+    if proxy.labels.get("network_profile").and_then(Value::as_str) != Some("offline") {
+        return;
+    }
+    let hosts = offline_allowlist_hosts(offline_hosts, api_hosts, console_host);
+    config
+        .transforms
+        .insert(0, offline_allowlist_transform(&hosts));
 }
 
 fn offline_allowlist_hosts(
@@ -77,35 +81,6 @@ fn offline_allowlist_transform(hosts: &[String]) -> Value {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{offline_allowlist_hosts, offline_allowlist_transform};
-
-    #[test]
-    fn offline_allowlist_includes_centaur_hosts_and_deduplicates() {
-        let hosts = offline_allowlist_hosts(
-            &["slipway.slipway.svc.cluster.local".to_owned(), "api.internal".to_owned()],
-            &["api.internal".to_owned(), "api-rs".to_owned()],
-            Some("console.internal"),
-        );
-        assert_eq!(
-            hosts,
-            vec![
-                "api-rs",
-                "api.internal",
-                "console.internal",
-                "slipway.slipway.svc.cluster.local",
-            ]
-        );
-        assert_eq!(
-            offline_allowlist_transform(&hosts),
-            serde_json::json!({
-                "name": "allowlist",
-                "config": { "domains": hosts }
-            })
-        );
-    }
-}
 pub(crate) fn config_hash(proxy: &ProxyRecord, config: &Value) -> Result<String, ApiError> {
     let mut payload = config
         .as_object()
@@ -145,4 +120,85 @@ fn timestamp(value: Option<DateTime<Utc>>) -> Value {
     value
         .map(|value| Value::String(value.format("%Y-%m-%dT%H:%M:%SZ").to_string()))
         .unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use centaur_console_db::models::Config;
+    use serde_json::json;
+
+    use crate::models::ProxyRecord;
+
+    use super::{apply_offline_allowlist, offline_allowlist_hosts, offline_allowlist_transform};
+
+    #[test]
+    fn offline_allowlist_includes_centaur_hosts_and_deduplicates() {
+        let hosts = offline_allowlist_hosts(
+            &[
+                "slipway.slipway.svc.cluster.local".to_owned(),
+                "api.internal".to_owned(),
+            ],
+            &["api.internal".to_owned(), "api-rs".to_owned()],
+            Some("console.internal"),
+        );
+        assert_eq!(
+            hosts,
+            vec![
+                "api-rs",
+                "api.internal",
+                "console.internal",
+                "slipway.slipway.svc.cluster.local",
+            ]
+        );
+        assert_eq!(
+            offline_allowlist_transform(&hosts),
+            serde_json::json!({
+                "name": "allowlist",
+                "config": { "domains": hosts }
+            })
+        );
+    }
+
+    #[test]
+    fn offline_proxy_without_principal_gets_default_deny_allowlist() {
+        let mut config = Config::default();
+        let proxy = ProxyRecord {
+            id: 1,
+            name: "offline-unassigned".to_owned(),
+            labels: json!({ "network_profile": "offline" }),
+            principal_id: None,
+            requester_principal_id: None,
+            principal_assigned_at: None,
+            requester_principal_assigned_at: None,
+            principal_cache_version: None,
+            principal: None,
+            console_user_email: None,
+            console_user_id: None,
+            slack_history_channel_ids: json!([]),
+        };
+
+        assert!(proxy.principal_id.is_none());
+
+        apply_offline_allowlist(
+            &mut config,
+            &proxy,
+            &["slipway.slipway.svc.cluster.local".to_owned()],
+            &["api.internal".to_owned()],
+            Some("console.internal"),
+        );
+
+        assert_eq!(
+            config.transforms.first(),
+            Some(&json!({
+                "name": "allowlist",
+                "config": {
+                    "domains": [
+                        "api.internal",
+                        "console.internal",
+                        "slipway.slipway.svc.cluster.local"
+                    ]
+                }
+            }))
+        );
+    }
 }

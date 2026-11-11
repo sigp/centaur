@@ -238,6 +238,7 @@ impl PgSessionStore {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_or_get_session_inner(
         &self,
         thread_key: &ThreadKey,

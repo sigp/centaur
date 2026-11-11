@@ -116,6 +116,8 @@ async fn main() -> Result<()> {
                 })),
                 on_harness_conflict: None,
                 principal: None,
+                network_profile: None,
+                sandbox_size: None,
             },
         )
         .await

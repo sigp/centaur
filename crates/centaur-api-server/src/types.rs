@@ -293,7 +293,10 @@ mod tests {
             "sandbox_size": "large"
         }))
         .unwrap();
-        assert_eq!(request.network_profile, Some(SandboxNetworkProfile::Offline));
+        assert_eq!(
+            request.network_profile,
+            Some(SandboxNetworkProfile::Offline)
+        );
         assert_eq!(request.sandbox_size.as_deref(), Some("large"));
     }
 

@@ -1402,10 +1402,7 @@ fn build_agent_sandbox(
 
     let mut annotations = config.annotations.clone();
     if spec.network_profile == SandboxNetworkProfile::Offline {
-        annotations.insert(
-            NETWORK_PROFILE_ANNOTATION.to_owned(),
-            "offline".to_owned(),
-        );
+        annotations.insert(NETWORK_PROFILE_ANNOTATION.to_owned(), "offline".to_owned());
     }
     if let Some(size) = &spec.sandbox_size {
         annotations.insert(SANDBOX_SIZE_ANNOTATION.to_owned(), size.clone());

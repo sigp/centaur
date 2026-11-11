@@ -22,7 +22,7 @@ use axum::{
 use cache::SyncCache;
 use centaur_console_db::{models::Config, oid};
 use chrono::Utc;
-use config::{build_config, config_hash};
+use config::{apply_offline_allowlist, build_config, config_hash};
 use database::load_proxy;
 use models::AppState;
 use serde::{Deserialize, Serialize};
@@ -124,8 +124,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let console_host = env::var("CENTAUR_CONSOLE_URL")
         .ok()
         .and_then(|url| host_from_url(&url));
-    let offline_allowed_hosts =
-        configured_hosts("CENTAUR_OFFLINE_ALLOWED_HOSTS", "CENTAUR_OFFLINE_ALLOWED_HOSTS");
+    let offline_allowed_hosts = configured_hosts(
+        "CENTAUR_OFFLINE_ALLOWED_HOSTS",
+        "CENTAUR_OFFLINE_ALLOWED_HOSTS",
+    );
     let state = AppState {
         pool,
         encryption: Arc::new(ActiveRecordEncryption::new(&primary_key, &salt)),
@@ -232,11 +234,18 @@ async fn sync(
         record_cache_lookup("miss");
     }
 
-    let config = if let Some(principal_id) = proxy.principal_id {
+    let mut config = if let Some(principal_id) = proxy.principal_id {
         build_config(&state, &proxy, principal_id, now).await?
     } else {
         Config::default()
     };
+    apply_offline_allowlist(
+        &mut config,
+        &proxy,
+        &state.offline_allowed_hosts,
+        &state.api_hosts,
+        state.console_host.as_deref(),
+    );
     let config_value = json!({
         "secrets": config.secrets,
         "transforms": config.transforms,
