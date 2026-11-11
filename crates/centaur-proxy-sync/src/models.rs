@@ -17,6 +17,7 @@ pub(crate) struct AppState {
     pub(crate) console_host: Option<String>,
     pub(crate) sync_cache: Arc<SyncCache>,
     pub(crate) metrics: PrometheusHandle,
+    pub(crate) offline_allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug)]

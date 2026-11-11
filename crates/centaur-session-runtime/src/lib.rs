@@ -17,14 +17,16 @@ use centaur_iron_control::{IronControlError, Principal, SessionRegistrar};
 use centaur_sandbox_core::{
     Mount, RepoCacheAccess, ResourceRequirements, SANDBOX_AGENT_HOME, SandboxBackend,
     SandboxCapabilities as BackendSandboxCapabilities, SandboxError, SandboxFile, SandboxId,
-    SandboxIoGuard, SandboxRead, SandboxResult, SandboxSpec, SandboxStatus, SandboxWrite,
+    SandboxIoGuard, SandboxNetworkProfile as BackendSandboxNetworkProfile, SandboxRead,
+    SandboxResult, SandboxSpec, SandboxStatus, SandboxWrite,
 };
 use centaur_sandbox_manager::{
     SandboxManager, SandboxReaper, SandboxReaperConfig, WarmClaim, WarmPool, WarmPoolConfig,
     WarmPoolManager,
 };
 use centaur_session_core::{
-    ChatDestination, ExecutionStatus, HarnessType, MessageRole,
+    ChatDestination, ExecutionStatus, HarnessType, MessageRole, SandboxNetworkProfile,
+    SandboxOptions,
     SandboxCapabilities as SessionSandboxCapabilities,
     SandboxRepoCacheAccess as SessionRepoCacheAccess, Session, SessionEvent, SessionExecution,
     SessionMessageInput, ThreadKey,
@@ -82,6 +84,7 @@ const PUBLIC_REPO_CACHE_SUBPATH: &str = "public";
 const CENTAUR_SKILL_DIRS_ENV: &str = "CENTAUR_SKILL_DIRS";
 const CENTAUR_PUBLIC_SKILL_DIRS_ENV: &str = "CENTAUR_PUBLIC_SKILL_DIRS";
 const SANDBOX_REPO_CACHE_LABEL: &str = "centaur.sandbox_repo_cache";
+const OFFLINE_PROXY_NETWORK_PROFILE_LABEL: &str = "network_profile";
 /// Tools that need the observability capability. Each user turn tells the
 /// agent whether they work; the sandbox network policy enforces it.
 const OBSERVABILITY_TOOLS: &str = "vlogs,vmetrics,grafana";
@@ -368,6 +371,8 @@ pub struct SandboxRuntime {
     warm_spec_factory: Option<WarmHarnessSpecFactory>,
     /// The deployment's default harness (`SESSION_SANDBOX_HARNESS`).
     default_harness: Option<HarnessType>,
+    /// Deployment size classes selected by immutable session options.
+    size_classes: BTreeMap<String, ResourceRequirements>,
 }
 
 type WarmHarnessSpecFactory = Arc<dyn Fn(&HarnessType) -> SandboxSpec + Send + Sync>;
@@ -780,6 +785,7 @@ struct EnsureSessionSandboxRequest<'a> {
     requester_principal: Option<&'a str>,
     proxy_labels: &'a BTreeMap<String, String>,
     desired_capabilities: &'a SessionSandboxCapabilities,
+    sandbox_options: SandboxOptions,
     execution_id: &'a str,
 }
 
@@ -1567,6 +1573,13 @@ impl SessionRuntime {
         self
     }
 
+    pub fn validate_sandbox_options(
+        &self,
+        options: &SandboxOptions,
+    ) -> Result<(), SessionRuntimeError> {
+        self.sandbox_runtime.validate_sandbox_options(options)
+    }
+
     /// Create or load an internal session, automatically provisioning its
     /// derived principal when no explicit principal is supplied.
     pub async fn create_or_get_session(
@@ -1584,6 +1597,7 @@ impl SessionRuntime {
             metadata,
             on_harness_conflict,
             None,
+            SandboxOptions::default(),
             SessionPrincipalAdmission::Automatic,
         )
         .await
@@ -1607,6 +1621,29 @@ impl SessionRuntime {
             metadata,
             on_harness_conflict,
             None,
+            SandboxOptions::default(),
+            self.session_principal_admission,
+        )
+        .await
+    }
+
+    pub async fn create_or_get_admitted_session_with_options(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        sandbox_options: SandboxOptions,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.create_or_get_session_with_principal_admission(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            None,
+            sandbox_options,
             self.session_principal_admission,
         )
         .await
@@ -1624,6 +1661,29 @@ impl SessionRuntime {
         on_harness_conflict: HarnessConflictPolicy,
         principal_foreign_id: Option<&str>,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.create_or_get_session_with_principal_and_options(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            on_harness_conflict,
+            principal_foreign_id,
+            SandboxOptions::default(),
+        )
+        .await
+    }
+
+    /// Create or load a session with immutable per-session sandbox options.
+    pub async fn create_or_get_session_with_principal_and_options(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        on_harness_conflict: HarnessConflictPolicy,
+        principal_foreign_id: Option<&str>,
+        sandbox_options: SandboxOptions,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
         self.create_or_get_session_with_principal_admission(
             thread_key,
             harness_type,
@@ -1631,6 +1691,7 @@ impl SessionRuntime {
             metadata,
             on_harness_conflict,
             principal_foreign_id,
+            sandbox_options,
             SessionPrincipalAdmission::Automatic,
         )
         .await
@@ -1645,8 +1706,10 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
         principal_foreign_id: Option<&str>,
+        sandbox_options: SandboxOptions,
         admission: SessionPrincipalAdmission,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+
         let principal_foreign_id = match principal_foreign_id {
             Some(foreign_id) if foreign_id.trim().is_empty() => {
                 return Err(SessionRuntimeError::BadRequest(
@@ -1742,12 +1805,13 @@ impl SessionRuntime {
             }
             match self
                 .store
-                .create_or_get_session(
+                .create_or_get_session_with_options(
                     thread_key,
                     harness_type,
                     persona_resolution.persona_id.as_deref(),
                     session_metadata.clone(),
                     proxy_labels.clone(),
+                    sandbox_options.clone(),
                 )
                 .await
             {
@@ -1771,6 +1835,15 @@ impl SessionRuntime {
                 .store
                 .bind_iron_control_principal(thread_key, &registered_principal.id)
                 .await?;
+            if !sandbox_options.is_default() && session.sandbox_options != sandbox_options {
+                return Err(SessionRuntimeError::BadRequest(format!(
+                    "session sandbox options are immutable; requested network_profile={} sandbox_size={:?}, existing network_profile={} sandbox_size={:?}",
+                    sandbox_options.network_profile.as_str(),
+                    sandbox_options.sandbox_size,
+                    session.sandbox_options.network_profile.as_str(),
+                    session.sandbox_options.sandbox_size,
+                )));
+            }
             let unavailable_requested_persona_id = persona_resolution
                 .unavailable_requested_persona_id
                 .filter(|_| {
@@ -2455,6 +2528,13 @@ impl SessionRuntime {
                         .await?
                 }
             };
+            let mut proxy_labels = session.proxy_labels.clone();
+            if session.sandbox_options.network_profile == SandboxNetworkProfile::Offline {
+                proxy_labels.insert(
+                    OFFLINE_PROXY_NETWORK_PROFILE_LABEL.to_owned(),
+                    SandboxNetworkProfile::Offline.as_str().to_owned(),
+                );
+            }
 
             let sandbox_id = match self
                 .ensure_session_sandbox(EnsureSessionSandboxRequest {
@@ -2465,8 +2545,9 @@ impl SessionRuntime {
                     existing_sandbox_capabilities: session.sandbox_capabilities.as_ref(),
                     iron_control_principal: session.iron_control_principal.as_deref(),
                     requester_principal: requester_principal_id.as_deref(),
-                    proxy_labels: &session.proxy_labels,
+                    proxy_labels: &proxy_labels,
                     desired_capabilities: &desired_capabilities,
+                    sandbox_options: session.sandbox_options.clone(),
                     execution_id: &execution.execution_id,
                 })
                 .instrument(execution_trace_span.clone())
@@ -3068,6 +3149,7 @@ impl SessionRuntime {
             requester_principal,
             proxy_labels,
             desired_capabilities,
+            sandbox_options,
             execution_id,
         } = request;
         let boot_mode = sandbox_boot_mode_for_thread(thread_key, iron_control_principal);
@@ -3295,7 +3377,11 @@ impl SessionRuntime {
             let warm_pool = self
                 .warm_pools
                 .as_ref()
-                .filter(|pools| boot_mode.uses_warm_pool() && !pools.keys.is_empty())
+                .filter(|pools| {
+                    sandbox_options.is_default()
+                        && boot_mode.uses_warm_pool()
+                        && !pools.keys.is_empty()
+                })
                 .and_then(|pools| {
                     if persona_context.is_some() {
                         record_sandbox_warm_pool_claim("persona_specific");
@@ -3396,6 +3482,30 @@ impl SessionRuntime {
                 harness_type,
                 persona_context.as_ref(),
             );
+            spec.network_profile = match sandbox_options.network_profile {
+                SandboxNetworkProfile::Default => BackendSandboxNetworkProfile::Default,
+                SandboxNetworkProfile::Offline => BackendSandboxNetworkProfile::Offline,
+            };
+            if let Some(size) = sandbox_options.sandbox_size.as_deref() {
+                let resources = self
+                    .sandbox_runtime
+                    .size_classes
+                    .get(size)
+                    .cloned()
+                    .ok_or_else(|| {
+                        SessionRuntimeError::BadRequest(format!(
+                            "unknown sandbox_size {size:?}; configured size classes: {}",
+                            self.sandbox_runtime
+                                .size_classes
+                                .keys()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    })?;
+                spec.sandbox_size = Some(size.to_owned());
+                spec.resources = Some(resources);
+            }
             if let Some(principal) = iron_control_principal {
                 spec.iron_control_principal = Some(principal.to_owned());
                 spec.iron_control_requester_principal = requester_principal.map(ToOwned::to_owned);
@@ -4432,6 +4542,26 @@ impl SandboxRuntime {
         runtime
     }
 
+    pub fn with_size_classes(mut self, size_classes: BTreeMap<String, ResourceRequirements>) -> Self {
+        self.size_classes = size_classes;
+        self
+    }
+
+    pub fn validate_sandbox_options(
+        &self,
+        options: &SandboxOptions,
+    ) -> Result<(), SessionRuntimeError> {
+        if let Some(size) = options.sandbox_size.as_deref()
+            && !self.size_classes.contains_key(size)
+        {
+            return Err(SessionRuntimeError::BadRequest(format!(
+                "unknown sandbox_size {size:?}; configured size classes: {}",
+                self.size_classes.keys().cloned().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        Ok(())
+    }
+
     pub fn backend_with_spec_factory<F>(backend: Arc<dyn SandboxBackend>, spec_factory: F) -> Self
     where
         F: Fn(&ThreadKey, &str, &HarnessType, Option<&PersonaContext>) -> SandboxSpec
@@ -4445,6 +4575,7 @@ impl SandboxRuntime {
             artifact_reader: None,
             warm_spec_factory: None,
             default_harness: None,
+            size_classes: BTreeMap::new(),
         }
     }
 
@@ -4466,6 +4597,7 @@ impl SandboxRuntime {
             artifact_reader: None,
             warm_spec_factory: Some(Arc::new(warm_spec_factory)),
             default_harness: None,
+            size_classes: BTreeMap::new(),
         }
     }
 
@@ -9551,6 +9683,7 @@ mod tests {
             harness_thread_id: None,
             persona_id: None,
             status: SessionStatus::Idle,
+            sandbox_options: SandboxOptions::default(),
             iron_control_principal: None,
             proxy_labels: BTreeMap::new(),
             sandbox_last_active_at: Some(now),
@@ -11056,6 +11189,7 @@ mod adoption_tests {
                     requester_principal: None,
                     proxy_labels: &BTreeMap::new(),
                     desired_capabilities: desired,
+                    sandbox_options: SandboxOptions::default(),
                     execution_id: &self.execution_id,
                 })
                 .await
@@ -11237,6 +11371,7 @@ mod adoption_tests {
                 requester_principal: None,
                 proxy_labels: &proxy_labels,
                 desired_capabilities: &SessionSandboxCapabilities::default_enabled(),
+                sandbox_options: SandboxOptions::default(),
                 execution_id: &execution_id,
             })
             .await
@@ -11914,6 +12049,7 @@ mod adoption_tests {
                 requester_principal: None,
                 proxy_labels: &BTreeMap::new(),
                 desired_capabilities: &SessionSandboxCapabilities::default_enabled(),
+                sandbox_options: SandboxOptions::default(),
                 execution_id: &execution_id,
             })
             .await

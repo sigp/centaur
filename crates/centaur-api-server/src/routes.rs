@@ -20,7 +20,7 @@ use axum::{
     routing::{any, delete, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use centaur_session_core::{ChatDestination, ThreadKey};
+use centaur_session_core::{ChatDestination, SandboxOptions, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SandboxRuntime, SessionPrincipalRegistrar,
     SessionRuntime, SessionRuntimeError,
@@ -667,6 +667,22 @@ async fn create_or_get_session(
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     let harness_type = request.harness_type;
     let runtime = state.runtime()?;
+    let sandbox_size = request
+        .sandbox_size
+        .as_deref()
+        .map(str::trim)
+        .filter(|size| !size.is_empty())
+        .map(ToOwned::to_owned);
+    if request.sandbox_size.is_some() && sandbox_size.is_none() {
+        return Err(ApiError::BadRequest(
+            "sandbox_size must be a non-empty size class name".to_owned(),
+        ));
+    }
+    let sandbox_options = SandboxOptions {
+        network_profile: request.network_profile.unwrap_or_default(),
+        sandbox_size,
+    };
+    runtime.validate_sandbox_options(&sandbox_options)?;
     let on_harness_conflict = match request.on_harness_conflict {
         Some(OnHarnessConflict::Restart) => HarnessConflictPolicy::Restart,
         Some(OnHarnessConflict::Reject) | None => HarnessConflictPolicy::Reject,
@@ -682,13 +698,14 @@ async fn create_or_get_session(
             let principal =
                 select_principal(&attached, request.principal.as_deref(), bound.as_deref())?;
             runtime
-                .create_or_get_session_with_principal(
+                .create_or_get_session_with_principal_and_options(
                     &thread_key,
                     &harness_type,
                     request.persona_id.as_deref(),
                     Some(api_client_metadata(client.client_id(), request.metadata)),
                     on_harness_conflict,
                     Some(&principal),
+                    sandbox_options.clone(),
                 )
                 .await?
         }
@@ -699,12 +716,13 @@ async fn create_or_get_session(
         }
         None => {
             runtime
-                .create_or_get_admitted_session(
+                .create_or_get_admitted_session_with_options(
                     &thread_key,
                     &harness_type,
                     request.persona_id.as_deref(),
                     request.metadata,
                     on_harness_conflict,
+                    sandbox_options,
                 )
                 .await?
         }

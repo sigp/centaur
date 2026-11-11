@@ -81,6 +81,7 @@ impl Fixture {
             console_host: None,
             sync_cache: Arc::new(SyncCache::default()),
             metrics: PrometheusBuilder::new().build_recorder().handle(),
+            offline_allowed_hosts: Vec::new(),
         };
         let admin = sqlx::query_scalar(
             "INSERT INTO users (email, admin, status, created_at, updated_at) \

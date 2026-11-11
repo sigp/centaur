@@ -7,9 +7,9 @@ use std::{
 };
 
 use centaur_session_core::{
-    ExecutionStatus, HarnessType, MessageRole, SandboxCapabilities, SandboxRepoCacheAccess,
-    Session, SessionEvent, SessionExecution, SessionMessage, SessionMessageInput, SessionStatus,
-    ThreadKey, empty_object,
+    ExecutionStatus, HarnessType, MessageRole, SandboxCapabilities, SandboxOptions,
+    SandboxRepoCacheAccess, Session, SessionEvent, SessionExecution, SessionMessage,
+    SessionMessageInput, SessionStatus, ThreadKey, empty_object,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -183,12 +183,33 @@ impl PgSessionStore {
         metadata: Value,
         proxy_labels: BTreeMap<String, String>,
     ) -> Result<Session, SessionStoreError> {
+        self.create_or_get_session_with_options(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            proxy_labels,
+            SandboxOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn create_or_get_session_with_options(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Value,
+        proxy_labels: BTreeMap<String, String>,
+        sandbox_options: SandboxOptions,
+    ) -> Result<Session, SessionStoreError> {
         self.create_or_get_session_inner(
             thread_key,
             harness_type,
             persona_id,
             metadata,
             proxy_labels,
+            sandbox_options,
             false,
         )
         .await
@@ -211,6 +232,7 @@ impl PgSessionStore {
             persona_id,
             metadata,
             proxy_labels,
+            SandboxOptions::default(),
             true,
         )
         .await
@@ -223,13 +245,14 @@ impl PgSessionStore {
         persona_id: Option<&str>,
         metadata: Value,
         proxy_labels: BTreeMap<String, String>,
+        sandbox_options: SandboxOptions,
         merge_metadata: bool,
     ) -> Result<Session, SessionStoreError> {
         let query = if merge_metadata {
             sqlx::query(
                 r#"
-                insert into sessions (thread_key, harness_type, persona_id, status, metadata, proxy_labels)
-                values ($1, $2, $3, $4, $5, $6)
+                insert into sessions (thread_key, harness_type, persona_id, status, metadata, proxy_labels, sandbox_options)
+                values ($1, $2, $3, $4, $5, $6, $7)
                 on conflict (thread_key) do update
                 set metadata = sessions.metadata || excluded.metadata,
                     updated_at = now()
@@ -240,8 +263,8 @@ impl PgSessionStore {
         } else {
             sqlx::query(
                 r#"
-                insert into sessions (thread_key, harness_type, persona_id, status, metadata, proxy_labels)
-                values ($1, $2, $3, $4, $5, $6)
+                insert into sessions (thread_key, harness_type, persona_id, status, metadata, proxy_labels, sandbox_options)
+                values ($1, $2, $3, $4, $5, $6, $7)
                 on conflict (thread_key) do nothing
                 "#,
             )
@@ -253,6 +276,7 @@ impl PgSessionStore {
             .bind(SessionStatus::Idle.as_ref())
             .bind(metadata)
             .bind(Json(proxy_labels.clone()))
+            .bind(Json(sandbox_options))
             .execute(&self.pool)
             .await?;
 
@@ -284,7 +308,7 @@ impl PgSessionStore {
     pub async fn get_session(&self, thread_key: &ThreadKey) -> Result<Session, SessionStoreError> {
         let row = sqlx::query_as::<_, SessionRow>(
             r#"
-            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_options, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             from sessions
             where thread_key = $1
             "#,
@@ -1519,7 +1543,7 @@ impl PgSessionStore {
                 end,
                 updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_options, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1550,7 +1574,7 @@ impl PgSessionStore {
                 sandbox_last_active_at = now(),
                 updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_options, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1697,7 +1721,7 @@ impl PgSessionStore {
                 status = $3,
                 updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_options, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1722,7 +1746,7 @@ impl PgSessionStore {
             update sessions
             set iron_control_principal = $2, updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_options, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1748,7 +1772,7 @@ impl PgSessionStore {
             set iron_control_principal = $2, updated_at = now()
             where thread_key = $1
               and (iron_control_principal is null or iron_control_principal = $2)
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_options, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1929,7 +1953,7 @@ impl PgSessionStore {
             update sessions
             set harness_thread_id = $2, updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_options, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -2089,6 +2113,7 @@ struct SessionRow {
     sandbox_repo_cache_enabled: Option<bool>,
     sandbox_repo_cache_access: Option<String>,
     sandbox_observability_enabled: Option<bool>,
+    sandbox_options: Json<SandboxOptions>,
     harness_type: String,
     harness_thread_id: Option<String>,
     persona_id: Option<String>,
@@ -2130,6 +2155,7 @@ impl TryFrom<SessionRow> for Session {
             harness_thread_id: row.harness_thread_id,
             persona_id: row.persona_id,
             status: parse_persisted(row.status)?,
+            sandbox_options: row.sandbox_options.0,
             iron_control_principal: row.iron_control_principal,
             proxy_labels: row.proxy_labels.0,
             sandbox_last_active_at: row.sandbox_last_active_at,

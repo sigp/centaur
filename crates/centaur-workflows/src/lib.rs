@@ -15,7 +15,9 @@ use absurd::{
 };
 use centaur_iron_control::{IronControlClient, IronControlError, PrincipalInput, slugify};
 use centaur_sandbox_core::SandboxSpec;
-use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
+use centaur_session_core::{
+    HarnessType, MessageRole, SandboxNetworkProfile, SandboxOptions, SessionMessageInput, ThreadKey,
+};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SESSION_OUTPUT_LINE_EVENT, SandboxRuntime,
     SessionRuntime,
@@ -3752,6 +3754,7 @@ async fn run_python_agent_turn(
         })
     });
     let harness_type = parse_agent_harness(&args)?.unwrap_or_else(|| input.harness_type.clone());
+    let sandbox_options = parse_agent_sandbox_options(&args)?;
     let persona_id = args
         .get("persona_id")
         .or_else(|| args.get("persona"))
@@ -3823,6 +3826,7 @@ async fn run_python_agent_turn(
             harness_type,
             persona_id,
             principal_foreign_id,
+            sandbox_options,
             parts,
             client_message_id,
             session_metadata,
@@ -4088,6 +4092,45 @@ fn parse_agent_harness(args: &Value) -> Result<Option<HarnessType>, WorkflowRunt
     };
     HarnessType::from_str(raw).map(Some).map_err(|_| {
         WorkflowRuntimeError::BadRequest(format!("unsupported ctx.agent_turn harness {raw:?}"))
+    })
+}
+
+fn parse_agent_sandbox_options(args: &Value) -> Result<SandboxOptions, WorkflowRuntimeError> {
+    let network_profile = match args.get("network_profile") {
+        None => SandboxNetworkProfile::Default,
+        Some(value) => {
+            let raw = value.as_str().ok_or_else(|| {
+                WorkflowRuntimeError::BadRequest(
+                    "ctx.agent_turn network_profile must be \"default\" or \"offline\"".to_owned(),
+                )
+            })?;
+            SandboxNetworkProfile::parse(raw).ok_or_else(|| {
+                WorkflowRuntimeError::BadRequest(format!(
+                    "ctx.agent_turn network_profile must be \"default\" or \"offline\", got {raw:?}"
+                ))
+            })?
+        }
+    };
+    let sandbox_size = match args.get("sandbox_size") {
+        None => None,
+        Some(value) => {
+            let raw = value.as_str().ok_or_else(|| {
+                WorkflowRuntimeError::BadRequest(
+                    "ctx.agent_turn sandbox_size must be a non-empty size class name".to_owned(),
+                )
+            })?;
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return Err(WorkflowRuntimeError::BadRequest(
+                    "ctx.agent_turn sandbox_size must be a non-empty size class name".to_owned(),
+                ));
+            }
+            Some(raw.to_owned())
+        }
+    };
+    Ok(SandboxOptions {
+        network_profile,
+        sandbox_size,
     })
 }
 
@@ -4507,6 +4550,7 @@ struct AgentTurnRequest {
     harness_type: HarnessType,
     persona_id: Option<String>,
     principal_foreign_id: Option<String>,
+    sandbox_options: SandboxOptions,
     parts: Vec<Value>,
     client_message_id: String,
     session_metadata: Value,
@@ -4563,6 +4607,7 @@ async fn run_agent_session_turn(
         harness_type,
         persona_id,
         principal_foreign_id,
+        sandbox_options,
         parts,
         client_message_id,
         session_metadata,
@@ -4582,13 +4627,14 @@ async fn run_agent_session_turn(
         object_insert(&mut session_metadata, "workflow_owned_thread", json!(true));
     }
     let session = session_runtime
-        .create_or_get_session_with_principal(
+        .create_or_get_session_with_principal_and_options(
             &thread_key,
             &harness_type,
             persona_id.as_deref(),
             Some(session_metadata),
             HarnessConflictPolicy::Reject,
             principal_foreign_id.as_deref(),
+            sandbox_options,
         )
         .await?
         .session;

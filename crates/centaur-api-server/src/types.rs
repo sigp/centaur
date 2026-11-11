@@ -1,5 +1,7 @@
 use axum::response::sse::Event;
-use centaur_session_core::{HarnessType, Session, SessionEvent, SessionMessageInput, ThreadKey};
+use centaur_session_core::{
+    HarnessType, SandboxNetworkProfile, Session, SessionEvent, SessionMessageInput, ThreadKey,
+};
 use centaur_session_runtime::SESSION_OUTPUT_LINE_EVENT;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,6 +15,13 @@ pub struct CreateSessionRequest {
     /// falls back to the eligible deployment default or no persona.
     pub persona_id: Option<String>,
     pub metadata: Option<Value>,
+    /// Optional per-session network boundary. `offline` permits only the
+    /// sandbox's own proxy, whose configured host allowlist is enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_profile: Option<SandboxNetworkProfile>,
+    /// Optional deployment size class for the sandbox resources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_size: Option<String>,
     /// What to do when the session already exists on a different harness.
     /// Omitted or `reject`: fail with 409. `restart`: stop the old sandbox and
     /// restart the thread on the requested harness (the new harness starts
@@ -269,4 +278,32 @@ pub enum SessionEventConversionError {
     OutputLinePayload { event_id: i64 },
     #[error("failed to serialize session event {event_id} payload as SSE JSON: {source}")]
     JsonData { event_id: i64, source: axum::Error },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CreateSessionRequest;
+    use centaur_session_core::SandboxNetworkProfile;
+
+    #[test]
+    fn create_session_deserializes_sandbox_options() {
+        let request: CreateSessionRequest = serde_json::from_value(serde_json::json!({
+            "harness_type": "codex",
+            "network_profile": "offline",
+            "sandbox_size": "large"
+        }))
+        .unwrap();
+        assert_eq!(request.network_profile, Some(SandboxNetworkProfile::Offline));
+        assert_eq!(request.sandbox_size.as_deref(), Some("large"));
+    }
+
+    #[test]
+    fn create_session_rejects_unknown_network_profile() {
+        let error = serde_json::from_value::<CreateSessionRequest>(serde_json::json!({
+            "harness_type": "codex",
+            "network_profile": "internet"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown variant"));
+    }
 }

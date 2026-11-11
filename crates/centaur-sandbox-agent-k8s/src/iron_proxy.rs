@@ -353,11 +353,18 @@ impl AgentSandboxBackend {
         let pg = self.resolved_pg_for_recreation(Some(&sandbox));
         let replace_placeholders = self.effective_replace_placeholders(&principal_id).await?;
         let observability_enabled = sandbox_observability_enabled(&sandbox);
+        let mut labels = BTreeMap::new();
+        if annotations
+            .and_then(|annotations| annotations.get(crate::NETWORK_PROFILE_ANNOTATION))
+            .is_some_and(|value| value == "offline")
+        {
+            labels.insert("network_profile".to_owned(), "offline".to_owned());
+        }
         Ok(Some(self.resolved_iron_proxy_for_principal(
             id,
             principal_id,
             requester_principal_id,
-            BTreeMap::new(),
+            labels,
             ResolvedIronProxyRuntime {
                 pg,
                 replace_placeholders,
@@ -905,11 +912,22 @@ impl AgentSandboxBackend {
                 );
                 false
             });
+        let mut effective_labels = labels.clone();
+        if sandbox.as_ref().and_then(|sandbox| {
+            sandbox
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(crate::NETWORK_PROFILE_ANNOTATION))
+        }) == Some(&"offline".to_owned())
+        {
+            effective_labels.insert("network_profile".to_owned(), "offline".to_owned());
+        }
         let resolved = self.resolved_iron_proxy_for_principal(
             id,
             principal_id,
             requester_principal_id.map(ToOwned::to_owned),
-            labels.clone(),
+            effective_labels,
             ResolvedIronProxyRuntime {
                 pg,
                 replace_placeholders,

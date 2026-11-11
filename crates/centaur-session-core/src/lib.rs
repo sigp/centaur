@@ -506,6 +506,56 @@ impl Default for SandboxCapabilities {
     }
 }
 
+/// Network reachability of a session's sandbox.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxNetworkProfile {
+    /// The deployment's normal egress: the sandbox's proxy may reach whatever
+    /// the principal's policy allows.
+    #[default]
+    Default,
+    /// The sandbox may reach only its own proxy, and that proxy forwards only
+    /// to the deployment's configured offline hosts.
+    Offline,
+}
+
+impl SandboxNetworkProfile {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Offline => "offline",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Some(Self::Default),
+            "offline" => Some(Self::Offline),
+            _ => None,
+        }
+    }
+}
+
+/// Per-session sandbox options chosen when the session is created and kept for
+/// its lifetime (pause, resume, and restart reuse them). The default value is
+/// the team's ordinary sandbox, which may come from the warm pool.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct SandboxOptions {
+    #[serde(default)]
+    pub network_profile: SandboxNetworkProfile,
+    /// Name of a deployment size class; `None` is the default resources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_size: Option<String>,
+}
+
+impl SandboxOptions {
+    /// Whether these options ask for nothing beyond the ordinary sandbox, so a
+    /// warm-pool sandbox is a valid fit.
+    pub fn is_default(&self) -> bool {
+        self.network_profile == SandboxNetworkProfile::Default && self.sandbox_size.is_none()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub thread_key: ThreadKey,
@@ -521,6 +571,10 @@ pub struct Session {
     pub harness_thread_id: Option<String>,
     pub persona_id: Option<String>,
     pub status: SessionStatus,
+    /// Per-session sandbox options, captured at creation and reused for the
+    /// lifetime of the session.
+    #[serde(default, skip_serializing_if = "SandboxOptions::is_default")]
+    pub sandbox_options: SandboxOptions,
     /// iron-control principal OID this session's egress proxy binds to,
     /// captured at registration so a resumed session can recreate its sandbox.
     pub iron_control_principal: Option<String>,

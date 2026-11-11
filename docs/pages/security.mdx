@@ -91,6 +91,24 @@ your tools actually need. iron-proxy will reject everything else with
 a 403. See the [iron-proxy configuration reference](https://docs.iron.sh/reference/configuration/)
 for the full set of allowlist options.
 
+### Per-session sandbox profiles
+
+Session creation accepts optional `network_profile` and `sandbox_size` fields.
+Workflow calls use the same names as `ctx.run_agent(..., network_profile=...,
+sandbox_size=...)`. `network_profile: offline` keeps the sandbox's egress
+limited to its paired iron-proxy and configures that proxy with the
+deployment's `sandbox.offline.allowedHosts` plus Centaur's own API and Console
+hosts needed for sandbox JWTs; it cannot reach the public
+internet through the proxy. The sandbox NetworkPolicy still permits DNS to
+kube-system so it can resolve the proxy Service; clusters whose CoreDNS
+forwards arbitrary names should treat DNS queries as a separate metadata
+exfiltration channel and restrict CoreDNS upstreams or add a DNS policy when
+deploying offline sessions. `sandbox_size` selects a named
+`sandbox.sizeClasses` resource map (including CPU, memory, and ephemeral
+storage). Sessions with either non-default option do not use a warm-pool
+sandbox, and the selected options persist across pause and resume. Unknown
+size names are rejected.
+
 ### Credentials
 
 Tool and harness credentials never reach the sandbox. Tools declare

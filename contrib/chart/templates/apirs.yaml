@@ -424,6 +424,10 @@ spec:
             - name: SESSION_SANDBOX_RESOURCES
               value: {{ toJson .Values.sandbox.resources | quote }}
 {{- end }}
+{{- if and .Values.sandbox.sizeClasses (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_SIZE_CLASSES")) }}
+            - name: SESSION_SANDBOX_SIZE_CLASSES
+              value: {{ toJson .Values.sandbox.sizeClasses | quote }}
+{{- end }}
 {{- if .Values.global.imagePullSecrets }}
             - name: SESSION_SANDBOX_IMAGE_PULL_SECRETS
               value: "{{- range $index, $secret := .Values.global.imagePullSecrets }}{{- if $index }},{{ end -}}{{ $secret.name }}{{- end }}"

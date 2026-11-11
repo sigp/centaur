@@ -378,6 +378,13 @@ sandbox:
   # Requests/limits for the agent container of every sandbox pod, per-session
   # and warm (k8s resources map).
   resources: {}
+  # Named per-session resource classes selected by sandbox_size. Empty keeps
+  # existing defaults unchanged.
+  sizeClasses: {}
+  # Hostnames allowed by iron-proxy for network_profile: offline sessions.
+  # The proxy-sync deployment turns this into a default-deny allowlist.
+  offline:
+    allowedHosts: []
 
 repoCache:
   enabled: true

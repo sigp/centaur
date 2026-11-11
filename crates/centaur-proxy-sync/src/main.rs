@@ -124,6 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let console_host = env::var("CENTAUR_CONSOLE_URL")
         .ok()
         .and_then(|url| host_from_url(&url));
+    let offline_allowed_hosts =
+        configured_hosts("CENTAUR_OFFLINE_ALLOWED_HOSTS", "CENTAUR_OFFLINE_ALLOWED_HOSTS");
     let state = AppState {
         pool,
         encryption: Arc::new(ActiveRecordEncryption::new(&primary_key, &salt)),
@@ -134,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         console_host,
         sync_cache: Arc::new(SyncCache::default()),
         metrics: metrics_handle,
+        offline_allowed_hosts,
     };
     let app = router(state);
     let bind: SocketAddr = env::var("BIND_ADDR")

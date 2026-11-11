@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use centaur_iron_control::IronControlClient;
 use centaur_sandbox_core::{
     MountKind, ObservedSandbox, ResourceRequirements, SandboxBackend, SandboxError, SandboxHandle,
-    SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
+    SandboxId, SandboxIo, SandboxNetworkProfile, SandboxResult, SandboxSpec, SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -59,6 +59,8 @@ const IRON_CONTROL_PRINCIPAL_ANNOTATION: &str = "centaur.ai/iron-control-princip
 // Absent when the turn has no requester, so an annotation-vs-binding
 // comparison treats "absent" and "no requester" as equal.
 const IRON_CONTROL_REQUESTER_ANNOTATION: &str = "centaur.ai/iron-control-requester-principal";
+const NETWORK_PROFILE_ANNOTATION: &str = "centaur.ai/network-profile";
+const SANDBOX_SIZE_ANNOTATION: &str = "centaur.ai/sandbox-size";
 // RFC 3339 instant stamped when the sandbox is paused for idleness and cleared
 // on resume. This keeps suspended status observable across api-rs restarts.
 const PAUSED_AT_ANNOTATION: &str = "centaur.ai/paused-at";
@@ -374,6 +376,15 @@ impl AgentSandboxBackend {
         id: &SandboxId,
         sandbox: &crd::Sandbox,
     ) -> SandboxResult<()> {
+        if sandbox
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(SANDBOX_SIZE_ANNOTATION))
+            .is_some()
+        {
+            return Ok(());
+        }
         let Some(resources) = self.config.default_resources.as_ref() else {
             return Ok(());
         };
@@ -1390,6 +1401,15 @@ fn build_agent_sandbox(
     );
 
     let mut annotations = config.annotations.clone();
+    if spec.network_profile == SandboxNetworkProfile::Offline {
+        annotations.insert(
+            NETWORK_PROFILE_ANNOTATION.to_owned(),
+            "offline".to_owned(),
+        );
+    }
+    if let Some(size) = &spec.sandbox_size {
+        annotations.insert(SANDBOX_SIZE_ANNOTATION.to_owned(), size.clone());
+    }
     if let Some(principal) = &spec.iron_control_principal {
         annotations.insert(
             IRON_CONTROL_PRINCIPAL_ANNOTATION.to_owned(),

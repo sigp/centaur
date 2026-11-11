@@ -19,5 +19,5 @@ pub use io::{SandboxIo, SandboxIoGuard, SandboxIoParts, SandboxRead, SandboxWrit
 pub use lifecycle::{ObservedSandbox, SandboxHandle, SandboxId, SandboxStatus};
 pub use spec::{
     EnvVar, Mount, MountKind, RepoCacheAccess, ResourceClaim, ResourceRequirements,
-    SandboxCapabilities, SandboxFile, SandboxSpec,
+    SandboxCapabilities, SandboxFile, SandboxNetworkProfile, SandboxSpec,
 };

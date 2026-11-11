@@ -25,6 +25,14 @@ impl RepoCacheAccess {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxNetworkProfile {
+    #[default]
+    Default,
+    Offline,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SandboxCapabilities {
     #[serde(default)]
@@ -66,6 +74,14 @@ pub struct SandboxSpec {
     pub working_dir: Option<String>,
     pub mounts: Vec<Mount>,
     pub resources: Option<ResourceRequirements>,
+    /// Network reachability for this sandbox. Offline sandboxes may only reach
+    /// their paired proxy; the proxy's configured host allowlist is enforced
+    /// separately by proxy-sync.
+    #[serde(default)]
+    pub network_profile: SandboxNetworkProfile,
+    /// Deployment size class selected for this sandbox, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_size: Option<String>,
     /// iron-control principal OID (``prn_…``) this sandbox's egress proxy
     /// should act as. When set, the backend registers/binds an iron-control
     /// proxy for the sandbox instead of rendering a static proxy config.
@@ -97,6 +113,8 @@ impl SandboxSpec {
             working_dir: None,
             mounts: Vec::new(),
             resources: None,
+            network_profile: SandboxNetworkProfile::Default,
+            sandbox_size: None,
             iron_control_principal: None,
             iron_control_requester_principal: None,
             iron_control_proxy_labels: std::collections::BTreeMap::new(),

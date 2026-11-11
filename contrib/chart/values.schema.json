@@ -253,6 +253,16 @@
         "serviceAccountName": { "type": "string" },
         "reposPath": { "type": "string" },
         "resources": { "type": "object" },
+        "sizeClasses": {
+          "type": "object",
+          "additionalProperties": { "type": "object" }
+        },
+        "offline": {
+          "type": "object",
+          "properties": {
+            "allowedHosts": { "type": "array", "items": { "type": "string" } }
+          }
+        },
         "telemetry": {
           "type": "object",
           "properties": {

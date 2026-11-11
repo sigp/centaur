@@ -816,6 +816,13 @@ struct SandboxArgs {
     /// into this because api-rs creates these pods at runtime.
     #[arg(long = "session-sandbox-resources", env = "SESSION_SANDBOX_RESOURCES")]
     sandbox_resources_json: Option<String>,
+    /// JSON map of immutable per-session sandbox size classes. Each value is a
+    /// Kubernetes `ResourceRequirements` object.
+    #[arg(
+        long = "session-sandbox-size-classes",
+        env = "SESSION_SANDBOX_SIZE_CLASSES"
+    )]
+    sandbox_size_classes_json: Option<String>,
     #[arg(
         long = "session-sandbox-state-volume-enabled",
         env = "SESSION_SANDBOX_STATE_VOLUME_ENABLED",
@@ -1133,6 +1140,7 @@ impl SandboxArgs {
         let artifact_backend = backend.clone();
         Ok(
             SandboxRuntime::backend_with_workload(backend, self.container_workload_mode()?)
+                .with_size_classes(self.sandbox_size_classes()?)
                 .with_artifact_reader(move |id, path, max_bytes| {
                     let backend = artifact_backend.clone();
                     async move { backend.read_artifact(&id, &path, max_bytes).await }
@@ -1260,6 +1268,36 @@ impl SandboxArgs {
             );
         }
         Ok(workload)
+    }
+
+    fn sandbox_size_classes(&self) -> Result<BTreeMap<String, ResourceRequirements>, ServerError> {
+        let Some(raw) = self
+            .sandbox_size_classes_json
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        else {
+            return Ok(BTreeMap::new());
+        };
+        let classes = serde_json::from_str::<BTreeMap<String, ResourceRequirements>>(raw)
+            .map_err(|error| {
+                ServerError::UnsupportedConfig(format!(
+                    "SESSION_SANDBOX_SIZE_CLASSES must be a JSON map of size names to ResourceRequirements: {error}"
+                ))
+            })?;
+        for (name, resources) in &classes {
+            if name.trim().is_empty() {
+                return Err(ServerError::UnsupportedConfig(
+                    "SESSION_SANDBOX_SIZE_CLASSES cannot contain an empty size name".to_owned(),
+                ));
+            }
+            if resources.is_empty() {
+                return Err(ServerError::UnsupportedConfig(format!(
+                    "SESSION_SANDBOX_SIZE_CLASSES entry {name:?} cannot be empty"
+                )));
+            }
+        }
+        Ok(classes)
     }
 
     fn repos_mount_kind(&self, repos_path: String) -> MountKind {
