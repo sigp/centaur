@@ -135,11 +135,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The Dockerfile builds the Console's single-page app from the pnpm
+      # workspace, so the build context is the repository root.
       - name: Build and push centaur-console
         run: |
           set -euo pipefail
           image="$REGISTRY/$NAMESPACE/centaur-console"
-          docker buildx build services/console \
+          docker buildx build . \
             --file services/console/Dockerfile \
             --platform linux/amd64 \
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
