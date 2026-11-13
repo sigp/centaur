@@ -302,6 +302,9 @@ if overlay_raw:
 
 path.write_text(text)
 PYEOF
+    # Optional enrichment: never block sandbox startup on the model catalog.
+    configure-codex-models "$HOME_DIR/.codex/config.toml" \
+        || echo "configure-codex-models failed; using Codex's bundled model catalog" >&2
 else
     echo "missing Codex harness config: $HARNESS_CONFIG_DIR/codex/config.toml" >&2
     exit 1
@@ -428,6 +431,9 @@ unset _centaur_tools_auto_reload
 # Base prompt: mounted as AGENTS_BASE.md when present, fallback to baked-in AGENTS.md.
 # Prompt overlays from mounted repos are appended when present.
 # The selected persona is appended when AGENTS_PERSONA.md exists in the sandbox home.
+# harness-server recomposes this file before its first turn, once the session's
+# credentials are bound, to add overlay session-prompt.sh hook output and pick
+# up overlay prompt changes made since a warm sandbox booted.
 TARGET_PROMPT="$WORKSPACE_DIR/AGENTS.md"
 compose-system-prompt \
     --home-dir "$HOME_DIR" \

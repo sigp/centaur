@@ -126,6 +126,10 @@ spec:
               value: {{ .Values.slackbotv2.responseMetadataMode | quote }}
             - name: SLACKBOTV2_RESPONSE_SERVICE_TIER_ENABLED
               value: {{ .Values.slackbotv2.responseServiceTierEnabled | quote }}
+            - name: SLACKBOTV2_GENERATIVE_UI_ENABLED
+              value: {{ .Values.slackbotv2.generativeUi.enabled | quote }}
+            - name: SLACKBOTV2_GENERATIVE_UI_LIMITS
+              value: {{ .Values.slackbotv2.generativeUi.limits | toJson | quote }}
             - name: SLACKBOTV2_MESSAGE_OVERRIDES_STRATEGY
               value: {{ .Values.slackbotv2.messageOverridesStrategy.mode | quote }}
             - name: SLACKBOTV2_MESSAGE_OVERRIDES_MODEL
@@ -176,10 +180,10 @@ spec:
             - name: CODEX_CUSTOM_PROVIDERS
               value: {{ .Values.codex.customProviders | toJson | quote }}
 {{- end }}
-{{- range $name := tuple "CLAUDE_MODEL" "CODEX_MODEL" "CODEX_MODEL_REASONING_EFFORT" "CENTAUR_PI_MODEL" "CENTAUR_OMP_MODEL" }}
+{{- range $name := tuple "CLAUDE_MODEL" "CODEX_MODEL" "CODEX_MODEL_PROVIDER" "OPENROUTER_MODEL" "CODEX_MODEL_REASONING_EFFORT" "CENTAUR_PI_MODEL" "CENTAUR_OMP_MODEL" }}
 {{- if and (hasKey $.Values.sandbox.extraEnv $name) (not (hasKey $.Values.slackbotv2.extraEnv $name)) }}
             # Mirror the deployer's harness default override (sandbox.extraEnv)
-            # so the Slack Console-link line names the model/reasoning policy
+            # so Slack selects and displays the model/provider/reasoning policy
             # sandboxes actually run. slackbotv2.extraEnv wins if it sets the
             # same variable.
             - name: {{ $name }}

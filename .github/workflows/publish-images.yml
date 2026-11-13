@@ -50,6 +50,10 @@ jobs:
   build:
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'depot-ubuntu-24.04-arm-16' || 'depot-ubuntu-24.04-16' }}
+    # Warm builds finish in a few minutes and a cold agent build in well under
+    # this. A stalled remote build step otherwise holds the run (and, on main,
+    # the non-cancelling concurrency group) for the 6h default.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -118,7 +122,7 @@ jobs:
             target: ""
           - service: console
             image: centaur-console
-            context: services/console
+            context: .
             dockerfile: services/console/Dockerfile
             target: ""
 
@@ -156,7 +160,7 @@ jobs:
 
       - name: Build and push ${{ matrix.image }} (${{ matrix.platform }})
         id: build
-        uses: depot/build-push-action@98e78adca7817480b8185f474a400b451d74e287 # v1.18.0
+        uses: depot/build-push-action@0f27be7c41d76663a98518dfe68f1c46582242c4 # v1.19.0
         with:
           project: d8qqlh1bmq
           context: ${{ matrix.context }}

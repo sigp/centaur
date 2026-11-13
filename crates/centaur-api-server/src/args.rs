@@ -26,8 +26,8 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, DeploymentRef, GitHubTokenRef, IronControlSettings,
-    IronProxyConfig, OtlpEgressTarget, SecurityContext, StateVolumeConfig, Toleration, ToolSource,
-    ToolsConfig,
+    IronProxyConfig, OtlpEgressTarget, SecurityContext, SshProxyConfig, StateVolumeConfig,
+    Toleration, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, ResourceRequirements, SandboxSpec};
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
@@ -847,8 +847,9 @@ struct SandboxArgs {
         default_value_t = 0
     )]
     warm_pool_size: usize,
-    /// Warm pools as a JSON list of `{"harness", "repoCache", "size"}`
-    /// objects, one per harness and repo-cache access. Replaces
+    /// Warm pools as a JSON list of `{"harness", "repoCache", "persona"?,
+    /// "size"}` objects, one per harness, repo-cache access, and persona. A
+    /// pool without `persona` serves only sessions without one. Replaces
     /// `SESSION_SANDBOX_WARM_POOL_SIZE` when set.
     #[arg(
         long = "session-sandbox-warm-pools",
@@ -1660,23 +1661,27 @@ impl SandboxArgs {
             return Ok(vec![WarmPoolTarget {
                 harness: self.default_harness.clone(),
                 repo_cache: SandboxRepoCacheAccess::All,
+                persona: None,
                 size: self.warm_pool_size,
             }]);
         };
         let targets: Vec<WarmPoolTarget> = serde_json::from_str(raw).map_err(|error| {
             ServerError::UnsupportedConfig(format!(
                 "SESSION_SANDBOX_WARM_POOLS must be a JSON list of \
-                 {{\"harness\", \"repoCache\", \"size\"}} objects: {error}"
+                 {{\"harness\", \"repoCache\", \"persona\"?, \"size\"}} objects: {error}"
             ))
         })?;
         for (index, target) in targets.iter().enumerate() {
             if targets[..index].iter().any(|earlier| {
-                earlier.harness == target.harness && earlier.repo_cache == target.repo_cache
+                earlier.harness == target.harness
+                    && earlier.repo_cache == target.repo_cache
+                    && earlier.persona == target.persona
             }) {
                 return Err(ServerError::UnsupportedConfig(format!(
-                    "SESSION_SANDBOX_WARM_POOLS lists harness {} with repoCache {} more than once",
+                    "SESSION_SANDBOX_WARM_POOLS lists harness {} with repoCache {} and persona {} more than once",
                     target.harness,
-                    target.repo_cache.as_str()
+                    target.repo_cache.as_str(),
+                    target.persona.as_deref().unwrap_or("(none)")
                 )));
             }
         }
@@ -2064,6 +2069,26 @@ fn repository_visibility(value: Option<&str>) -> String {
 #[derive(Debug, ClapArgs)]
 struct IronProxyArgs {
     #[arg(
+        long = "kubernetes-iron-proxy-ssh-enabled",
+        env = "KUBERNETES_IRON_PROXY_SSH_ENABLED",
+        default_value_t = false
+    )]
+    ssh_enabled: bool,
+    #[arg(
+        long = "kubernetes-iron-proxy-ssh-workspace",
+        env = "KUBERNETES_IRON_PROXY_SSH_WORKSPACE",
+        default_value = "/workspace"
+    )]
+    ssh_workspace: String,
+    /// Stable secret every sandbox's disposable SSH keys are derived from.
+    /// Required when SSH is enabled; at least 32 bytes.
+    #[arg(
+        long = "kubernetes-iron-proxy-ssh-seed",
+        env = "CENTAUR_SSH_SEED",
+        hide_env_values = true
+    )]
+    ssh_seed: Option<String>,
+    #[arg(
         long = "kubernetes-iron-proxy-image",
         env = "KUBERNETES_IRON_PROXY_IMAGE",
         default_value = "centaur-iron-proxy:latest"
@@ -2157,6 +2182,21 @@ struct IronProxyArgs {
 }
 
 impl IronProxyArgs {
+    /// Fails at startup, not at the first sandbox, when SSH is misconfigured.
+    fn ssh_config(&self) -> Result<Option<SshProxyConfig>, ServerError> {
+        if !self.ssh_enabled {
+            return Ok(None);
+        }
+        let seed = self.ssh_seed.as_deref().ok_or_else(|| {
+            ServerError::UnsupportedConfig(
+                "KUBERNETES_IRON_PROXY_SSH_ENABLED requires CENTAUR_SSH_SEED".to_owned(),
+            )
+        })?;
+        SshProxyConfig::new(seed, self.ssh_workspace.clone())
+            .map(Some)
+            .map_err(ServerError::UnsupportedConfig)
+    }
+
     fn to_config(&self) -> Result<IronProxyConfig, ServerError> {
         let (ca_cert_secret_name, ca_key_secret_name) = self.ca.secrets()?;
 
@@ -2189,6 +2229,8 @@ impl IronProxyArgs {
         config.database_namespace =
             non_empty(self.database_namespace.as_deref()).map(ToOwned::to_owned);
         config.database_port = self.database_port;
+        config.ssh = self.ssh_config()?;
+
         self.source.apply_to_config(&mut config);
         config.fragments = harness_fragments;
         config.env_from_secret_names = self.env_from_secret_names();
@@ -3656,6 +3698,7 @@ mod tests {
             vec![WarmPoolTarget {
                 harness: HarnessType::ClaudeCode,
                 repo_cache: SandboxRepoCacheAccess::All,
+                persona: None,
                 size: 3,
             }],
             "the legacy size configures one default-harness pool"
@@ -3671,14 +3714,40 @@ mod tests {
                 WarmPoolTarget {
                     harness: HarnessType::Codex,
                     repo_cache: SandboxRepoCacheAccess::All,
+                    persona: None,
                     size: 2,
                 },
                 WarmPoolTarget {
                     harness: HarnessType::Codex,
                     repo_cache: SandboxRepoCacheAccess::Public,
+                    persona: None,
                     size: 1,
                 },
             ]
+        );
+        assert_eq!(
+            parse(&[
+                "--session-sandbox-warm-pools",
+                r#"[{"harness":"codex","repoCache":"all","size":2},
+                    {"harness":"codex","repoCache":"all","persona":"eng","size":1}]"#,
+            ])
+            .unwrap()[1],
+            WarmPoolTarget {
+                harness: HarnessType::Codex,
+                repo_cache: SandboxRepoCacheAccess::All,
+                persona: Some("eng".to_owned()),
+                size: 1,
+            },
+            "a persona splits a pool from its harness and repo-cache pool"
+        );
+        assert!(
+            parse(&[
+                "--session-sandbox-warm-pools",
+                r#"[{"harness":"codex","repoCache":"all","persona":"eng","size":2},
+                    {"harness":"codex","repoCache":"all","persona":"eng","size":1}]"#,
+            ])
+            .is_err(),
+            "duplicate persona pools are rejected"
         );
         assert!(
             parse(&[
@@ -3943,6 +4012,55 @@ mod tests {
             ])
         );
         assert_eq!(config.database_namespace.as_deref(), Some("databases"));
+    }
+
+    #[test]
+    fn iron_proxy_ssh_requires_a_valid_seed_at_startup() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--kubernetes-firewall-ca-secret-name",
+                "centaur-firewall-ca",
+                "--kubernetes-firewall-ca-key-secret-name",
+                "centaur-firewall-ca-key",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv).unwrap()
+        };
+
+        let off = parse(&[]).sandbox.iron_proxy.to_config().unwrap();
+        assert!(off.ssh.is_none());
+        assert!(
+            !off.extra_env
+                .keys()
+                .any(|name| name.starts_with("IRON_SSH"))
+        );
+
+        for extra in [
+            &["--kubernetes-iron-proxy-ssh-enabled"][..],
+            &[
+                "--kubernetes-iron-proxy-ssh-enabled",
+                "--kubernetes-iron-proxy-ssh-seed",
+                "too-short",
+            ][..],
+        ] {
+            assert!(parse(extra).sandbox.iron_proxy.to_config().is_err());
+        }
+
+        let on = parse(&[
+            "--kubernetes-iron-proxy-ssh-enabled",
+            "--kubernetes-iron-proxy-ssh-seed",
+            "test-only-seed-with-at-least-32-bytes",
+        ])
+        .sandbox
+        .iron_proxy
+        .to_config()
+        .unwrap();
+        let ssh = on.ssh.expect("SSH enabled");
+        assert!(!format!("{ssh:?}").contains("test-only-seed"));
+        assert!(!on.extra_env.keys().any(|name| name.starts_with("IRON_SSH")));
     }
 
     #[test]

@@ -38,6 +38,7 @@ export type Execution = { execution_id: string; status: string; error: string | 
 export type ModelRequest = {
   provider: 'openai' | 'anthropic'
   model?: string
+  host?: string
   /** The credential header as the provider received it, after iron-proxy. */
   credential?: string
   /** The ChatGPT workspace the request was sent for, after iron-proxy. */
@@ -94,6 +95,7 @@ const consoleUrl = required('E2E_CONSOLE_URL')
 const consoleApiKey = required('E2E_CONSOLE_API_KEY')
 const logDir = required('E2E_LOG_DIR')
 const namespace = 'centaur'
+const sshNamespace = 'centaur-e2e-ssh'
 const release = 'centaur'
 
 /** How the stack's Codex and Claude Code authenticate: api_key, or access_token (subscriptions). */
@@ -112,6 +114,14 @@ export const turnTimeoutMs = Number(process.env.E2E_TURN_TIMEOUT_MS ?? 300_000)
 /** How long a finished execution may take to show up in Slack. */
 const renderTimeoutMs = 60_000
 
+export async function executionOutput(executionId: string): Promise<any[]> {
+  const events = await db`
+    select payload from session_events
+    where execution_id = ${executionId} and event_type = 'session.output.line'
+    order by event_id`
+  return events.map(({ payload }: { payload: string }) => JSON.parse(payload))
+}
+
 export const model = {
   /**
    * Scripts the model's answer to the message this is attached to. `delayMs`
@@ -124,8 +134,19 @@ export const model = {
    * Scripts the model to run a shell command through the harness's shell tool
    * (OpenAI harnesses), then answer with `text` once the command finishes.
    */
-  runs(command: string, text = 'Ran it.'): Script {
-    return { token: `e2e-${randomUUID().slice(0, 8)}`, text, run: command }
+  runs(command: string, text = 'Ran it.', options: { delayMs?: number } = {}): Script {
+    return { token: `e2e-${randomUUID().slice(0, 8)}`, text, run: command, ...options }
+  },
+  /** What the harness's shell tool returned for a `runs` script's command, as the model received it. */
+  async commandOutput(script: Script): Promise<string> {
+    for (const { body } of await modelRequests(script.token)) {
+      const outputs = (Array.isArray(body.input) ? body.input : [])
+        .filter((item: any) => String(item?.type ?? '').endsWith('_call_output'))
+        .map((item: any) => (typeof item.output === 'string' ? item.output : contentText(item.output)))
+        .map(commandText)
+      if (outputs.length > 0) return outputs.join('\n')
+    }
+    throw new Error(`the harness returned no command output for script ${script.token}`)
   },
   /**
    * The X-E2E-Credential header of each request a command made to
@@ -233,6 +254,21 @@ export const cluster = {
       '-l', `centaur.ai/sandbox-id=${sandboxId}`, '-o', 'name'
     )
     return out.split('\n').filter(Boolean)
+  }
+}
+
+/**
+ * The remote development environment behind the e2e SSH gateway
+ * (e2e/infra/ssh-gateway.yaml), as its owner sees it.
+ */
+export const sshGateway = {
+  /** The WSS URL the deployment's SSH target policy allows. */
+  url: 'wss://workspace.ssh-gateway.test/events/events',
+  /** The private key the gateway authorizes for its `dev` user. */
+  privateKey: required('E2E_SSH_PRIVATE_KEY'),
+  /** Runs a shell script on the remote host as root; the workspace is /workspace, owned by `dev`. */
+  async exec(script: string): Promise<string> {
+    return kubectl({ namespace: sshNamespace }, 'exec', 'deploy/ssh-gateway', '-c', 'sshd', '--', 'sh', '-c', script)
   }
 }
 
@@ -574,6 +610,16 @@ export class Thread {
     }
   }
 
+  async nextCancelledExecution(): Promise<Execution> {
+    const index = this.turnsSeen++
+    return eventually(`cancelled execution ${index + 1} of ${this.key}`, turnTimeoutMs, async () => {
+      const execution = (await this.executions())[index]
+      if (!execution || !isTerminal(execution.status)) return undefined
+      if (execution.status !== 'cancelled') throw new Error(`expected cancellation, got ${JSON.stringify(execution)}`)
+      return execution
+    })
+  }
+
   /** Sandboxes that served this thread, in the order they became ready. */
   async sandboxes(): Promise<Array<{ id: string; harness: string }>> {
     return db`
@@ -660,6 +706,21 @@ async function modelRequests(token: string): Promise<ModelRequest[]> {
   })
 }
 
+/** Codex's code mode returns each nested exec_command result as JSON; keep only what the command printed. */
+function commandText(output: string): string {
+  return output
+    .split('\n')
+    .map(line => {
+      try {
+        const parsed = JSON.parse(line)
+        return typeof parsed?.output === 'string' ? parsed.output : line
+      } catch {
+        return line
+      }
+    })
+    .join('\n')
+}
+
 function lastBlockText(content: unknown): string {
   return Array.isArray(content) ? contentText(content.slice(-1)) : contentText(content)
 }
@@ -696,8 +757,8 @@ async function slackApi<T>(user: SlackUser, method: string, body: Record<string,
   return payload
 }
 
-async function kubectl(options: { stdin?: string }, ...args: string[]): Promise<string> {
-  const proc = Bun.spawn(['kubectl', '-n', namespace, ...args], {
+async function kubectl(options: { stdin?: string; namespace?: string }, ...args: string[]): Promise<string> {
+  const proc = Bun.spawn(['kubectl', '-n', options.namespace ?? namespace, ...args], {
     stdin: options.stdin === undefined ? 'ignore' : new Blob([options.stdin]),
     stdout: 'pipe',
     stderr: 'pipe'

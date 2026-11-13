@@ -234,7 +234,45 @@
               "name": { "type": "string", "minLength": 1 },
               "baseUrl": { "type": "string", "pattern": "^https://" },
               "apiKeyEnv": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
-              "defaultModel": { "type": "string", "minLength": 1 }
+              "defaultModel": { "type": "string", "minLength": 1 },
+              "webSearch": { "type": "boolean" },
+              "models": {
+                "type": "object",
+                "propertyNames": { "pattern": "\\S" },
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "displayName": { "type": "string", "pattern": "\\S" },
+                    "aliases": {
+                      "type": "array",
+                      "items": { "type": "string", "pattern": "\\S" },
+                      "uniqueItems": true
+                    },
+                    "description": { "type": "string", "pattern": "\\S" },
+                    "contextWindow": { "type": "integer", "minimum": 1 },
+                    "inputModalities": {
+                      "type": "array",
+                      "items": { "type": "string", "enum": ["text", "image"] },
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "contains": { "const": "text" }
+                    },
+                    "reasoningEfforts": {
+                      "type": "array",
+                      "items": { "type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
+                      "uniqueItems": true
+                    },
+                    "defaultReasoning": { "type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
+                    "reasoningAliases": {
+                      "type": "object",
+                      "propertyNames": { "pattern": "\\S" },
+                      "additionalProperties": { "type": "string", "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] }
+                    }
+                  },
+                  "required": ["displayName"],
+                  "additionalProperties": false
+                }
+              }
             },
             "required": ["name", "baseUrl", "apiKeyEnv"],
             "additionalProperties": false
@@ -436,6 +474,7 @@
                 "enum": ["codex", "amp", "claudecode", "nanocodex", "hermes", "pi", "omp"]
               },
               "repoCache": { "type": "string", "enum": ["all", "public", "none"] },
+              "persona": { "type": "string", "minLength": 1 },
               "size": { "type": "integer", "minimum": 0 }
             }
           }
@@ -558,6 +597,28 @@
           "enum": ["first", "always", "never"]
         },
         "responseServiceTierEnabled": { "type": "boolean" },
+        "generativeUi": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "limits": {
+              "type": "object",
+              "properties": {
+                "tables": { "type": "integer", "minimum": 1 },
+                "charts": { "type": "integer", "minimum": 1 },
+                "fields": { "type": "integer", "minimum": 1 },
+                "tableRows": { "type": "integer", "minimum": 1 },
+                "tableColumns": { "type": "integer", "minimum": 1 },
+                "chartLabel": { "type": "integer", "minimum": 1 },
+                "chartTitle": { "type": "integer", "minimum": 1 },
+                "chartSeries": { "type": "integer", "minimum": 1 },
+                "chartPoints": { "type": "integer", "minimum": 1 }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
         "proactivity": {
           "type": "object",
           "properties": {

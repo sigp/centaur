@@ -165,11 +165,11 @@ module Oauth
     end
 
     def sign_in(user)
-      post login_url, params: { email: user.email, password: "password123456" }
+      console_password_login(user.email)
     end
 
     def sign_out
-      delete logout_url
+      console_sign_out
     end
 
     # Runs /start and returns the state extracted from the IdP redirect (the flow
@@ -216,7 +216,7 @@ module Oauth
       assert_no_difference("BrokerCredential.count") do
         get oauth_callback_url(slug: @app.slug), params: { state: state, code: "different" }
       end
-      assert_response :unprocessable_entity
+      assert_response :unprocessable_content
       assert_equal "google-sub-1", credential.reload.provider_subject
     end
 
@@ -393,13 +393,13 @@ module Oauth
 
     test "start renders a 422 result page for a disabled app" do
       get oauth_start_url(slug: "google-disabled")
-      assert_response :unprocessable_entity
+      assert_response :unprocessable_content
       assert_match "disabled", response.body
     end
 
     test "start 422s a scope outside the allowlist" do
       get oauth_start_url(slug: "google"), params: { scopes: "https://www.googleapis.com/auth/drive" }
-      assert_response :unprocessable_entity
+      assert_response :unprocessable_content
     end
 
     test "start honors an optional scopes subset" do
@@ -624,6 +624,76 @@ module Oauth
       assert_equal "Linear – Ada Lovelace token", cred.static_secret.name
     end
 
+    test "custom provider consent uses the configured endpoints, resource, and userinfo identity" do
+      app = OauthApp.create!(
+        slug: "custom-mcp", provider: "custom", client_id: "custom-client", client_secret: "custom-secret",
+        allowed_scopes: %w[read write], created_by: users(:acme_admin),
+        provider_config: {
+          "authorization_endpoint" => "https://auth.example.test/oauth/authorize",
+          "token_endpoint" => "https://auth.example.test/oauth/token",
+          "userinfo_endpoint" => "https://auth.example.test/oauth/userinfo",
+          "resource" => "https://api.example.test/mcp"
+        }
+      )
+      state = start_flow(slug: app.slug)
+      uri = URI.parse(response.location)
+      query = URI.decode_www_form(uri.query).to_h
+      assert_equal "https://auth.example.test/oauth/authorize", "#{uri.scheme}://#{uri.host}#{uri.path}"
+      assert_equal "https://api.example.test/mcp", query["resource"]
+      assert_equal "read write", query["scope"]
+      assert_equal "S256", query["code_challenge_method"]
+
+      stub_exchange(status: 200, body: { access_token: "custom-at", refresh_token: "custom-rt", expires_in: 1800, scope: "read write" }.to_json) do |request|
+        assert_equal "https://auth.example.test/oauth/token", request[:url]
+        assert_equal "custom-secret", request[:form]["client_secret"]
+        assert_equal "https://api.example.test/mcp", request[:form]["resource"]
+        assert request[:form]["code_verifier"].present?
+      end
+      stub_identity(body: { sub: "User-42", email: "ada@example.com", name: "Ada" }.to_json) do |request|
+        assert_equal :get, request[:method]
+        assert_equal "https://auth.example.test/oauth/userinfo", request[:url]
+        assert_equal "Bearer custom-at", request[:headers]["Authorization"]
+      end
+      get oauth_callback_url(slug: app.slug), params: { state: state, code: "auth-code" }
+      assert_redirected_to console_integrations_path
+
+      cred = app.broker_credentials.sole
+      assert_equal "User-42", cred.provider_subject
+      assert_equal "ada@example.com", cred.provider_email
+      assert_equal "custom-custom-mcp-user-42", cred.foreign_id
+      assert_equal "https://auth.example.test/oauth/token", cred.token_endpoint
+      assert_equal "custom-rt", cred.refresh_token
+      assert_equal [ { "host" => "api.example.test", "paths" => [ "/mcp" ] } ], cred.static_secret.rules.map(&:to_proxy_rule)
+    end
+
+    test "custom provider without a userinfo endpoint takes the identity from the access token claims" do
+      app = OauthApp.create!(
+        slug: "custom-jwt", provider: "custom", client_id: "custom-client", client_secret: "custom-secret",
+        allowed_scopes: %w[read], created_by: users(:acme_admin),
+        provider_config: {
+          "authorization_endpoint" => "https://auth.example.test/oauth/authorize",
+          "token_endpoint" => "https://auth.example.test/oauth/token",
+          "resource" => "https://api.example.test/mcp"
+        }
+      )
+      claims = Base64.urlsafe_encode64({ sub: "user-7", email: "ada@example.com" }.to_json, padding: false)
+      state = start_flow(slug: app.slug)
+      stub_exchange(status: 200, body: { access_token: "header.#{claims}.signature", refresh_token: "rt", expires_in: 1800 }.to_json)
+      get oauth_callback_url(slug: app.slug), params: { state: state, code: "auth-code" }
+      assert_redirected_to console_integrations_path
+
+      cred = app.broker_credentials.sole
+      assert_equal "user-7", cred.provider_subject
+      assert_equal "ada@example.com", cred.provider_email
+
+      state = start_flow(slug: app.slug)
+      stub_exchange(status: 200, body: { access_token: "opaque-token", refresh_token: "rt", expires_in: 1800 }.to_json)
+      assert_no_difference -> { BrokerCredential.count } do
+        get oauth_callback_url(slug: app.slug), params: { state: state, code: "auth-code" }
+      end
+      assert_response :unprocessable_content
+    end
+
     test "callback happy path supports Zoom OAuth app tokens" do
       state = start_flow(slug: "zoom")
       stub_exchange(status: 200, body: zoom_token_body) do |request|
@@ -799,7 +869,7 @@ module Oauth
         get oauth_callback_url(slug: "github"), params: { state: state, code: "auth-code" }
       end
 
-      assert_response :unprocessable_entity
+      assert_response :unprocessable_content
       assert_match "identity_lookup_failed", response.body
     end
 
@@ -874,8 +944,9 @@ module Oauth
       assert_nil cred.provider_email
       assert_equal user, cred.created_by
 
-      get console_integrations_url
-      assert_select "a.btn-secondary[href=?]", "http://www.example.com/oauth/slack/start", text: "Reconnect"
+      get api_v1_console_integrations_path
+      slack = JSON.parse(response.body).dig("data", "apps").find { |app| app["slug"] == "slack" }
+      assert_equal "connected", slack.dig("connection", "status")
     end
 
     test "callback redirects signed-out users to login and mints nothing" do
@@ -930,7 +1001,7 @@ module Oauth
       assert_no_difference -> { BrokerCredential.count } do
         get oauth_callback_url(slug: "google"), params: { state: state, error: "access_denied" }
       end
-      assert_response :unprocessable_entity
+      assert_response :unprocessable_content
       assert_match "Not connected", response.body
       assert_match "access_denied", response.body
     end
@@ -960,7 +1031,7 @@ module Oauth
       assert_no_difference -> { BrokerCredential.count } do
         get oauth_callback_url(slug: "google"), params: { state: state, code: "bad-code" }
       end
-      assert_response :unprocessable_entity
+      assert_response :unprocessable_content
       assert_match "invalid_grant", response.body
     end
 
@@ -970,7 +1041,7 @@ module Oauth
       assert_no_difference -> { BrokerCredential.count } do
         get oauth_callback_url(slug: "google"), params: { state: state, code: "code" }
       end
-      assert_response :unprocessable_entity
+      assert_response :unprocessable_content
       assert_match "id_token_aud_mismatch", response.body
     end
 
@@ -979,6 +1050,80 @@ module Oauth
       @app.destroy!
       get oauth_callback_url(slug: "google"), params: { state: state, code: "code" }
       assert_response :not_found
+    end
+
+    test "the result page is a standalone server-rendered page" do
+      state = start_flow
+      get oauth_callback_url(slug: "google"), params: { state: state, error: "access_denied" }
+
+      assert_response :unprocessable_content
+      assert_match %r{text/html}, response.media_type
+      assert_select "title", "Not connected · Centaur Console"
+      assert_select "h1", "Not connected"
+      assert_select "p", "Consent was not granted (access_denied)."
+      assert_select "a[href=?]", oauth_start_path(slug: "google"), text: "Try again"
+      assert_select "script", count: 0
+      assert_select "link[rel=stylesheet][href^=?]", "/assets/oauth-page/oauth.css?v="
+      assert_page_assets_under_assets_prefix
+    end
+
+    test "the result page offers no retry for unknown or disabled apps" do
+      get oauth_start_url(slug: "nope")
+      assert_response :not_found
+      assert_select "h1", "Something went wrong"
+      assert_select "p", "Unknown integration."
+      assert_select "a", count: 0
+
+      get oauth_start_url(slug: "google-disabled")
+      assert_response :unprocessable_content
+      assert_select "p", "This integration is disabled."
+      assert_select "a", count: 0
+    end
+
+    test "a hostile provider error code is escaped on the result page" do
+      state = start_flow
+      get oauth_callback_url(slug: "google"), params: { state: state, error: "<img src=x onerror=alert(1)>" }
+      assert_response :unprocessable_content
+      assert_not_includes response.body, "<img src=x"
+      assert_includes response.body, "&lt;img src=x onerror=alert(1)&gt;"
+    end
+
+    test "a replayed callback fails once the flow cookie is used" do
+      state = start_flow
+      stub_exchange(status: 200, body: token_body)
+      get oauth_callback_url(slug: "google"), params: { state: state, code: "auth-code" }
+      assert_redirected_to console_integrations_path
+
+      assert_no_difference -> { BrokerCredential.count } do
+        get oauth_callback_url(slug: "google"), params: { state: state, code: "auth-code" }
+      end
+      assert_response :bad_request
+      assert_match "started in another browser", response.body
+    end
+
+    test "success hands the connected notice to the console" do
+      state = start_flow
+      stub_exchange(status: 200, body: token_body)
+      get oauth_callback_url(slug: "google"), params: { state: state, code: "auth-code" }
+      get api_v1_console_me_path
+      assert_equal "google connected as user@example.com.", json_body.dig("data", "flash", "notice")
+    end
+
+    test "a slug with a tilde keeps its sign-in continuation and retry link" do
+      app = @app.dup
+      app.update!(slug: "google~team")
+      sign_out
+      get oauth_start_url(slug: app.slug)
+      assert_redirected_to login_path
+      assert_equal "/oauth/google~team/start", session[:return_to]
+
+      sign_in users(:member_user)
+      assert_equal "/oauth/google~team/start", console_login_redirect
+
+      state = start_flow(slug: app.slug)
+      get oauth_callback_url(slug: app.slug), params: { state: state, error: "access_denied" }
+      assert_response :unprocessable_content
+      assert_select "a[href=?]", "/oauth/google~team/start", text: "Try again"
     end
   end
 end

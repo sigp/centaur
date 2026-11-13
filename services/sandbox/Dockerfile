@@ -8,10 +8,11 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ARG CA_CERTIFICATES_VERSION=20260816ubuntu0.24.04.2
 
 # ── System packages (cached unless base image or package pins change) ─────────
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
-    git curl wget ca-certificates=${CA_CERTIFICATES_VERSION} gnupg lsb-release sudo \
+RUN --mount=type=cache,id=sandbox-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=sandbox-apt-lib,target=/var/lib/apt,sharing=locked \
+    printf '%s\n' "Acquire::Retries \"5\";" "Acquire::http::Timeout \"30\";" "Acquire::https::Timeout \"30\";" > /etc/apt/apt.conf.d/80-network-retries \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    openssh-client git curl wget ca-certificates=${CA_CERTIFICATES_VERSION} gnupg lsb-release sudo \
     build-essential pkg-config cmake ninja-build \
     ffmpeg ghostscript dvisvgm file \
     libssl-dev libclang-dev protobuf-compiler \
@@ -27,8 +28,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/info
 
 # reth's default JIT build uses revmc, which depends on llvm-sys 221.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+RUN --mount=type=cache,id=sandbox-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=sandbox-apt-lib,target=/var/lib/apt,sharing=locked \
     curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
       | gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
@@ -45,7 +46,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip3 install --break-system-packages --no-compile --ignore-installed "packaging>=24.2.0" \
     && pip3 install --break-system-packages --no-compile \
     python-docx==1.2.0 lxml==6.1.3 docx-revisions==0.1.5 \
-    matplotlib==3.11.2 numpy==2.5.4 pandas==3.1.0 \
+    matplotlib==3.11.2 numpy==2.5.4 pandas==3.1.1 \
     python-pptx==1.0.2 openpyxl==3.1.5 PyMuPDF==1.28.2 mammoth==1.13.0 \
     faster-whisper \
     asyncpg==0.32.0 \
@@ -62,14 +63,14 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     "githubkit>=0.16.1" \
     pysocks>=1.7.1 \
     rich>=13.0.0 \
-    slack-sdk==3.45.0 \
+    slack-sdk==3.46.0 \
     tomli-w==1.2.0 \
     && find /usr/local/lib/python3.12 /usr/lib/python3 -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
 # ── GitHub CLI + Node.js 24 (LTS) + Docker CLI + Google Cloud CLI (cached) ──
 ARG NODE_VERSION=24.22.2
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+RUN --mount=type=cache,id=sandbox-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=sandbox-apt-lib,target=/var/lib/apt,sharing=locked \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
@@ -93,9 +94,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN useradd -m -s /bin/bash -u 1001 agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
 
-ARG CLAUDE_CODE_VERSION=2.1.312
-ARG CODEX_VERSION=0.165.0
-ARG PI_CODING_AGENT_VERSION=1.4.0
+ARG CLAUDE_CODE_VERSION=2.1.318
+# Bumping CODEX_VERSION: refresh services/sandbox/codex-base-instructions.md
+# from openai/codex rust-v<version>/codex-rs/models-manager/prompt.md.
+ARG CODEX_VERSION=0.166.0
+ARG PI_CODING_AGENT_VERSION=1.5.0
 # Hermes Agent (NousResearch) — pinned by commit SHA per the dependency policy.
 ARG HERMES_AGENT_REF=e5e2fb8b2dbe1cae85aa5ad6ce45aef376016e43
 ARG NUSHELL_VERSION=0.116.1
@@ -106,7 +109,7 @@ ARG KACHE_VERSION=v0.28.1
 # different version, pnpm downloads and runs that one (v11 `pmOnFail=download`
 # default; `manage-package-manager-versions` in v10) over the same registry
 # egress a dependency install already needs.
-ARG PNPM_VERSION=11.28.9
+ARG PNPM_VERSION=11.28.10
 
 # ── kubectl ──────────────────────────────────────────────────────────────────
 RUN set -eux; \
@@ -157,7 +160,7 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
       "@openai/codex@${CODEX_VERSION}" \
       "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
       "pnpm@${PNPM_VERSION}" \
-      agent-browser@0.39.4 \
+      agent-browser@0.41.2 \
     && find /usr/lib/node_modules -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && codex --version | grep -F "${CODEX_VERSION}" \
@@ -186,8 +189,8 @@ ENV HERMES_PYTHON=/opt/hermes/bin/python3
 
 # ── agent-browser system deps (must run as root before USER agent) ───────────
 # Chrome for Testing doesn't provide Linux ARM64 builds; fall back to system chromium
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+RUN --mount=type=cache,id=sandbox-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=sandbox-apt-lib,target=/var/lib/apt,sharing=locked \
     if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
       apt-get update && apt-get install -y --no-install-recommends \
         libxcb-shm0 libx11-xcb1 libx11-6 libxcb1 libxext6 libxrandr2 \
@@ -207,11 +210,11 @@ WORKDIR /home/agent
 
 ENV PATH="/home/agent/.cargo/bin:/home/agent/.local/bin:/home/agent/.foundry/bin:/home/agent/.bun/bin:${PATH}"
 
-ARG FOUNDRY_VERSION=v1.8.6
-ARG AMP_CLI_VERSION=0.0.1793203246-g5eab6d
+ARG FOUNDRY_VERSION=v1.9.0
+ARG AMP_CLI_VERSION=0.0.1793829508-g91ac5b
 ARG MANIM_VERSION=0.22.1
 ARG BUN_VERSION=bun-v1.4.4
-ARG OMP_VERSION=18.13.3
+ARG OMP_VERSION=18.16.0
 
 # ── Agent-scoped toolchains ─────────────────────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -273,11 +276,11 @@ RUN set -eux; \
     amp --version >/dev/null
 
 # ── agent-browser: download Chrome binary (runs as agent, deps already installed) ─
-# Pinned to the Chrome for Testing Beta build because Stable (156) is affected by
-# CVE-2026-121030, -121035, -121071 and -121189 (fixed in 157.0.8103.38). Switch
-# back to `agent-browser install` once CfT Stable is at or above 157.0.8103.38.
+# Pinned to Chrome for Testing Stable 157.0.8103.78, which fixes the Skia RCE
+# CVE-2026-126846 (and the earlier 157.0.8103.50 fix for CVE-2026-125350 and
+# 157.0.8103.38 fixes for CVE-2026-121030, -121035, -121071 and -121189).
 # agent-browser discovers the browser at ~/.agent-browser/browsers/chrome-<version>.
-ARG CHROME_FOR_TESTING_VERSION=158.0.8127.2
+ARG CHROME_FOR_TESTING_VERSION=157.0.8103.78
 RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
       set -eux; \
       dest="$HOME/.agent-browser/browsers/chrome-${CHROME_FOR_TESTING_VERSION}"; \
@@ -341,6 +344,9 @@ RUN rm -f /etc/sudoers.d/agent
 RUN install -d -m 0755 /etc/centaur /opt/centaur \
     && install -d -o 1001 -g 1001 -m 0700 /tmp/downloads
 COPY --link centaur_sdk/ /opt/centaur/centaur_sdk/
+# Tool runs write bytecode (see install_tool_shims.py tool_env), but the SDK is
+# root-owned, so compile it here rather than on every tool call.
+RUN python3 -m compileall -q /opt/centaur/centaur_sdk
 COPY --link --chmod=0755 services/sandbox/git-hooks/ /opt/centaur/git-hooks/
 COPY --link --chown=1001:1001 tools/ /opt/centaur/tools/
 COPY --link --chmod=644 services/sandbox/codex-auth.json /etc/centaur/codex-auth.default.json
@@ -356,6 +362,10 @@ COPY --link --chmod=755 services/sandbox/centaur_tool_host.py /usr/local/bin/cen
 COPY --link --chmod=755 services/sandbox/compose_system_prompt.py /usr/local/bin/compose-system-prompt
 COPY --link --chmod=755 services/sandbox/repo_cache_sync.py /usr/local/bin/repo-cache-sync
 COPY --link --chmod=755 services/sandbox/repo_cache_watch.py /usr/local/bin/repo-cache-watch
+COPY --link --chmod=755 services/sandbox/configure_codex_models.py /usr/local/bin/configure-codex-models
+# Codex's generic base prompt (Apache-2.0, vendored from openai/codex
+# rust-v0.166.0 codex-rs/models-manager/prompt.md) for custom catalog models.
+COPY --link --chmod=644 services/sandbox/codex-base-instructions.md /etc/centaur/codex-base-instructions.md
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
 COPY --link --chown=1001:1001 --from=harness-server-build /home/agent/harness-server/bin/harness-server /home/agent/.local/bin/harness-server
 
