@@ -175,7 +175,7 @@ overlay; the release chart already contains the immutable image references:
 
 ```sh
 COMMIT_SHA=0123456789abcdef0123456789abcdef01234567
-CHART_VERSION=0.1.205
+CHART_VERSION=0.1.213
 helm upgrade --install centaur \
   oci://ghcr.io/sigp/centaur/charts/centaur \
   --version "${CHART_VERSION}-sigp-${COMMIT_SHA::7}" \
