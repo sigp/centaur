@@ -513,16 +513,31 @@ api-rs as `SESSION_SANDBOX_HOST_USERS` and
 `SESSION_SANDBOX_CONTAINER_SECURITY_CONTEXT`. The former sets the sandbox
 Pod's `hostUsers`; the latter accepts a Kubernetes `SecurityContext` for the
 agent container. Neither changes the paired iron-proxy pod, and the container
-setting does not change bootstrap init containers. Defaults omit both fields.
+setting does not change bootstrap init containers. `hostUsers` is omitted by
+default. The container setting defaults to the agent image's user, with no
+privilege escalation, no capabilities and the runtime's default seccomp
+profile:
 
-For example, request an isolated Pod user namespace and a non-root agent:
+```yaml
+sandbox:
+  containerSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1001
+    runAsGroup: 1001
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+    seccompProfile:
+      type: RuntimeDefault
+```
+
+Keys you set merge into this default. A sandbox image whose agent runs as
+another user needs its own `runAsUser` and `runAsGroup`, and `null` omits the
+security context. For example, also request an isolated Pod user namespace:
 
 ```yaml
 sandbox:
   hostUsers: false
-  containerSecurityContext:
-    runAsNonRoot: true
-    runAsUser: 1001
 ```
 
 The cluster's Kubernetes version, container runtime, and volume filesystems
@@ -537,8 +552,9 @@ These Pod settings are immutable. Before enabling reuse, api-rs stops retained
 sandboxes whose user namespace or agent security context differs from the
 configured profile, using the same reconciliation as ServiceAccount changes.
 This includes warm pods and active sessions, and applies when reverting a
-profile as well. Schedule these changes after active turns finish. Leaving
-both options unset preserves existing default sandboxes.
+profile as well. Schedule these changes after active turns finish, including
+the first upgrade to a chart with this default, which stops sandboxes created
+without a security context.
 
 ### Use an External PostgreSQL
 

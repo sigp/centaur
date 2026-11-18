@@ -326,10 +326,23 @@ sandbox:
   # null omits hostUsers and preserves the Kubernetes default.
   hostUsers: null
   # Kubernetes SecurityContext for the agent container only. Bootstrap init
-  # containers and iron-proxy are unaffected. procMount: Unmasked requires
-  # hostUsers: false. Changing either option drains incompatible retained
-  # sandbox pods at api-rs startup, including warm and active pods.
-  containerSecurityContext: {}
+  # containers and iron-proxy are unaffected. The default runs the agent image's
+  # agent user (1001) with no privilege escalation, no capabilities and the
+  # runtime's default seccomp profile, as the security docs describe. Keys you
+  # set merge into it; an image whose agent runs as another user needs its own
+  # runAsUser and runAsGroup, and null omits the context. procMount: Unmasked
+  # requires hostUsers: false. Changing either option drains incompatible
+  # retained sandbox pods at api-rs startup, including warm and active pods.
+  containerSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1001
+    runAsGroup: 1001
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
   tolerations: []
   # - key: centaur.ai/sandbox
   #   operator: Exists
