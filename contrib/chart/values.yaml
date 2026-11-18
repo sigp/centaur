@@ -1331,6 +1331,27 @@ networkPolicy:
   enabled: true
   ingressSourceNamespaces: []
   apiIngressSourceNamespaces: []
+  # Pods in other namespaces that call api-rs or the Console directly, such as
+  # an application that manages principals through the Console API. Each entry
+  # names a namespace (or a namespaceSelector) and may narrow it with a
+  # podSelector; without one, every pod in the namespace is admitted.
+  apiIngressSources: []
+  consoleIngressSources: []
+  #   - namespace: my-app
+  #     podSelector:
+  #       matchLabels:
+  #         app.kubernetes.io/name: my-app
+  # In-cluster destinations every iron-proxy may reach, besides the control
+  # plane, its database and public addresses: for example a model gateway in
+  # another namespace that sandboxes call through their proxy. Entries have
+  # the shape of observabilityEgress.destinations.
+  ironProxyEgress: []
+  #   - namespace: my-app
+  #     podSelector:
+  #       matchLabels:
+  #         app.kubernetes.io/name: my-app
+  #     ports:
+  #       - port: 8080
   ingressControllerNamespaces:
     - kube-system
   # Port the kubernetes.default ClusterIP forwards to for the API server. The

@@ -215,6 +215,9 @@ spec:
             matchLabels:
               kubernetes.io/metadata.name: {{ . | quote }}
 {{- end }}
+{{- range $index, $source := .Values.networkPolicy.apiIngressSources }}
+        {{- include "centaur.namespacedPeer" (dict "peer" $source "path" (printf "networkPolicy.apiIngressSources[%d]" $index)) | nindent 8 }}
+{{- end }}
       ports:
         - protocol: TCP
           port: {{ .Values.apiRs.port }}
@@ -250,6 +253,37 @@ spec:
         - protocol: TCP
           port: {{ .Values.proxySync.port }}
 ---
+{{- if .Values.networkPolicy.ironProxyEgress }}
+# In-cluster destinations every iron-proxy may reach for its sandbox, besides
+# the control plane, the database and the public addresses api-rs's
+# per-sandbox policies allow.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-proxy-egress
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      centaur.ai/iron-proxy: "true"
+  policyTypes:
+    - Egress
+  egress:
+{{- range $index, $destination := .Values.networkPolicy.ironProxyEgress }}
+{{- if not $destination.ports }}
+{{- fail (printf "networkPolicy.ironProxyEgress[%d].ports must contain at least one port" $index) }}
+{{- end }}
+    - to:
+        {{- include "centaur.namespacedPeer" (dict "peer" $destination "path" (printf "networkPolicy.ironProxyEgress[%d]" $index)) | nindent 8 }}
+      ports:
+{{- range $portIndex, $port := $destination.ports }}
+        - protocol: {{ default "TCP" $port.protocol }}
+          port: {{ required (printf "networkPolicy.ironProxyEgress[%d].ports[%d].port is required" $index $portIndex) $port.port }}
+{{- end }}
+{{- end }}
+---
+{{- end }}
 {{- if .Values.networkPolicy.observabilityEgress.enabled }}
 {{- if not .Values.networkPolicy.observabilityEgress.destinations }}
 {{- fail "networkPolicy.observabilityEgress.destinations must contain at least one destination when networkPolicy.observabilityEgress.enabled is true" }}

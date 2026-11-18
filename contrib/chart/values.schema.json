@@ -811,6 +811,60 @@
           "type": "array",
           "items": { "type": "string" }
         },
+        "apiIngressSources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "namespace": { "type": "string" },
+              "namespaceSelector": { "type": "object" },
+              "podSelector": { "type": "object" }
+            }
+          }
+        },
+        "consoleIngressSources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "namespace": { "type": "string" },
+              "namespaceSelector": { "type": "object" },
+              "podSelector": { "type": "object" }
+            }
+          }
+        },
+        "ironProxyEgress": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "namespace": { "type": "string" },
+              "namespaceSelector": { "type": "object" },
+              "podSelector": { "type": "object" },
+              "ports": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "port": {
+                      "oneOf": [
+                        { "type": "integer" },
+                        { "type": "string" }
+                      ]
+                    },
+                    "protocol": {
+                      "type": "string",
+                      "enum": ["TCP", "UDP", "SCTP"]
+                    }
+                  },
+                  "required": ["port"]
+                }
+              }
+            },
+            "required": ["ports"]
+          }
+        },
         "ingressControllerNamespaces": {
           "type": "array",
           "items": { "type": "string" }

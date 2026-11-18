@@ -105,6 +105,25 @@ the internet rule api-rs gives each iron-proxy; keep the two lists in step.
       - 240.0.0.0/4
 {{- end -}}
 
+{{/*
+NetworkPolicy peer in another namespace: the namespace by name or by
+namespaceSelector, narrowed by an optional podSelector (a pod must match
+both). .peer is the entry and .path names it in error messages.
+*/}}
+{{- define "centaur.namespacedPeer" -}}
+- namespaceSelector:
+{{- if .peer.namespaceSelector }}
+{{ toYaml .peer.namespaceSelector | indent 4 }}
+{{- else }}
+    matchLabels:
+      kubernetes.io/metadata.name: {{ required (printf "%s.namespace is required when namespaceSelector is unset" .path) .peer.namespace | quote }}
+{{- end }}
+{{- with .peer.podSelector }}
+  podSelector:
+{{ toYaml . | indent 4 }}
+{{- end }}
+{{- end -}}
+
 {{- define "centaur.componentName" -}}
 {{- printf "%s-%s" (include "centaur.fullname" .root) .component | trunc 63 | trimSuffix "-" -}}
 {{- end -}}

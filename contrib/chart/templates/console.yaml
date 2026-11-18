@@ -368,6 +368,9 @@ spec:
               kubernetes.io/metadata.name: {{ . | quote }}
 {{- end }}
 {{- end }}
+{{- range $index, $source := .Values.networkPolicy.consoleIngressSources }}
+        {{- include "centaur.namespacedPeer" (dict "peer" $source "path" (printf "networkPolicy.consoleIngressSources[%d]" $index)) | nindent 8 }}
+{{- end }}
       ports:
         - protocol: TCP
           port: {{ $console.service.httpPort }}
