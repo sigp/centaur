@@ -79,6 +79,32 @@ the database endpoint can resolve to.
 {{- end -}}
 {{- end -}}
 
+{{/*
+NetworkPolicy peer for public IPv4 addresses: everything except the private,
+shared, loopback, link-local and other reserved ranges. It grants the same
+addresses as public_ipv4_peer in crates/centaur-sandbox-agent-k8s/src/iron_proxy.rs,
+the internet rule api-rs gives each iron-proxy; keep the two lists in step.
+*/}}
+{{- define "centaur.publicIPv4Peer" -}}
+- ipBlock:
+    cidr: 0.0.0.0/0
+    except:
+      - 0.0.0.0/8
+      - 10.0.0.0/8
+      - 100.64.0.0/10
+      - 127.0.0.0/8
+      - 169.254.0.0/16
+      - 172.16.0.0/12
+      - 192.0.0.0/24
+      - 192.0.2.0/24
+      - 192.168.0.0/16
+      - 198.18.0.0/15
+      - 198.51.100.0/24
+      - 203.0.113.0/24
+      - 224.0.0.0/4
+      - 240.0.0.0/4
+{{- end -}}
+
 {{- define "centaur.componentName" -}}
 {{- printf "%s-%s" (include "centaur.fullname" .root) .component | trunc 63 | trimSuffix "-" -}}
 {{- end -}}

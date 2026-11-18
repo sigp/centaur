@@ -126,10 +126,10 @@ spec:
 # Python workflow-host sandboxes (centaur.ai/component=workflow-run) are spawned
 # by api-rs, so the per-sandbox egress policy api-rs renders already covers their
 # proxy, the control plane, and DNS. The host process additionally talks to
-# Postgres directly (DATABASE_URL) and may make direct outbound HTTPS calls
-# (mirroring api-rs), neither of which the per-sandbox policy grants -- without
-# this the host fails to start with ECONNREFUSED to Postgres under any enforcing
-# CNI (the default-deny denies all egress).
+# Postgres directly (DATABASE_URL) and may make direct outbound HTTPS calls,
+# neither of which the per-sandbox policy grants -- without this the host fails
+# to start with ECONNREFUSED to Postgres under any enforcing CNI (the
+# default-deny denies all egress).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -144,8 +144,12 @@ spec:
     - Egress
   egress:
     {{- include "centaur.postgresEgress" . | nindent 4 }}
-    # Trusted workflow code may make direct outbound HTTPS calls (mirrors api-rs).
-    - ports:
+    # Trusted workflow code may make direct outbound HTTPS calls, to public
+    # addresses only. The host runs in a sandbox pod, so like that sandbox's
+    # iron-proxy it must not reach the cluster's pods, nodes or private network.
+    - to:
+        {{- include "centaur.publicIPv4Peer" . | nindent 8 }}
+      ports:
         - protocol: TCP
           port: 443
 ---
