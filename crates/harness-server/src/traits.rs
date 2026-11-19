@@ -33,6 +33,9 @@ pub struct ThreadState {
     pub thread_key: Option<String>,
     pub completed_turns: Vec<Turn>,
     pub process: Option<HarnessChild>,
+    /// A harness process started before the first turn (see
+    /// [`HarnessServer::start_before_first_turn`]); the first turn adopts it.
+    pub ready_process: Option<HarnessChild>,
     pub thread_started_sent: bool,
 }
 
@@ -81,6 +84,13 @@ pub trait HarnessServer {
     /// the process with the new model. Off by default: the process keeps the
     /// model it started with.
     fn restart_on_model_change(&self) -> bool {
+        false
+    }
+    /// Whether the blocks server starts the harness process when it starts,
+    /// before any turn arrives, so a warm sandbox's first turn does not wait
+    /// for the harness to load. Only for harnesses whose process does not
+    /// depend on the thread until [`Self::on_process_start`]. Off by default.
+    fn start_before_first_turn(&self) -> bool {
         false
     }
     /// Checks a non-empty model before a process starts with it, returning a
@@ -144,6 +154,7 @@ pub trait HarnessServer {
             thread_key: None,
             completed_turns: Vec::new(),
             process: None,
+            ready_process: None,
             thread_started_sent: false,
         }
     }

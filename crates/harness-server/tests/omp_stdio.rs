@@ -291,6 +291,23 @@ fn startup_renders_final_text_and_reasoning_restores_default() {
 }
 
 #[test]
+fn omp_starts_before_the_first_turn_and_the_turn_uses_it() {
+    let mut server = Server::new(&[]);
+    let argv = server.dir.join("argv");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !argv.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "omp did not start before the first turn"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
+    assert_eq!(std::fs::read_to_string(&argv).unwrap().lines().count(), 1);
+    assert_eq!(server.commands()[0]["type"], "negotiate_protocol");
+}
+
+#[test]
 fn recorded_tools_and_thinking_project_to_distinct_complete_items() {
     let mut server = Server::new(&[]);
     for scenario in ["tool", "thinking_tool"] {

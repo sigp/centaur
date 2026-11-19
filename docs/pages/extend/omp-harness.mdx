@@ -44,3 +44,7 @@ is no longer available, so the thread's turns fail until it names one.
 Turns run at the `high` thinking level unless `-rsn <level>` sets one for that
 turn (`none` turns thinking off). OMP clamps the level to the model's capabilities.
 A turn without an override restores `high`, including after a session resumes.
+
+OMP takes seconds to load. In a sandbox, harness-server starts it as the
+sandbox starts, so a warm sandbox's first message does not wait for it; OMP
+rereads the workspace `AGENTS.md` when that message opens its session.

@@ -150,6 +150,14 @@ impl HarnessServer for OmpHarness {
         true
     }
 
+    /// OMP takes seconds to load, longer when several sandboxes start at once.
+    /// Nothing before open_session depends on the thread, and open_session
+    /// rereads the workspace AGENTS.md, so a prompt the first turn recomposes
+    /// still applies.
+    fn start_before_first_turn(&self) -> bool {
+        true
+    }
+
     fn validate_model(&self, model: &str) -> std::result::Result<(), String> {
         split_model(model).map(|_| ()).ok_or_else(|| {
             format!("unsupported model `{model}` for OMP: expected provider/modelId")

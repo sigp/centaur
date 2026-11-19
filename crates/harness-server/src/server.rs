@@ -69,6 +69,14 @@ pub fn run_blocks_server(kind: HarnessKind) -> Result<()> {
 pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
     let mut stdout = io::stdout().lock();
     let mut state = initial_blocks_thread_state(harness)?;
+    if harness.start_before_first_turn() {
+        // A warm sandbox waits here until a thread claims it; loading the
+        // harness meanwhile keeps that wait out of the first turn.
+        match spawn_harness_process(harness, &state) {
+            Ok(process) => state.ready_process = Some(process),
+            Err(error) => eprintln!("harness-server: starting the harness early failed: {error}"),
+        }
+    }
     let (command_tx, command_rx) = mpsc::channel();
     let (request_tx, request_rx) = mpsc::channel();
     let turn_active = Arc::new(AtomicBool::new(false));
@@ -1029,6 +1037,7 @@ fn resumed_thread_state<H: HarnessServer>(
         thread_key: None,
         completed_turns: Vec::new(),
         process: None,
+        ready_process: None,
         thread_started_sent: false,
     })
 }
@@ -1453,6 +1462,35 @@ fn ensure_harness_process<H: HarnessServer>(harness: &H, state: &mut ThreadState
     }
     state.process = None;
 
+    let mut process = match take_ready_process(state) {
+        Some(mut ready) => {
+            // It started before the model was known; on_process_start sets it.
+            ready.model = state.model.clone();
+            ready
+        }
+        None => spawn_harness_process(harness, state)?,
+    };
+    if let Err(error) = harness.on_process_start(state, &mut process) {
+        if matches!(error, HarnessServerError::UnknownModel { .. }) {
+            state.model = previous_model.unwrap_or_else(|| harness.default_model());
+        }
+        return Err(error);
+    }
+    state.process = Some(process);
+    Ok(())
+}
+
+/// The process started before the first turn, if it is still running. One
+/// that has exited is dropped, and the turn starts a fresh process.
+fn take_ready_process(state: &mut ThreadState) -> Option<HarnessChild> {
+    let mut ready = state.ready_process.take()?;
+    matches!(ready.child.try_wait(), Ok(None)).then_some(ready)
+}
+
+fn spawn_harness_process<H: HarnessServer>(
+    harness: &H,
+    state: &ThreadState,
+) -> Result<HarnessChild> {
     let mut command = harness.command_for_turn(state);
     let mut child = command
         .stdin(Stdio::piped())
@@ -1497,21 +1535,13 @@ fn ensure_harness_process<H: HarnessServer>(harness: &H, state: &mut ThreadState
         }
     });
 
-    let mut process = HarnessChild {
+    Ok(HarnessChild {
         child,
         stdin,
         stdout: stdout_rx,
         model: state.model.clone(),
         reasoning_effort: None,
-    };
-    if let Err(error) = harness.on_process_start(state, &mut process) {
-        if matches!(error, HarnessServerError::UnknownModel { .. }) {
-            state.model = previous_model.unwrap_or_else(|| harness.default_model());
-        }
-        return Err(error);
-    }
-    state.process = Some(process);
-    Ok(())
+    })
 }
 
 fn request_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result<T> {
