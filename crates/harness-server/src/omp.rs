@@ -31,6 +31,10 @@ use crate::{
 };
 
 const DEFAULT_THINKING_LEVEL: &str = "high";
+/// OMP's side-task model roles (skill-description compression, titles, plans).
+/// Unset, OMP picks Anthropic models for them, which fail on every session in
+/// a deployment without an Anthropic key.
+const SIDE_MODEL_ROLE_ENVS: [&str; 3] = ["PI_SMOL_MODEL", "PI_SLOW_MODEL", "PI_PLAN_MODEL"];
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REASSEMBLED_BYTES: usize = 64 * 1024 * 1024;
 const CHUNK_BYTES: usize = 256 * 1024;
@@ -78,6 +82,11 @@ impl HarnessServer for OmpHarness {
             && let Some(proxy) = env::var_os("HTTPS_PROXY").or_else(|| env::var_os("https_proxy"))
         {
             command.env("PI_PROXY_ANTHROPIC", proxy);
+        }
+        for (role, model) in
+            side_model_roles(&self.default_model(), |role| env::var_os(role).is_some())
+        {
+            command.env(role, model);
         }
         command
     }
@@ -518,6 +527,21 @@ fn image(input: &UserInput) -> Option<Value> {
     Some(json!({"type": "image", "data": data, "mimeType": mime}))
 }
 
+/// The deployment's model for each side-task role the environment leaves unset.
+fn side_model_roles(
+    default_model: &str,
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, String)> {
+    if default_model.trim().is_empty() {
+        return Vec::new();
+    }
+    SIDE_MODEL_ROLE_ENVS
+        .into_iter()
+        .filter(|role| !is_set(role))
+        .map(|role| (role, default_model.to_string()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +633,18 @@ mod tests {
         let mut oversized = parts[0].clone();
         oversized["byteLength"] = json!(MAX_REASSEMBLED_BYTES + 1);
         assert!(OmpEventNormalizer::default().frame(oversized).is_err());
+    }
+
+    #[test]
+    fn side_model_roles_default_to_the_deployment_model_unless_set() {
+        let roles = side_model_roles("fireworks/flash", |role| role == "PI_SLOW_MODEL");
+        assert_eq!(
+            roles,
+            vec![
+                ("PI_SMOL_MODEL", "fireworks/flash".to_string()),
+                ("PI_PLAN_MODEL", "fireworks/flash".to_string()),
+            ]
+        );
+        assert!(side_model_roles("", |_| false).is_empty());
     }
 }
