@@ -61,6 +61,31 @@ if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
     export CENTAUR_PERSISTENT_STATE=1
 fi
 
+# ── Network settings for omp's Python eval ────────────────────────────────────
+# omp starts its Python eval runner with an allowlist of variables that leaves
+# out the proxy and CA settings (oh-my-pi src/eval/py/runtime.ts). The sandbox
+# reaches the internet only through iron-proxy and a direct connection is
+# dropped without a reply, so every request from eval, cargo and git included,
+# hung until it timed out. omp runs eval with this interpreter, which restores
+# the variables api-rs sets for iron-proxy (proxy_env in iron_proxy.rs).
+if [ -n "${HTTPS_PROXY:-}" ] && command -v python3 >/dev/null; then
+    mkdir -p "$HOME_DIR/.config/centaur"
+    {
+        echo '#!/bin/bash'
+        for _proxy_var in FIREWALL_HOST FIREWALL_PROXY_PORT HTTP_PROXY HTTPS_PROXY http_proxy https_proxy \
+            NO_PROXY no_proxy NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE CURL_CA_BUNDLE SSL_CERT_FILE GIT_SSL_CAINFO; do
+            if [ -n "${!_proxy_var:-}" ]; then
+                printf 'export %s=%q\n' "$_proxy_var" "${!_proxy_var}"
+            fi
+        done
+        printf 'exec %q "$@"\n' "$(command -v python3)"
+    } > "$HOME_DIR/.config/centaur/eval-python"
+    chmod 755 "$HOME_DIR/.config/centaur/eval-python"
+    printf 'python:\n  interpreter: %s\n' "$HOME_DIR/.config/centaur/eval-python" > "$HOME_DIR/.config/centaur/omp.yml"
+    export CENTAUR_OMP_CONFIG="$HOME_DIR/.config/centaur/omp.yml"
+    unset _proxy_var
+fi
+
 mkdir -p "$HOME_DIR/.config/amp"
 
 # ── Write harness configs (no MCP — adds ~10s startup overhead) ───────────────

@@ -71,6 +71,10 @@ impl HarnessServer for OmpHarness {
         let bin = env::var("CENTAUR_OMP_BIN").unwrap_or_else(|_| "omp".to_string());
         let mut command = ProcessCommand::new(bin);
         command.args(["--mode", "rpc", "--no-ui"]);
+        // Settings a deployment layers over OMP's own config.yml.
+        if let Some(config) = env::var_os("CENTAUR_OMP_CONFIG").filter(|path| !path.is_empty()) {
+            command.arg("--config").arg(config);
+        }
         // harness-server reports this turn's telemetry; OMP would otherwise
         // export its own duplicate spans to the sandbox's OTLP endpoint.
         command.env("OTEL_SDK_DISABLED", "true");
