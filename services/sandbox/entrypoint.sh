@@ -61,6 +61,13 @@ if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
     export CENTAUR_PERSISTENT_STATE=1
 fi
 
+# ── Deployment guidance for the agent's prompt ────────────────────────────────
+# The chart passes overlay.systemPrompt as CENTAUR_AGENTS_OVERLAY;
+# compose-system-prompt appends ~/AGENTS_OVERLAY.md right after the root prompt.
+if [ -n "${CENTAUR_AGENTS_OVERLAY:-}" ]; then
+    printf '%s\n' "$CENTAUR_AGENTS_OVERLAY" > "$HOME_DIR/AGENTS_OVERLAY.md"
+fi
+
 # ── Network settings for omp's Python eval ────────────────────────────────────
 # omp starts its Python eval runner with an allowlist of variables that leaves
 # out the proxy and CA settings (oh-my-pi src/eval/py/runtime.ts). The sandbox

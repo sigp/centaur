@@ -614,6 +614,10 @@ spec:
 {{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_TELEMETRY_CAPTURE_TOOL_TRACES") }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_TELEMETRY_CAPTURE_TOOL_TRACES" "value" (.Values.sandbox.telemetry.captureToolTraces | toString)) }}
 {{- end }}
+{{- if and .Values.overlay.systemPrompt (not (hasKey .Values.sandbox.extraEnv "CENTAUR_AGENTS_OVERLAY")) }}
+{{- /* The sandbox writes it to ~/AGENTS_OVERLAY.md, which its prompt composer appends after the root prompt. */}}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_AGENTS_OVERLAY" "value" (.Values.overlay.systemPrompt | trim)) }}
+{{- end }}
 {{- range $k, $v := .Values.sandbox.extraEnv }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" $k "value" ($v | toString)) }}
 {{- end }}
