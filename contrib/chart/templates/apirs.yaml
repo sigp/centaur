@@ -486,7 +486,7 @@ spec:
             - name: KUBERNETES_IRON_PROXY_IMAGE_PULL_POLICY
               value: {{ .Values.ironProxy.image.pullPolicy | quote }}
             - name: KUBERNETES_IRON_PROXY_UPSTREAM_DENY_CIDRS
-              value: {{ join "," .Values.ironProxy.upstreamDenyCidrs | quote }}
+              value: {{ append .Values.ironProxy.upstreamDenyCidrs .Values.ironProxy.clusterPodCidr | join "," | quote }}
             # Per-sandbox iron-proxies forward the tool-server sidecar's pool to
             # the core database; allow them to reach it and no other in-cluster
             # Postgres.

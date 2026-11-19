@@ -137,6 +137,7 @@
     },
     "ironProxy": {
       "type": "object",
+      "required": ["clusterPodCidr"],
       "properties": {
         "service": {
           "type": "object",
@@ -149,6 +150,7 @@
         },
         "secretSource": { "type": "string" },
         "secretTtl": { "type": "string" },
+        "clusterPodCidr": { "type": "string", "minLength": 1 },
         "upstreamDenyCidrs": {
           "type": "array",
           "items": { "type": "string" }
