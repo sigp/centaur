@@ -283,6 +283,7 @@ export async function forwardToSessionApi(
         input.threadId,
         input.executeMessage!,
         input.model,
+        input.executeContextMessages,
         input.reasoning,
         input.provider,
         input.metadataModel,
@@ -324,6 +325,7 @@ export async function executeSessionTurn(
         input.threadId,
         input.executeMessage!,
         input.model,
+        input.executeContextMessages,
         input.reasoning,
         input.provider,
         input.metadataModel,
@@ -706,6 +708,7 @@ async function executeSession(
   threadId: string,
   message: MattermostbotApiMessage,
   model?: string,
+  contextMessages?: MattermostbotApiMessage[],
   reasoning?: string,
   provider?: string,
   metadataModel?: string,
@@ -728,6 +731,7 @@ async function executeSession(
       model,
       reasoning,
       provider,
+      contextMessages,
       contextPreamble,
       proactiveContext,
     ),
@@ -895,12 +899,13 @@ export function toCodexInputLines(
   model?: string,
   reasoning?: string,
   provider?: string,
+  contextMessages?: MattermostbotApiMessage[],
   contextPreamble?: string,
   proactiveContext?: string,
 ): string[] {
   const staged = new Map<MattermostbotApiAttachment, string>();
   const lines: string[] = [];
-  for (const attachment of message.attachments) {
+  for (const attachment of executableAttachments(message, contextMessages)) {
     if (!attachment.dataBase64) continue;
     const inlineLine = toCodexInputLineWithStaged(
       message,
@@ -909,6 +914,7 @@ export function toCodexInputLines(
       model,
       reasoning,
       provider,
+      contextMessages,
       contextPreamble,
       proactiveContext,
     );
@@ -930,6 +936,7 @@ export function toCodexInputLines(
       model,
       reasoning,
       provider,
+      contextMessages,
       contextPreamble,
       proactiveContext,
     ),
@@ -944,12 +951,35 @@ function toCodexInputLineWithStaged(
   model?: string,
   reasoning?: string,
   provider?: string,
+  contextMessages?: MattermostbotApiMessage[],
   contextPreamble?: string,
   proactiveContext?: string,
 ): string {
   const content: JsonValue[] = [];
   if (contextPreamble?.trim()) {
     content.push({ type: "text", text: contextPreamble });
+  } else {
+    const threadContext = mattermostThreadContext(message, contextMessages);
+    if (threadContext) {
+      content.push({ type: "text", text: threadContext });
+    }
+  }
+  for (const contextAttachment of mattermostThreadContextAttachments(
+    message,
+    contextMessages,
+  )) {
+    content.push({
+      type: "text",
+      text:
+        `Earlier Mattermost thread attachment from ${mattermostContextAuthor(contextAttachment.message)}: ` +
+        attachmentDescription(contextAttachment.attachment),
+    });
+    content.push(
+      codexAttachmentInput(
+        contextAttachment.attachment,
+        staged.get(contextAttachment.attachment),
+      ),
+    );
   }
   if (proactiveContext?.trim()) {
     content.push({ type: "text", text: proactiveContext });
@@ -1005,6 +1035,101 @@ function stagedAttachmentInputLines(
   }
   return lines;
 }
+
+function executableAttachments(
+  message: MattermostbotApiMessage,
+  contextMessages?: MattermostbotApiMessage[],
+): MattermostbotApiAttachment[] {
+  const attachments: MattermostbotApiAttachment[] = [];
+  for (const item of contextMessages ?? []) {
+    if (item.id === message.id) continue;
+    attachments.push(...item.attachments);
+  }
+  attachments.push(...message.attachments);
+  return attachments;
+}
+
+function mattermostThreadContext(
+  currentMessage: MattermostbotApiMessage,
+  contextMessages: MattermostbotApiMessage[] | undefined,
+): string | undefined {
+  const priorMessages = (contextMessages ?? []).filter(
+    (item) => item.id !== currentMessage.id,
+  );
+  if (priorMessages.length === 0) return undefined;
+
+  const lines = [
+    "# Mattermost Thread Context",
+    "",
+    "Earlier messages in this Mattermost thread, in chronological order:",
+  ];
+  for (const [index, item] of priorMessages.entries()) {
+    const author = mattermostContextAuthor(item);
+    const text = mattermostContextMessageText(item);
+    lines.push(
+      "",
+      `${index + 1}. ${author}:`,
+      indentMattermostContext(text || "[no text]"),
+    );
+  }
+  lines.push(
+    "",
+    "# Current Request",
+    "",
+    "The user message follows in the next content block.",
+    "---",
+  );
+  return lines.join("\n");
+}
+
+function mattermostThreadContextAttachments(
+  currentMessage: MattermostbotApiMessage,
+  contextMessages: MattermostbotApiMessage[] | undefined,
+): Array<{
+  attachment: MattermostbotApiAttachment;
+  message: MattermostbotApiMessage;
+}> {
+  const attachments: Array<{
+    attachment: MattermostbotApiAttachment;
+    message: MattermostbotApiMessage;
+  }> = [];
+  for (const item of contextMessages ?? []) {
+    if (item.id === currentMessage.id) continue;
+    for (const attachment of item.attachments) {
+      attachments.push({ attachment, message: item });
+    }
+  }
+  return attachments;
+}
+
+function mattermostContextAuthor(message: MattermostbotApiMessage): string {
+  const displayName =
+    message.author.fullName || message.author.userName || message.author.userId;
+  const userId =
+    message.author.userId && message.author.userId !== displayName
+      ? ` (${message.author.userId})`
+      : "";
+  const bot = message.author.isBot === true ? " bot" : "";
+  return `${displayName || "unknown"}${userId}${bot}`;
+}
+
+function mattermostContextMessageText(
+  message: MattermostbotApiMessage,
+): string {
+  const fields = [message.text.trim()];
+  for (const attachment of message.attachments) {
+    fields.push(attachmentDescription(attachment));
+  }
+  return fields.filter(Boolean).join("\n");
+}
+
+function indentMattermostContext(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => `   ${line}`)
+    .join("\n");
+}
+
 
 function codexInputContent(
   message: MattermostbotApiMessage,

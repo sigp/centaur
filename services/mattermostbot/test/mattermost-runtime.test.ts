@@ -3,7 +3,7 @@ import {
   createMattermostbot,
   mattermostHealthState,
 } from "../src/index";
-import { sessionMetadata } from "../src/session-api";
+import { sessionMetadata, toCodexInputLines } from "../src/session-api";
 import type {
   MattermostbotApiMessage,
   MattermostAdapterWithHealth,
@@ -80,5 +80,52 @@ describe("Mattermost runtime contracts", () => {
       value: { readyState: 1 },
     });
     expect((await bot.app.fetch(new Request("http://bot.test/health"))).status).toBe(200);
+  });
+
+  it("renders earlier human thread messages before a threaded mention", () => {
+    const earlierMessage: MattermostbotApiMessage = {
+      ...message,
+      author: {
+        fullName: "Bob",
+        isBot: false,
+        isMe: false,
+        userId: "user-2",
+        userName: "bob",
+      },
+      id: "post-earlier",
+      isMention: false,
+      raw: { id: "post-earlier", root_id: "root-1" },
+      text: "The deploy failed with ENOSPC.",
+      timestamp: "2026-01-01T00:01:00.000Z",
+    };
+    const currentMessage: MattermostbotApiMessage = {
+      ...message,
+      id: "post-reply",
+      raw: { id: "post-reply", root_id: "root-1" },
+      text: "@centaur can you try again?",
+      timestamp: "2026-01-01T00:02:00.000Z",
+    };
+
+    const lines = toCodexInputLines(
+      currentMessage,
+      currentMessage.threadId,
+      undefined,
+      undefined,
+      undefined,
+      [earlierMessage, currentMessage],
+    );
+
+    expect(lines.join("\n")).toContain("The deploy failed with ENOSPC.");
+    expect(lines.join("\n")).toContain("@centaur can you try again?");
+  });
+
+  it("leaves a first message in a new thread without context", () => {
+    const lines = toCodexInputLines(message, message.threadId);
+    const input = JSON.parse(lines[0]!) as {
+      message: { content: Array<{ type: string; text?: string }> };
+    };
+
+    expect(lines).toHaveLength(1);
+    expect(input.message.content).toEqual([{ type: "text", text: "hello" }]);
   });
 });

@@ -1159,8 +1159,10 @@ function pendingProactiveMessage(message: ChatMessage): PendingProactiveMessage 
 }
 
 function isMattermostThreadReply(message: ChatMessage): boolean {
-  const raw = message.raw as { root_id?: unknown } | null | undefined;
-  return typeof raw?.root_id === "string" && raw.root_id.length > 0;
+  const raw = message.raw as { id?: unknown; root_id?: unknown } | null | undefined;
+  const rootId = typeof raw?.root_id === "string" ? raw.root_id : "";
+  const postId = typeof raw?.id === "string" ? raw.id : message.id;
+  return Boolean(rootId && postId && rootId !== postId);
 }
 
 function compareProactiveMessages(
@@ -1325,8 +1327,14 @@ async function syncThreadMessageToSession(
   };
 
   try {
+    // A reply that starts an execution carries the thread's earlier messages
+    // into that execution, because the agent behind the thread may be new (its
+    // first start failed, or it was replaced) and could not see them otherwise.
+    const shouldRefreshThreadContext =
+      shouldStartExecution && isMattermostThreadReply(message);
     const includeContext =
-      shouldStartExecution && state.historyForwarded !== true;
+      shouldStartExecution &&
+      (state.historyForwarded !== true || shouldRefreshThreadContext);
     const refreshContext =
       (message.isMention === true || input.proactive === true) &&
       state.historyForwarded === true;
@@ -1474,9 +1482,10 @@ async function syncThreadMessageToSession(
     let messages: MattermostbotApiMessage[];
     if (includeContext || refreshContext) {
       try {
-        messages = refreshContext
-          ? await collectMentionContext(thread, message, options)
-          : await collectInitialContext(thread, message, options);
+        messages =
+          refreshContext || shouldRefreshThreadContext
+            ? await collectMentionContext(thread, message, options)
+            : await collectInitialContext(thread, message, options);
       } catch (error) {
         if (!refreshContext) {
           logger.error("mattermostbot_history_fetch_failed", {
@@ -1545,6 +1554,8 @@ async function syncThreadMessageToSession(
     const forwardInput: ForwardSessionInput = {
       afterEventId: lastEventId,
       conversationName,
+      executeContextMessages:
+        shouldStartExecution && includeContext ? messages : undefined,
       executeMessage: shouldStartExecution ? serialized : undefined,
       harnessType:
         shouldStartExecution &&

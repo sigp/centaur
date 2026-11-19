@@ -313,6 +313,8 @@ export type ForwardSessionInput = {
   /** Added before the execute message when an operator rule starts a turn. */
   proactiveContext?: string;
   contextPreamble?: string;
+  /** The thread's earlier messages, rendered ahead of the execute message. */
+  executeContextMessages?: MattermostbotApiMessage[];
   executionId?: string;
   executeMessage?: MattermostbotApiMessage;
   /** Rendered model metadata line for the successful execution reply. */
