@@ -16,12 +16,12 @@ name: sigp release
       - Cargo.lock
       - crates/**
       - services/api-rs/**
-      # The agent image copies the sandbox runtime, tools, workflows, and
-      # baked-in harness files below.
+      # The agent image copies the sandbox runtime, tools, workflows, Code Mode
+      # connectors, Python workflow host/SDK, and baked-in harness files below.
       - services/sandbox/**
       - tools/**
       - workflows/**
-      # The api-rs image installs the Python workflow host and SDK.
+      - connectors/**
       - services/workflow-python/**
       - centaur_sdk/**
       - contrib/chart/**
