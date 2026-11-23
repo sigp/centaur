@@ -359,7 +359,7 @@ importers:
         version: 2.1.0(chat@4.44.0(zod@4.6.7))(zod@4.6.7)
       hono:
         specifier: ^4.13.14
-        version: 4.13.16
+        version: 4.13.19
       pg:
         specifier: ^8.23.1
         version: 8.23.1
