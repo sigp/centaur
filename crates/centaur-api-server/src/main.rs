@@ -3,7 +3,7 @@ mod args;
 
 use centaur_api_server::{
     ApiAuthConfig, AppState, build_router_with_app_state, partition_slack_external_team_ids,
-    warm_slack_public_channel_cache,
+    spawn_scheduled_task_scheduler, warm_slack_public_channel_cache,
 };
 use centaur_session_runtime::SessionRuntime;
 use centaur_session_sqlx::PgSessionStore;
@@ -32,8 +32,13 @@ async fn main() -> Result<(), ServerError> {
         return result;
     }
 
-    let args = Args::parse();
+    let mut args = Args::parse();
+    info!(enabled = centaur_api_server::mcp_enabled(), "MCP endpoint");
     let api_auth = ApiAuthConfig::from_env()?;
+    let console_session = args.console_session_config()?;
+    // When api-rs serves the Console, iron-control calls go straight to the
+    // Console database instead of over the bearer API.
+    args.set_console_in_process(console_session.is_some());
     let listener = TcpListener::bind(args.server.bind_addr).await?;
     info!(
         bind_addr = %args.server.bind_addr,
@@ -43,6 +48,12 @@ async fn main() -> Result<(), ServerError> {
     let mut app_state = AppState::unready(api_auth);
     if let Some(pool) = args.console_db() {
         app_state = app_state.with_console_db(pool);
+    }
+    if let Some(pool) = args.console_write_db() {
+        app_state = app_state.with_console_write_db(pool);
+    }
+    if let Some(config) = console_session {
+        app_state = app_state.with_console_session(config);
     }
     let app = build_router_with_app_state(app_state.clone());
     warm_slack_public_channel_cache();
@@ -141,6 +152,11 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
         .with_session_principal_admission(args.session_principal_admission())
         .with_openai_session_title_generator_from_env();
     runtime = runtime.with_personas(args.persona_registry()?);
+    if centaur_api_server::mcp_enabled() {
+        let image = args.codemode_image();
+        info!(image = %image, "MCP Code Mode sandboxes enabled");
+        runtime = runtime.with_codemode(image);
+    }
     let sandbox_capacity_config = args.sandbox_capacity_config();
     if let Some(config) = sandbox_capacity_config {
         runtime = runtime.with_sandbox_capacity(config);
@@ -158,15 +174,20 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     let workflow_host_sandbox = args
         .workflow_host_sandbox_runtime(&iron_control.workflow_host_principal)
         .await?;
-    let workflows = Some(
-        WorkflowRuntime::new(
-            store,
-            runtime.clone(),
-            workflow_host_sandbox,
-            iron_control.workflow_principal_registrar,
-        )
-        .await?,
-    );
+    let workflows = WorkflowRuntime::new(
+        store,
+        runtime.clone(),
+        workflow_host_sandbox,
+        args.workflow_discovery_client()?,
+        iron_control.workflow_principal_registrar,
+    )
+    .await?;
+    // Console stores scheduled tasks; api-rs runs them.
+    match args.console_db() {
+        Some(console_db) => spawn_scheduled_task_scheduler(console_db, workflows.clone()),
+        None => warn!("Console database is not configured; scheduled tasks will not run"),
+    }
+    let workflows = Some(workflows);
 
     // Adopt executions orphaned by another control plane process
     // (deploy/crash): recover finished turns from recorded sandbox output,

@@ -32,6 +32,11 @@ cd "$(dirname "$0")/.."
 
 CLUSTER="${CENTAUR_E2E_CLUSTER:-centaur-e2e}"
 RELEASE=centaur # contrib/scripts/bootstrap-k8s-secrets.sh assumes this name
+NODE="${CLUSTER}-control-plane"
+# The node directory sandboxes mount (sandbox.reposPath in e2e/infra/values.yaml)
+# and the workflow directory under it that tests install workflow files into.
+REPOS_DIR=/var/lib/centaur-e2e/repos
+WORKFLOW_DIR="$REPOS_DIR/centaur-e2e/workflows"
 NAMESPACE=centaur
 SLACK_NAMESPACE=centaur-e2e-slack
 MODEL_NAMESPACE=centaur-e2e-model
@@ -58,7 +63,7 @@ case "$AUTH_MODE" in
   api_key | access_token) ;;
   *) echo "CENTAUR_E2E_AUTH_MODE must be api_key or access_token, not $AUTH_MODE" >&2; exit 2 ;;
 esac
-IMAGES=(api-rs:apiRs proxy-sync:proxySync token-broker:tokenBroker iron-proxy:ironProxy slackbotv2:slackbotv2 agent:sandbox console:console)
+IMAGES=(api-rs:apiRs proxy-sync:proxySync codemode:codemode token-broker:tokenBroker iron-proxy:ironProxy slackbotv2:slackbotv2 agent:sandbox console:console)
 
 export KUBECONFIG
 KUBECONFIG="$(mktemp)"
@@ -76,7 +81,8 @@ apply_stdin() {
 up() {
   if kind get clusters | grep -qx "$CLUSTER"; then
     use_cluster
-    if ! docker port "${CLUSTER}-control-plane" | grep -q '^30082/tcp'; then
+    if ! docker port "${CLUSTER}-control-plane" | grep -q '^30082/tcp' \
+      || [[ "$(kubectl get node "${CLUSTER}-control-plane" -o jsonpath='{.status.capacity.pods}')" -lt 250 ]]; then
       echo "cluster $CLUSTER predates e2e/infra/kind.yaml; run e2e/stack.sh down first" >&2
       exit 1
     fi
@@ -89,6 +95,8 @@ up() {
   # which is slow under load. resolv.conf is bind-mounted, so write in place.
   docker exec "${CLUSTER}-control-plane" sh -c \
     "grep -v '^search ' /etc/resolv.conf > /tmp/resolv.conf && cat /tmp/resolv.conf > /etc/resolv.conf"
+
+  docker exec "$NODE" mkdir -p "$WORKFLOW_DIR"
 
   kubectl -n kube-system create configmap coredns --from-file=Corefile=e2e/infra/Corefile \
     --dry-run=client -o yaml | apply_stdin
@@ -166,9 +174,13 @@ up() {
 # The NodePorts and the policy admitting them take a moment to start routing;
 # until then connections are reset, so wait before declaring the stack up.
 wait_for_test_access() {
+  # api-rs serves the Console, so the Console NodePort is probed with a Console
+  # page. `/login` is the server-rendered sign-in page, selected by the Host
+  # matching console.publicUrl (http://127.0.0.1:30082 in e2e/infra/values.yaml);
+  # api-rs has no Rails `/up` health route.
   for _ in $(seq 60); do
     if curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:30081/readyz 2> /dev/null &&
-      curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:30082/up 2> /dev/null &&
+      curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:30082/login 2> /dev/null &&
       timeout 2 bash -c '< /dev/tcp/127.0.0.1/30432' 2> /dev/null; then
       return 0
     fi
@@ -186,9 +198,12 @@ admit_external_team() {
 }
 
 # Stores the subscription access tokens as token-broker would after a refresh.
-# Without a refresh token token-broker never tries to refresh them.
+# Without a refresh token token-broker never tries to refresh them. The Console
+# itself is served by api-rs, so the Rails worker is the only Rails process left;
+# it shares the image, the DB env, and the ActiveRecord encryption keys, so
+# `bin/rails runner` runs there.
 seed_broker_credentials() {
-  local console="deploy/${RELEASE}-centaur-console"
+  local console="deploy/${RELEASE}-centaur-console-worker"
   until kubectl -n "$NAMESPACE" get "$console" > /dev/null 2>&1; do sleep 2; done
   kubectl -n "$NAMESPACE" rollout status "$console" --timeout=15m
   kubectl -n "$NAMESPACE" exec "$console" -- bin/rails runner "
@@ -242,7 +257,8 @@ deploy_model_server() {
 # cluster: the gateway authorizes the public half, and tests grant the private
 # half to the principals that may use it.
 deploy_ssh_gateway() {
-  docker build -q -t centaur-e2e-ssh-gateway:latest e2e/infra/ssh-gateway > /dev/null
+  docker build -q ${CENTAUR_BUILD_HTTP_PROXY:+--build-arg "http_proxy=$CENTAUR_BUILD_HTTP_PROXY"} \
+    -t centaur-e2e-ssh-gateway:latest e2e/infra/ssh-gateway > /dev/null
   kind load docker-image --name "$CLUSTER" centaur-e2e-ssh-gateway:latest
   issue_cert ssh-gateway workspace.ssh-gateway.test
 
@@ -277,12 +293,15 @@ deploy_fake_slack() {
 run_tests() {
   use_cluster
   remove_sandboxes
+  # Workflows installed by earlier runs would otherwise be discovered forever.
+  docker exec "$NODE" sh -c "mkdir -p '$WORKFLOW_DIR' && rm -f '$WORKFLOW_DIR'/*.py"
+  export E2E_KIND_NODE="$NODE" E2E_WORKFLOW_DIR="$WORKFLOW_DIR"
   local password
   password="$(kubectl -n "$NAMESPACE" get secret centaur-infra-env -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d)"
   export E2E_SLACK_URL=http://127.0.0.1:30443
   export E2E_MODEL_URL=http://127.0.0.1:30080
   export E2E_DATABASE_URL="postgres://tempo:${password}@127.0.0.1:30432/ai_v2"
-  # The console names its database after the Rails environment (contrib/chart/templates/console.yaml).
+  # The console names its database after the Rails environment (console.database.name, created by the Console worker).
   export E2E_IRON_CONTROL_DATABASE_URL="postgres://tempo:${password}@127.0.0.1:30432/iron_control_production"
   export E2E_API_URL=http://127.0.0.1:30081 E2E_API_KEY="$API_ADMIN_KEY"
   # The key api-rs administers the console with.

@@ -68,7 +68,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     && find /usr/local/lib/python3.12 /usr/lib/python3 -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
 # ── GitHub CLI + Node.js 24 (LTS) + Docker CLI + Google Cloud CLI (cached) ──
-ARG NODE_VERSION=24.22.2
+ARG NODE_VERSION=24.22.3
 RUN --mount=type=cache,id=sandbox-apt-cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,id=sandbox-apt-lib,target=/var/lib/apt,sharing=locked \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -94,14 +94,14 @@ RUN --mount=type=cache,id=sandbox-apt-cache,target=/var/cache/apt,sharing=locked
 RUN useradd -m -s /bin/bash -u 1001 agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/agent
 
-ARG CLAUDE_CODE_VERSION=2.1.318
+ARG CLAUDE_CODE_VERSION=2.1.325
 # Bumping CODEX_VERSION: refresh services/sandbox/codex-base-instructions.md
 # from openai/codex rust-v<version>/codex-rs/models-manager/prompt.md.
-ARG CODEX_VERSION=0.166.0
-ARG PI_CODING_AGENT_VERSION=1.5.0
+ARG CODEX_VERSION=0.171.0
+ARG PI_CODING_AGENT_VERSION=1.6.0
 # Hermes Agent (NousResearch) — pinned by commit SHA per the dependency policy.
 ARG HERMES_AGENT_REF=e5e2fb8b2dbe1cae85aa5ad6ce45aef376016e43
-ARG NUSHELL_VERSION=0.116.1
+ARG NUSHELL_VERSION=0.117.0
 ARG KUBECTL_VERSION=v1.37.2
 ARG KACHE_VERSION=v0.28.1
 # Bootstrap pnpm for agents working in JS monorepos. The exact baked version
@@ -109,7 +109,7 @@ ARG KACHE_VERSION=v0.28.1
 # different version, pnpm downloads and runs that one (v11 `pmOnFail=download`
 # default; `manage-package-manager-versions` in v10) over the same registry
 # egress a dependency install already needs.
-ARG PNPM_VERSION=11.28.10
+ARG PNPM_VERSION=11.28.11
 
 # ── kubectl ──────────────────────────────────────────────────────────────────
 RUN set -eux; \
@@ -160,7 +160,7 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
       "@openai/codex@${CODEX_VERSION}" \
       "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}" \
       "pnpm@${PNPM_VERSION}" \
-      agent-browser@0.41.2 \
+      agent-browser@0.42.0 \
     && find /usr/lib/node_modules -type f \( -name '*.map' -o -name '*.tsbuildinfo' \) -delete \
     && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
     && codex --version | grep -F "${CODEX_VERSION}" \
@@ -211,10 +211,10 @@ WORKDIR /home/agent
 ENV PATH="/home/agent/.cargo/bin:/home/agent/.local/bin:/home/agent/.foundry/bin:/home/agent/.bun/bin:${PATH}"
 
 ARG FOUNDRY_VERSION=v1.9.0
-ARG AMP_CLI_VERSION=0.0.1793829508-g91ac5b
+ARG AMP_CLI_VERSION=0.0.1794326444-g2deeb3
 ARG MANIM_VERSION=0.22.1
 ARG BUN_VERSION=bun-v1.4.4
-ARG OMP_VERSION=18.16.0
+ARG OMP_VERSION=19.1.1
 
 # ── Agent-scoped toolchains ─────────────────────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -276,11 +276,11 @@ RUN set -eux; \
     amp --version >/dev/null
 
 # ── agent-browser: download Chrome binary (runs as agent, deps already installed) ─
-# Pinned to Chrome for Testing Stable 157.0.8103.78, which fixes the Skia RCE
-# CVE-2026-126846 (and the earlier 157.0.8103.50 fix for CVE-2026-125350 and
-# 157.0.8103.38 fixes for CVE-2026-121030, -121035, -121071 and -121189).
+# Pinned to Chrome for Testing Stable 158.0.8127.36, which fixes CVE-2026-130963
+# and the 38 other CVEs in the same Chrome release (earlier pins covered
+# CVE-2026-126846, CVE-2026-125350, and CVE-2026-121030, -121035, -121071, -121189).
 # agent-browser discovers the browser at ~/.agent-browser/browsers/chrome-<version>.
-ARG CHROME_FOR_TESTING_VERSION=157.0.8103.78
+ARG CHROME_FOR_TESTING_VERSION=158.0.8127.36
 RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
       set -eux; \
       dest="$HOME/.agent-browser/browsers/chrome-${CHROME_FOR_TESTING_VERSION}"; \
@@ -296,7 +296,7 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
 # Keep Playwright in uv's image-backed cache so isolated tool environments do
 # not download its large Python driver package on first use. Browser binaries
 # are intentionally omitted because DocSend connects to Browserbase over CDP.
-ARG PLAYWRIGHT_VERSION=1.64.1
+ARG PLAYWRIGHT_VERSION=1.65.0
 RUN uv tool install "playwright==${PLAYWRIGHT_VERSION}" \
     && playwright --version | grep -F "${PLAYWRIGHT_VERSION}"
 
@@ -322,11 +322,18 @@ FROM toolchain AS harness-server-build
 WORKDIR /home/agent/centaur-src
 COPY --chown=1001:1001 Cargo.toml Cargo.lock ./
 COPY --chown=1001:1001 crates/ crates/
+# The target dir cache is shared by every build, on every branch, and cargo
+# decides freshness by mtime: a checkout older than another branch's cached
+# artifacts would ship that branch's binary. Touching the workspace sources
+# under the cache lock makes them newer than anything cached, so workspace
+# crates always rebuild while third-party crates stay cached.
 RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,sharing=locked \
     --mount=type=cache,target=/home/agent/.cargo/git,uid=1001,gid=1001,sharing=locked \
     --mount=type=cache,target=/home/agent/.cache/harness-server-target,uid=1001,gid=1001,sharing=locked \
-    CARGO_TARGET_DIR=/home/agent/.cache/harness-server-target \
-    cargo +stable install --locked --path crates/harness-server --root /home/agent/harness-server
+    find Cargo.toml Cargo.lock crates -type f -exec touch {} + \
+    && CARGO_TARGET_DIR=/home/agent/.cache/harness-server-target \
+    cargo +stable install --locked --path crates/harness-server --root /home/agent/harness-server \
+    && cargo +stable install --locked --path crates/centaur-codemode --root /home/agent/harness-server
 
 # ==============================================================================
 # Final thin stage: only frequently-changing local files below.
@@ -349,6 +356,8 @@ COPY --link centaur_sdk/ /opt/centaur/centaur_sdk/
 RUN python3 -m compileall -q /opt/centaur/centaur_sdk
 COPY --link --chmod=0755 services/sandbox/git-hooks/ /opt/centaur/git-hooks/
 COPY --link --chown=1001:1001 tools/ /opt/centaur/tools/
+# Code Mode connectors; the chart's CENTAUR_CODEMODE_CONNECTORS lists this root first.
+COPY --link --chown=1001:1001 connectors/ /opt/centaur/connectors/
 COPY --link --chmod=644 services/sandbox/codex-auth.json /etc/centaur/codex-auth.default.json
 COPY --link --chmod=644 services/sandbox/claude-credentials.json /etc/centaur/claude-credentials.default.json
 COPY --link --chmod=755 services/sandbox/md2docx.py /usr/local/bin/md2docx
@@ -357,17 +366,16 @@ COPY --link services/workflow-python/api/ /usr/local/bin/api/
 COPY --link --chmod=755 services/sandbox/git-branch.sh /usr/local/bin/git-branch
 COPY --link --chmod=755 services/sandbox/install_tool_shims.py /usr/local/bin/install-tool-shims
 COPY --link --chmod=755 services/sandbox/seed_hermes_codex_auth.py /usr/local/bin/seed-hermes-codex-auth
-COPY --link --chmod=755 services/sandbox/centaur_artifact_get.py /usr/local/bin/centaur-artifact-get
-COPY --link --chmod=755 services/sandbox/centaur_tool_host.py /usr/local/bin/centaur-tool-host
 COPY --link --chmod=755 services/sandbox/compose_system_prompt.py /usr/local/bin/compose-system-prompt
 COPY --link --chmod=755 services/sandbox/repo_cache_sync.py /usr/local/bin/repo-cache-sync
 COPY --link --chmod=755 services/sandbox/repo_cache_watch.py /usr/local/bin/repo-cache-watch
 COPY --link --chmod=755 services/sandbox/configure_codex_models.py /usr/local/bin/configure-codex-models
 # Codex's generic base prompt (Apache-2.0, vendored from openai/codex
-# rust-v0.166.0 codex-rs/models-manager/prompt.md) for custom catalog models.
+# rust-v0.167.1 codex-rs/models-manager/prompt.md) for custom catalog models.
 COPY --link --chmod=644 services/sandbox/codex-base-instructions.md /etc/centaur/codex-base-instructions.md
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
 COPY --link --chown=1001:1001 --from=harness-server-build /home/agent/harness-server/bin/harness-server /home/agent/.local/bin/harness-server
+COPY --link --chmod=755 --from=harness-server-build /home/agent/harness-server/bin/centaur-codemode /usr/local/bin/centaur-codemode
 
 USER agent
 WORKDIR /home/agent

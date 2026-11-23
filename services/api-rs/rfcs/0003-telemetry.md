@@ -47,10 +47,10 @@ Prometheus/VictoriaMetrics metrics, and domain spans in the session runtime.
   enabled, and api-rs does not reconstruct spans from sandbox stdout.
 - Remote MCP `tools/call` telemetry is implemented at the authenticated API
   boundary. Each accepted call emits a Laminar `TOOL` span with Centaur tool
-  kind, MCP entry point, validated method, status, and correlation identifiers.
-  Correlation identifiers are retained when the durable execution fails. The
-  tool span's trace context is persisted as the parent of the durable tool-host
-  execution. Arguments, results, stdout, and stderr are not exported.
+  kind, MCP entry point, validated method, status, and the Code Mode sandbox
+  id. The tool span's trace context is sent to the Code Mode sandbox, which
+  parents the cell on it. Arguments, results, stdout, and stderr are not
+  exported.
 - The harness OpenTelemetry SDK batches and exports directly to the configured
   OTLP endpoint. There is no collector or loopback OTLP proxy in the sandbox.
   The api-rs process's own OTLP env
@@ -225,6 +225,9 @@ Initial span set:
 | `centaur.api_rs.mcp.tool` | `centaur-api-server` |
 | `<harness>.session_task.turn` | `harness-server` |
 | `<harness>.tool.<name>[ <subcommand>]` | `harness-server` |
+| `codemode.cell` | `centaur-codemode` |
+| `codemode.tool.<connector>.<function>` | `centaur-codemode` |
+| `<METHOD> <host>` (connector request) | `centaur-codemode` |
 
 Spans may carry:
 
@@ -279,10 +282,20 @@ session association and execution metadata. Tool state is scoped to one turn;
 finishing, failing, cancelling, or dropping the turn closes any unfinished tool
 spans.
 
+Code Mode cells run as harness shell commands, so the harness sees one command
+span per cell. `harness-server` writes the turn's `traceparent`, `thread_key`,
+and `execution_id` to a turn trace file for the length of the turn;
+`centaur-codemode exec` reads it and exports a `codemode.cell` span as another
+child of the execution span, with a `TOOL` span per connector call and a client
+span per upstream request beneath it. For remote MCP, api-rs sends the tool
+span's `traceparent` header to the Code Mode sandbox's `/exec`, which parents
+the cell on it. Cell spans carry names, timings, statuses, and query-free URLs
+only.
+
 Remote MCP calls have no harness turn. The API creates a root `TOOL` span for
-the accepted `tools/call` and uses its `traceparent` when creating the durable
-tool-host execution. This keeps sandbox lifecycle work in the same trace while
-grouping calls by the stable `mcp:<principal_id>` Laminar session association.
+the accepted `tools/call` and sends its `traceparent` to the Code Mode sandbox.
+This keeps the cell in the same trace while grouping calls by the stable
+`mcp:<principal_id>` Laminar session association.
 
 ## Implementation Plan
 

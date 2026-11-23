@@ -93,7 +93,54 @@ if [ -n "${HTTPS_PROXY:-}" ] && command -v python3 >/dev/null; then
     unset _proxy_var
 fi
 
-mkdir -p "$HOME_DIR/.config/amp"
+mkdir -p "$HOME_DIR/.config/amp" "$HOME_DIR/.pi/agent"
+
+# Pi: declare Gemini models newer than Pi's bundled catalog. The `google`
+# provider reads GEMINI_API_KEY, an iron-proxy placeholder in the sandbox.
+# Keep the IDs in sync with MODELS in crates/harness-server/src/pi.rs.
+cat > "$HOME_DIR/.pi/agent/models.json" <<'EOF'
+{
+  "providers": {
+    "google": {
+      "models": [
+        {
+          "id": "gemini-4-carbon",
+          "name": "Gemini 4 Carbon",
+          "api": "google-generative-ai",
+          "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+          "reasoning": true,
+          "thinkingLevelMap": {"off": null, "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": null, "max": null},
+          "input": ["text", "image"],
+          "contextWindow": 1048576,
+          "maxTokens": 32768
+        },
+        {
+          "id": "gemini-4-hydrogen",
+          "name": "Gemini 4 Hydrogen",
+          "api": "google-generative-ai",
+          "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+          "reasoning": true,
+          "thinkingLevelMap": {"off": null, "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": null, "max": null},
+          "input": ["text", "image"],
+          "contextWindow": 1048576,
+          "maxTokens": 65536
+        },
+        {
+          "id": "gemini-4-neon",
+          "name": "Gemini 4 Neon",
+          "api": "google-generative-ai",
+          "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+          "reasoning": true,
+          "thinkingLevelMap": {"off": null, "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": null, "max": null},
+          "input": ["text", "image"],
+          "contextWindow": 1048576,
+          "maxTokens": 65536
+        }
+      ]
+    }
+  }
+}
+EOF
 
 # ── Write harness configs (no MCP — adds ~10s startup overhead) ───────────────
 cat > "$HOME_DIR/.config/amp/settings.json" <<EOF
@@ -439,6 +486,10 @@ fi
 
 # ── Ensure uploads directory exists ──────────────────────────────────────────
 mkdir -p "$HOME_DIR/uploads"
+
+# Code Mode connectors that read or write files take paths under the home
+# directory, which holds the workspace, uploads, and branches.
+export CENTAUR_CODEMODE_FILES_DIR="${CENTAUR_CODEMODE_FILES_DIR:-$HOME_DIR}"
 
 # ── Copy project skills into workspace (so `skill` tool discovers them) ──────
 WORKSPACE_DIR="$WORKSPACE_DIR" install-tool-shims --refresh-skills \

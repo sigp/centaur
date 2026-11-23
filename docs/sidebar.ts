@@ -14,11 +14,12 @@ export const sidebar = [
   {
     text: 'Operate',
     items: [
-      { text: 'Slack ETL', link: '/operate/slack-etl' },
+      { text: 'Company Context', link: '/operate/company-context' },
       { text: 'Expose Slackbot with Tailscale Funnel', link: '/operate/tailscale-funnel' },
       { text: 'SSH access', link: '/operate/ssh' },
       { text: 'API Clients', link: '/operate/api-clients' },
       { text: 'Mattermost', link: '/operate/mattermost' },
+      { text: 'Upgrade to the api-rs Console', link: '/operate/console-backend-cutover' },
     ],
   },
   {

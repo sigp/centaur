@@ -168,26 +168,29 @@ class Api::V1::SandboxScheduledTasksControllerTest < ActionDispatch::Integration
     end
     assert_response :unprocessable_entity
     assert_equal "validation failed", json_body.dig("error", "message")
-    assert_includes json_body.dig("error", "details", "cron_expression"), "is not a valid cron schedule"
+    assert_includes json_body.dig("error", "details", "cron_expression"),
+                    "is not a valid five-field cron schedule"
   end
 
-  test "linked user queues an immediate run" do
+  test "linked user starts an immediate run" do
     task = create_task(author: @user, name: "Run me")
 
-    assert_enqueued_jobs 1, only: ScheduledTaskRunJob do
+    with_scheduled_task_client do |client|
       with_token(@proxy) do |headers|
         post "/api/v1/sandbox/scheduled_tasks/#{task.oid}/run", headers: headers
       end
+      assert_equal [ { task_oid: task.oid, scheduled_for: nil } ], client.runs
     end
     assert_response :accepted
     assert_equal true, json_body.dig("data", "queued")
+    assert_equal "run-123", json_body.dig("data", "run_id")
   end
 
   test "disabled tasks cannot be run immediately" do
     task = create_task(author: @user, name: "Disabled task")
     task.update!(enabled: false)
 
-    assert_no_enqueued_jobs only: ScheduledTaskRunJob do
+    assert_scheduled_task_runs 0 do
       with_token(@proxy) do |headers|
         post "/api/v1/sandbox/scheduled_tasks/#{task.oid}/run", headers: headers
       end
@@ -197,17 +200,35 @@ class Api::V1::SandboxScheduledTasksControllerTest < ActionDispatch::Integration
     assert_equal "scheduled task is disabled", json_body.dig("error", "message")
   end
 
-  test "run reports when the task could not be queued" do
+  test "run reports when the task could not be started" do
     task = create_task(author: @user, name: "Do not run")
+    unavailable = CentaurApiClient::Error.new("database unavailable", status: 503)
 
-    ScheduledTaskRunJob.stub(:perform_later, false) do
+    with_scheduled_task_client(ScheduledTaskRunHelper::FakeClient.new(error: unavailable)) do
       with_token(@proxy) do |headers|
         post "/api/v1/sandbox/scheduled_tasks/#{task.oid}/run", headers: headers
       end
     end
 
     assert_response :service_unavailable
-    assert_equal "scheduled task run could not be queued", json_body.dig("error", "message")
+    assert_equal "scheduled task run could not be started", json_body.dig("error", "message")
+  end
+
+  test "run explains why api-rs refused the task" do
+    task = create_task(author: @user, name: "Lost channel")
+    refused = CentaurApiClient::Error.new(
+      "Slack delivery destination is no longer available to the task owner", status: 422
+    )
+
+    with_scheduled_task_client(ScheduledTaskRunHelper::FakeClient.new(error: refused)) do
+      with_token(@proxy) do |headers|
+        post "/api/v1/sandbox/scheduled_tasks/#{task.oid}/run", headers: headers
+      end
+    end
+
+    assert_response :unprocessable_entity
+    assert_equal "Slack delivery destination is no longer available to the task owner",
+                 json_body.dig("error", "message")
   end
 
   test "principal without an active linked user cannot manage tasks" do
@@ -255,7 +276,7 @@ class Api::V1::SandboxScheduledTasksControllerTest < ActionDispatch::Integration
             as: :json
       assert_response :ok
 
-      assert_enqueued_jobs 1, only: ScheduledTaskRunJob do
+      assert_scheduled_task_runs 1 do
         post "/api/v1/sandbox/scheduled_tasks/#{task.oid}/run", headers: headers
       end
       assert_response :accepted
@@ -307,6 +328,114 @@ class Api::V1::SandboxScheduledTasksControllerTest < ActionDispatch::Integration
     assert_empty principals(:acme_channel).scheduled_tasks
   end
 
+  test "channel requester creates a personal task delivered to their own DM" do
+    channel_proxy = proxies(:acme_proxy)
+    channel_proxy.update!(requester_principal: slack_user_principal("U0123456789", console_user: @user))
+
+    with_token(channel_proxy) do |headers|
+      post "/api/v1/sandbox/scheduled_tasks",
+           params: {
+             data: { owner: "me", name: "Remind me", prompt: "Remind me to review PRs.", cron_expression: "0 9 * * 1" }
+           },
+           headers: headers,
+           as: :json
+    end
+
+    assert_response :created
+    task = @user.scheduled_tasks.find_by!(name: "Remind me")
+    assert_nil task.principal
+    assert_equal "U0123456789", task.delivery_channel
+    assert_empty principals(:acme_channel).scheduled_tasks
+  end
+
+  test "personal tasks refuse any destination other than the DM" do
+    channel_proxy = proxies(:acme_proxy)
+    channel_proxy.update!(requester_principal: slack_user_principal("U0123456789", console_user: @user))
+
+    [ principals(:acme_channel).slack_channel_id, "C0123456789", "U2222222222" ].each do |destination|
+      assert_no_difference("ScheduledTask.count") do
+        with_token(channel_proxy) do |headers|
+          post "/api/v1/sandbox/scheduled_tasks",
+               params: { data: { owner: "me", name: "Elsewhere", prompt: "Post.", delivery_channel: destination } },
+               headers: headers,
+               as: :json
+        end
+      end
+      assert_response :unprocessable_entity
+      assert_equal "personal tasks always deliver to your DM", json_body.dig("error", "message")
+    end
+
+    assert_no_difference("ScheduledTask.count") do
+      with_token(@proxy) do |headers|
+        post "/api/v1/sandbox/scheduled_tasks",
+             params: { data: { owner: "me", name: "Elsewhere", prompt: "Post.", delivery_channel: "C0123456789" } },
+             headers: headers,
+             as: :json
+      end
+    end
+    assert_response :unprocessable_entity
+  end
+
+  test "personal tasks from a channel require a linked active requester" do
+    channel_proxy = proxies(:acme_proxy)
+    params = { data: { owner: "me", name: "Remind me", prompt: "Remind me." } }
+
+    with_token(channel_proxy) do |headers|
+      post "/api/v1/sandbox/scheduled_tasks", params: params, headers: headers, as: :json
+    end
+    assert_response :forbidden
+
+    channel_proxy.update!(requester_principal: slack_user_principal("U0123456789"))
+    with_token(channel_proxy) do |headers|
+      post "/api/v1/sandbox/scheduled_tasks", params: params, headers: headers, as: :json
+    end
+    assert_response :forbidden
+
+    channel_proxy.update!(
+      requester_principal: slack_user_principal("U0123456789", team_id: "T0EXTERNAL1", console_user: @user)
+    )
+    with_token(channel_proxy) do |headers|
+      post "/api/v1/sandbox/scheduled_tasks", params: params, headers: headers, as: :json
+    end
+    assert_response :forbidden
+
+    # A requester whose Slack identity differs from the linked user's DM.
+    channel_proxy.update!(requester_principal: slack_user_principal("U2222222222", console_user: @user))
+    with_token(channel_proxy) do |headers|
+      post "/api/v1/sandbox/scheduled_tasks", params: params, headers: headers, as: :json
+    end
+    assert_response :forbidden
+
+    linked = Principal.find_by!(kind: :slack_dm, slack_user_id: "U0123456789", slack_team_id: "T0123456789")
+    linked.update!(console_user: @user)
+    @user.update!(status: :disabled)
+    channel_proxy.update!(requester_principal: linked)
+    with_token(channel_proxy) do |headers|
+      post "/api/v1/sandbox/scheduled_tasks", params: params, headers: headers, as: :json
+    end
+    assert_response :forbidden
+    assert_empty ScheduledTask.where(name: "Remind me")
+  end
+
+  test "owner is only accepted as me on create" do
+    task = create_task(author: @user, name: "Mine")
+
+    with_token(@proxy) do |headers|
+      post "/api/v1/sandbox/scheduled_tasks",
+           params: { data: { owner: "U2222222222", name: "Theirs", prompt: "Post." } },
+           headers: headers,
+           as: :json
+      assert_response :unprocessable_entity
+
+      patch "/api/v1/sandbox/scheduled_tasks/#{task.oid}",
+            params: { data: { owner: "me", name: "Renamed" } },
+            headers: headers,
+            as: :json
+      assert_response :unprocessable_entity
+    end
+    assert_equal "Mine", task.reload.name
+  end
+
   test "disabled linked user cannot manage tasks" do
     @user.update!(status: :disabled)
 
@@ -329,9 +458,10 @@ class Api::V1::SandboxScheduledTasksControllerTest < ActionDispatch::Integration
     )
   end
 
-  def slack_user_principal(slack_user_id, team_id: "T0123456789")
+  def slack_user_principal(slack_user_id, team_id: "T0123456789", console_user: nil)
     Principal.create!(
       foreign_id: "slack-user-#{team_id.downcase}-#{slack_user_id.downcase}",
+      console_user: console_user,
       name: "Slack User #{slack_user_id}",
       kind: :slack_dm,
       slack_user_id: slack_user_id,

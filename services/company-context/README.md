@@ -6,7 +6,7 @@ It also indexes Google Calendar events through the same Google broker credential
 
 It also indexes Granola meeting notes (title, summary, owner, and attendees) through each user's Granola MCP OAuth credential. Each sync lists the account's meetings from its checkpoint onward, fetches their details ten meetings at a time, and republishes a note only when its content changes. Transcripts are not indexed; the Granola tool fetches them on demand. Notes that no live Granola credential still observes are removed.
 
-It also discovers the public and private Slack channels (and, when enabled, direct messages) each user belongs to, through the same per-user Slack broker credentials the Rails Console Slack DM sync uses. The app's bot token (`SLACK_BOT_TOKEN`) is synced as one more credential: it discovers the public and private channels the bot is a member of and can sync their history and files, but never its direct messages. While `COMPANY_CONTEXT_SLACK_USER_IDS` is set, the bot is synced only if the limit lists the bot's Slack user ID. Each discovery records the credential's Slack identity and its channel memberships; channels that no live Slack credential still observes are removed, along with their messages. The first discovery each cycle to list a conversation syncs its members and message history. Each sync replaces the conversation's members with those `conversations.members` lists, so everyone in a conversation can read it, including users without a Slack credential of their own and channels only the bot observes. A sync reads the conversation's configured history days (`COMPANY_CONTEXT_SLACK_HISTORY_DAYS`, overridden per conversation by `COMPANY_CONTEXT_SLACK_CHANNEL_HISTORY_DAYS`) whenever part of that span has not been synchronized yet, so raising a value backfills the older history; lowering one keeps messages already synchronized. Otherwise it reads from its previous sync, always rereading the last `COMPANY_CONTEXT_SLACK_THREAD_REFRESH_DAYS` days so edits within that window are picked up. Threads are synced whenever a parent message read this way shows a new reply; replies to threads started before that window are not picked up. Only one sync reads a conversation at a time. Messages are stored privately in the system schema. Each discovery cycle also lists the workspace users through the app's bot token (`SLACK_BOT_TOKEN`), so documents show names instead of user IDs; the bot token needs the `users:read` scope and belongs to the same Slack app, so it shares the same rate-limit schedule. Users are removed once no live credential in their workspace remains. Slack tasks run on their own `company_context_slack` queue and worker, except thread syncs, which run in order on the `company_context_slack_threads` queue so a large backlog of threads does not delay discovery and history syncs.
+It also discovers the public and private Slack channels (and, when enabled, direct messages) each user belongs to, through the per-user Slack broker credentials of the Console OAuth app selected by `COMPANY_CONTEXT_SLACK_OAUTH_APP_SLUG`. The app's bot token (`SLACK_BOT_TOKEN`) is synced as one more credential: it discovers the public and private channels the bot is a member of and can sync their history and files, but never its direct messages. While `COMPANY_CONTEXT_SLACK_USER_IDS` is set, the bot is synced only if the limit lists the bot's Slack user ID. Each discovery records the credential's Slack identity and its channel memberships; channels that no live Slack credential still observes are removed, along with their messages. The first discovery each cycle to list a conversation syncs its members and message history. Each sync replaces the conversation's members with those `conversations.members` lists, so everyone in a conversation can read it, including users without a Slack credential of their own and channels only the bot observes. A sync reads the conversation's configured history days (`COMPANY_CONTEXT_SLACK_HISTORY_DAYS`, overridden per conversation by `COMPANY_CONTEXT_SLACK_CHANNEL_HISTORY_DAYS`) whenever part of that span has not been synchronized yet, so raising a value backfills the older history; lowering one keeps messages already synchronized. Otherwise it reads from its previous sync, always rereading the last `COMPANY_CONTEXT_SLACK_THREAD_REFRESH_DAYS` days so edits within that window are picked up. Threads are synced whenever a parent message read this way shows a new reply; replies to threads started before that window are not picked up. Only one sync reads a conversation at a time. Messages are stored privately in the system schema. Each discovery cycle also lists the workspace users through the app's bot token (`SLACK_BOT_TOKEN`), so documents show names instead of user IDs; the bot token needs the `users:read` scope and belongs to the same Slack app, so it shares the same rate-limit schedule. Users are removed once no live credential in their workspace remains. Slack tasks run on their own `company_context_slack` queue and worker, except thread syncs, which run in order on the `company_context_slack_threads` queue so a large backlog of threads does not delay discovery and history syncs.
 
 It also projects custom documents, such as imports, notes, and memory, that
 principals write through the [custom documents API](#custom-documents-api) or
@@ -25,11 +25,11 @@ The service owns these Postgres schemas:
 - `company_context_system`: private cursors, staging (including Slack messages and users, and custom documents), and processing state.
 - `company_context_data`: retrieval-facing Drive documents, Calendar events, Granola notes, Slack channel and file documents, custom document chunks, access observations (including Slack identities, channel memberships, and the conversations each Slack file is shared in), and embeddings. The query endpoints read only this schema, as the `centaur_company_context_v2_query` role, which can only select from it; the service switches to that role for each query transaction, so its login role must be able to grant itself membership (`CREATEROLE` or superuser).
 
-Documents are exposed to retrieval only through the query endpoints; no other database role can read them. The Helm deployment is gated by `experimentalCompanyContext.enabled` until it is ready for production.
+Documents are exposed to retrieval only through the query endpoints; no other database role can read them. The Helm deployment is gated by `companyContext.enabled` (formerly `experimentalCompanyContext.enabled`, still accepted as an alias), which defaults to `false`. See `docs/pages/operate/company-context.mdx`.
 
 ## Required infrastructure
 
-- Postgres with the existing Absurd schema and the `vector` and `pg_search` extensions available.
+- Postgres with the existing Absurd schema and the `vector` extension available. The `pg_search` extension is needed only for the `paradedb` text-search backend.
 - `pdftotext` from Poppler (for PDF sources).
 - `pandoc` 3.8.3 or later (for Office, OpenDocument, RTF, and EPUB Slack files).
 - A Rails Console database containing live per-user Google and Granola OAuth broker credentials.
@@ -60,8 +60,8 @@ those tokens; the service decrypts the current access token before each Google
 request. Granola broker credentials are
 selected the same way by `COMPANY_CONTEXT_GRANOLA_OAUTH_APP_SLUG` (default
 `granola`), and Slack broker credentials by
-`COMPANY_CONTEXT_SLACK_OAUTH_APP_SLUG` (default `slack`), which should match the
-Console's Slack DM sync app. Google requests honor `Retry-After`
+`COMPANY_CONTEXT_SLACK_OAUTH_APP_SLUG` (default `slack`; the chart sets it from
+`console.slackDmSync.oauthAppSlug`). Google requests honor `Retry-After`
 on rate limits and retry server errors with bounded exponential backoff. Durable
 document tasks record known permanent content and request failures as `rejected`
 instead of retrying them. A credential reconciliation task deactivates
@@ -74,6 +74,22 @@ walk runs as one Absurd task per batch of folders: each batch lists its
 folders' children in a single Drive search and spawns batches for the
 subfolders. The Helm deployment reads
 `OPENAI_API_KEY` directly from the shared Kubernetes Secret.
+
+Keyword search backend:
+
+- `DATABASE_TEXT_SEARCH` (default `paradedb`): `paradedb` uses ParadeDB BM25
+  indexes and requires `pg_search`; `postgres` uses PostgreSQL's built-in
+  full-text search and runs on any server with `vector`, including RDS and
+  Cloud SQL. Each backend has its own migration tree, `migrations/paradedb` and
+  `migrations/postgres` under `crates/centaur-company-context`. A database keeps
+  the backend it was first migrated with, and the service refuses to start
+  with the other one. The Helm chart passes the backend it gives api-rs.
+
+  The backends match terms slightly differently. `postgres` uses the `english`
+  text-search configuration, so it matches stemmed forms ("launches" finds
+  "launch") and ignores stopwords; a query of only stopwords matches nothing.
+  Its `keyword` mode requires every term in the title and body together, while
+  `paradedb` requires them all in the title or all in the body.
 
 Indexer switches (default `true`):
 
@@ -255,7 +271,7 @@ results follow, the response's `next_cursor` is passed as `cursor`, with the
 same query, mode, and filters, to fetch the next page; the cursor is valid only
 in `keyword` mode.
 
-A `hybrid` search is not paged, so narrow its filters instead. Keyword (BM25) and embedding similarity ranks, each taken across every
+A `hybrid` search is not paged, so narrow its filters instead. Keyword (BM25 on `paradedb`, `ts_rank` on `postgres`) and embedding similarity ranks, each taken across every
 searched type, are combined with reciprocal rank fusion. A keyword match is
 ranked by its similarity too, and a document farther from the query than
 `COMPANY_CONTEXT_EMBEDDINGS_MAX_QUERY_DISTANCE` gets no similarity rank. If the

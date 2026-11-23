@@ -48,6 +48,7 @@ use crate::{
         SLACK_FILE_DOCUMENT_ID_PREFIX,
     },
     credentials::{ConsoleCredentials, PrincipalIdentity},
+    database::TextSearchBackend,
     embeddings::EmbeddingsClient,
 };
 
@@ -94,6 +95,7 @@ macro_rules! slack_readable {
 #[derive(Clone)]
 pub struct QueryState {
     pub pool: PgPool,
+    pub text_search: TextSearchBackend,
     pub credentials: Arc<ConsoleCredentials>,
     pub embeddings: EmbeddingsClient,
     pub jwt: Arc<JwtVerifier>,
@@ -569,9 +571,15 @@ async fn handle_query(
     // Authenticate before looking at the body.
     let identity = authenticate(&state, &headers).await?;
     let Json(request) = request.map_err(|rejection| ApiError::BadRequest(rejection.body_text()))?;
-    let response = search(&state.pool, Some(&state.embeddings), &identity, &request)
-        .await
-        .map_err(internal("company_context_query_failed"))?;
+    let response = search(
+        &state.pool,
+        state.text_search,
+        Some(&state.embeddings),
+        &identity,
+        &request,
+    )
+    .await
+    .map_err(internal("company_context_query_failed"))?;
     Ok(Json(response))
 }
 
@@ -687,6 +695,7 @@ impl Cursor {
 /// Keyword searches return matches newest first, unranked.
 pub async fn search(
     pool: &PgPool,
+    text_search: TextSearchBackend,
     embeddings: Option<&EmbeddingsClient>,
     identity: &PrincipalIdentity,
     request: &QueryRequest,
@@ -730,7 +739,16 @@ pub async fn search(
         });
     }
     if request.mode == Mode::Keyword {
-        return keyword_search(pool, query, searches, limit, &params, cursor.as_ref()).await;
+        return keyword_search(
+            pool,
+            text_search,
+            query,
+            searches,
+            limit,
+            &params,
+            cursor.as_ref(),
+        )
+        .await;
     }
 
     let vector = match embeddings {
@@ -754,14 +772,15 @@ pub async fn search(
     let mut semantic_hits: Vec<(DataType, Hit)> = Vec::new();
     for (data_type, subjects) in searches {
         let source = data_type.source();
+        let (matches, score) = any_term_match(text_search);
         let keyword = format!(
             r#"
-            SELECT {columns}, paradedb.score(d.document_id)::float8 AS rank_score
+            SELECT {columns}, {score}::float8 AS rank_score
             FROM {documents} d
-            WHERE (d.title ||| $1::text::pdb.boost(2) OR d.body ||| $1::text)
+            WHERE {matches}
               AND {visible}
               AND {filters}
-            ORDER BY paradedb.score(d.document_id) DESC, d.document_id
+            ORDER BY {score} DESC, d.document_id
             LIMIT $3
             "#,
             columns = source.columns,
@@ -894,6 +913,7 @@ pub async fn search(
 /// after `cursor`.
 async fn keyword_search(
     pool: &PgPool,
+    text_search: TextSearchBackend,
     query: &str,
     searches: Vec<(DataType, Vec<String>)>,
     limit: usize,
@@ -913,7 +933,7 @@ async fn keyword_search(
             r#"
             SELECT {columns}
             FROM {documents} d
-            WHERE (d.title &&& $1::text OR d.body &&& $1::text)
+            WHERE {matches}
               AND {visible}
               AND {filters}
               AND ($10::text IS NULL OR CASE
@@ -930,6 +950,7 @@ async fn keyword_search(
             visible = source.visible,
             filters = source.filters(),
             at = source.starts_at,
+            matches = all_terms_match(text_search),
         );
         // One extra row shows whether another page follows.
         let rows: Vec<Row> = bind_filters(
@@ -1033,6 +1054,44 @@ async fn query_vector(embeddings: &EmbeddingsClient, query: &str) -> Option<(Str
     }
 }
 
+/// Title boost for ranked keyword matches, as a multiple of body matches.
+const TITLE_MATCH_BOOST: u32 = 2;
+
+/// A condition matching documents whose title or body contains any term of
+/// the query in `$1`, and the score that ranks those matches.
+fn any_term_match(text_search: TextSearchBackend) -> (String, String) {
+    match text_search {
+        TextSearchBackend::Paradedb => (
+            format!(
+                "(d.title ||| $1::text::pdb.boost({TITLE_MATCH_BOOST}) OR d.body ||| $1::text)"
+            ),
+            "paradedb.score(d.document_id)".to_owned(),
+        ),
+        TextSearchBackend::Postgres => {
+            // Lexemes never contain spaces, so the replace changes only the
+            // operators, turning the conjunction into a disjunction.
+            let terms =
+                "replace(plainto_tsquery('english', $1::text)::text, ' & ', ' | ')::tsquery";
+            // ts_rank weights are ordered {D, C, B, A}: body terms carry
+            // weight D and title terms weight A.
+            let body_weight = 1.0 / f64::from(TITLE_MATCH_BOOST);
+            (
+                format!("d.search_vector @@ {terms}"),
+                format!("ts_rank('{{{body_weight}, 0, 0, 1}}', d.search_vector, {terms}, 1)"),
+            )
+        }
+    }
+}
+
+/// A condition matching documents that contain every term of the query in
+/// `$1`.
+fn all_terms_match(text_search: TextSearchBackend) -> &'static str {
+    match text_search {
+        TextSearchBackend::Paradedb => "(d.title &&& $1::text OR d.body &&& $1::text)",
+        TextSearchBackend::Postgres => "d.search_vector @@ plainto_tsquery('english', $1::text)",
+    }
+}
+
 /// Runs one ranked lane: `$1` is the query text or vector, `$2` the subjects,
 /// `$3` the limit, `$4`..`$9` the filters, and `$10` the embedding model.
 async fn lane(
@@ -1107,7 +1166,12 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     (scheme.eq_ignore_ascii_case("Bearer") && !token.is_empty()).then_some(token)
 }
 
-/// Verifies the principal API JWTs the Console mints for api-rs.
+/// Verifies the principal JWTs a sandbox presents on the query endpoint.
+///
+/// The single `centaur-sandbox` token (minted by proxy-sync) replaced the
+/// old `centaur-api` principal JWT; both are accepted through the rollout so a
+/// proxy holding a token minted before the upgrade keeps working until its next
+/// sync.
 pub struct JwtVerifier {
     key: DecodingKey,
     validation: Validation,
@@ -1124,7 +1188,7 @@ impl JwtVerifier {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.leeway = JWT_LEEWAY_SECONDS;
         validation.validate_nbf = true;
-        validation.set_audience(&["centaur-api"]);
+        validation.set_audience(&["centaur-sandbox", "centaur-api"]);
         validation.set_issuer(&["centaur-console"]);
         validation.set_required_spec_claims(&["exp", "iss", "sub", "aud"]);
         Self {
@@ -1306,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_accepts_only_console_principal_api_tokens() {
+    fn verifier_accepts_the_sandbox_and_legacy_principal_audiences() {
         let now = Utc::now().timestamp();
         let claims = |overrides: Value| {
             let mut claims = json!({
@@ -1325,6 +1389,13 @@ mod tests {
         let verifier = verifier();
         assert_eq!(
             verifier.principal_id(&token("secret", claims(json!({})))),
+            Some(1)
+        );
+        assert_eq!(
+            verifier.principal_id(&token(
+                "secret",
+                claims(json!({ "aud": "centaur-sandbox" }))
+            )),
             Some(1)
         );
         for rejected in [
@@ -1352,13 +1423,19 @@ mod tests {
         identity: &PrincipalIdentity,
         body: Value,
     ) -> Vec<String> {
-        let mut ids: Vec<_> = search(pool, embeddings, identity, &request(body))
-            .await
-            .unwrap()
-            .results
-            .into_iter()
-            .map(|result| result.document.document_id)
-            .collect();
+        let mut ids: Vec<_> = search(
+            pool,
+            crate::test_support::text_search(pool).await,
+            embeddings,
+            identity,
+            &request(body),
+        )
+        .await
+        .unwrap()
+        .results
+        .into_iter()
+        .map(|result| result.document.document_id)
+        .collect();
         ids.sort();
         ids
     }
@@ -1619,9 +1696,15 @@ mod tests {
                 "occurred_before": "2024-01-01T00:00:00Z",
             } }),
         ] {
-            let error = search(pool, None, &ada, &request(invalid.clone()))
-                .await
-                .unwrap_err();
+            let error = search(
+                pool,
+                crate::test_support::text_search(pool).await,
+                None,
+                &ada,
+                &request(invalid.clone()),
+            )
+            .await
+            .unwrap_err();
             assert!(error.is::<InvalidQuery>(), "{invalid}");
         }
 
@@ -1707,13 +1790,19 @@ mod tests {
         let ranked = |body: Value| {
             let embeddings = &embeddings;
             async move {
-                search(pool, Some(embeddings), &ada(), &request(body))
-                    .await
-                    .unwrap()
-                    .results
-                    .into_iter()
-                    .map(|result| result.document.document_id)
-                    .collect::<Vec<_>>()
+                search(
+                    pool,
+                    crate::test_support::text_search(pool).await,
+                    Some(embeddings),
+                    &ada(),
+                    &request(body),
+                )
+                .await
+                .unwrap()
+                .results
+                .into_iter()
+                .map(|result| result.document.document_id)
+                .collect::<Vec<_>>()
             }
         };
 
@@ -1814,7 +1903,15 @@ mod tests {
         let keyword = |body: Value| async move {
             let mut body = body;
             body["mode"] = json!("keyword");
-            search(pool, None, &ada(), &request(body)).await.unwrap()
+            search(
+                pool,
+                crate::test_support::text_search(pool).await,
+                None,
+                &ada(),
+                &request(body),
+            )
+            .await
+            .unwrap()
         };
         let slack = json!(["slack_message", "slack_file"]);
 
@@ -1885,9 +1982,15 @@ mod tests {
             json!({ "query": "falcon", "mode": "keyword", "cursor": "garbage" }),
             json!({ "query": "falcon", "cursor": "|slack-file:SF3" }),
         ] {
-            let error = search(pool, None, &ada(), &request(invalid.clone()))
-                .await
-                .unwrap_err();
+            let error = search(
+                pool,
+                crate::test_support::text_search(pool).await,
+                None,
+                &ada(),
+                &request(invalid.clone()),
+            )
+            .await
+            .unwrap_err();
             assert!(error.is::<InvalidQuery>(), "{invalid}");
         }
 

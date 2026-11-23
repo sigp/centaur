@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
@@ -17,6 +19,18 @@ use crate::{
 
 /// Effort levels Claude Code accepts for its `effortLevel` setting.
 const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Claude Code drops `OTEL_*` variables from the shells its Bash tool runs, so
+/// programs the agent runs there (such as `centaur-codemode exec`) never see
+/// the OTLP exporter settings harness-server was given, and export nothing.
+/// Claude Code sources `CLAUDE_ENV_FILE` in each of those shells after that
+/// filtering, so the settings are re-exported from that file.
+const CLAUDE_ENV_FILE_ENV: &str = "CLAUDE_ENV_FILE";
+/// Relative to `$HOME`. Holds the OTLP headers (the collector's API key), so
+/// it is written owner-only and kept outside the workspace.
+const DEFAULT_OTEL_ENV_FILE: &str = ".centaur/claude-otel-env.sh";
+/// Set on every sandbox api-rs creates.
+const API_URL_ENV: &str = "CENTAUR_API_URL";
 
 /// Defers agent text until the owning message's fate is known, so agentMessage
 /// items can be emitted with an authoritative stop reason. Claude's per-block
@@ -40,6 +54,14 @@ const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"]
 /// surfaced as a tool item that starts on `task_started` and completes with
 /// the agent's summary on `task_notification`; a resumed agent starts again
 /// and gets a new item.
+///
+/// Steers are held the same way. Claude Code takes a user message sent
+/// mid-turn into its work at the next tool result, or, when none is left,
+/// answers it in a follow-up turn of its own after the turn's `result`
+/// (observed with 2.1.318). With `--replay-user-messages` it echoes each user
+/// message as it takes it in, keeping the `uuid` it was sent with, so a
+/// steer not yet echoed when `result` arrives is owed a follow-up, which this
+/// turn waits for.
 #[derive(Debug, Default)]
 pub struct ClaudeEventNormalizer {
     inner: AnthropicEventNormalizer,
@@ -50,6 +72,8 @@ pub struct ClaudeEventNormalizer {
     /// Claude Code's own turn ended (its `result` was swallowed) and no
     /// follow-up message has started since.
     result_held: bool,
+    /// Steers written to Claude Code that it has not echoed yet, by uuid.
+    outstanding_steers: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -80,7 +104,25 @@ impl PendingAgentMessage {
 }
 
 impl ClaudeEventNormalizer {
+    /// Notes a steer sent with `uuid`, which this turn must see taken in.
+    pub fn steer_sent(&mut self, uuid: String) {
+        self.outstanding_steers.insert(uuid);
+    }
+
     pub fn normalize(&mut self, event: AnthropicStreamEvent) -> Vec<NormalizedEvent> {
+        // An echoed user message carries no output of its own; it only tells
+        // which steers Claude Code has taken in.
+        if let AnthropicStreamEvent::User {
+            is_replay: true,
+            uuid,
+            ..
+        } = &event
+        {
+            if let Some(uuid) = uuid {
+                self.outstanding_steers.remove(uuid);
+            }
+            return Vec::new();
+        }
         let token_usage = event.token_usage();
         let message_stop_reason = event.message_stop_reason().map(str::to_string);
         let mut out = Vec::new();
@@ -198,9 +240,11 @@ impl ClaudeEventNormalizer {
     fn flush_pending(&mut self, stop_reason: Option<String>, out: &mut Vec<NormalizedEvent>) {
         // A message that ends the model's turn while background agents still
         // owe a follow-up is commentary, not the final answer; flushing it as
-        // `end_turn` would also arm the terminal-stop fallback.
+        // `end_turn` would also arm the terminal-stop fallback. An answer
+        // given before a steer's follow-up still answers the user, so it
+        // stays one (the runner arms no fallback while the turn is held).
         let stop_reason = match stop_reason {
-            Some(reason) if reason != "tool_use" && self.holding_turn() => {
+            Some(reason) if reason != "tool_use" && self.holding_for_background_work() => {
                 Some("tool_use".to_string())
             }
             reason => reason,
@@ -209,6 +253,10 @@ impl ClaudeEventNormalizer {
     }
 
     fn holding_turn(&self) -> bool {
+        self.holding_for_background_work() || !self.outstanding_steers.is_empty()
+    }
+
+    fn holding_for_background_work(&self) -> bool {
         self.awaiting_follow_up || !self.background_agents.is_empty()
     }
 
@@ -375,6 +423,9 @@ impl HarnessServer for ClaudeCodeHarness {
             "--dangerously-skip-permissions",
             "--permission-mode",
             "bypassPermissions",
+            // Echoes each user message as Claude Code takes it in, which is
+            // how a turn tells whether a steer still owes an answer.
+            "--replay-user-messages",
         ]);
         if !state.model.is_empty() {
             command.args(["--model", &state.model]);
@@ -387,6 +438,9 @@ impl HarnessServer for ClaudeCodeHarness {
         } else {
             command.args(["--session-id", &state.id]);
         }
+        if let Some(path) = write_otel_env_file() {
+            command.env(CLAUDE_ENV_FILE_ENV, path);
+        }
         command
     }
 
@@ -398,6 +452,30 @@ impl HarnessServer for ClaudeCodeHarness {
                 "content": user_input_to_anthropic_content(input),
             },
         });
+        let mut bytes = serde_json::to_vec(&payload)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    fn steers_mid_turn(&self) -> bool {
+        true
+    }
+
+    fn stdin_for_steer(
+        &self,
+        normalizer: &mut Self::EventNormalizer,
+        input: &[UserInput],
+    ) -> Result<Vec<u8>> {
+        let uuid = Uuid::new_v4().to_string();
+        let payload = json!({
+            "type": "user",
+            "uuid": uuid,
+            "message": {
+                "role": "user",
+                "content": user_input_to_anthropic_content(input),
+            },
+        });
+        normalizer.steer_sent(uuid);
         let mut bytes = serde_json::to_vec(&payload)?;
         bytes.push(b'\n');
         Ok(bytes)
@@ -466,6 +544,74 @@ impl HarnessServer for ClaudeCodeHarness {
     }
 }
 
+/// Writes the `OTEL_*` exports for Claude Code's Bash shells and returns the
+/// file to point `CLAUDE_ENV_FILE` at. Like the turn trace file, only
+/// API-created sandboxes write to `$HOME`, and an operator-set
+/// `CLAUDE_ENV_FILE` is left alone. Failures are logged and never fail the turn.
+fn write_otel_env_file() -> Option<PathBuf> {
+    let non_empty =
+        |name: &str| env::var_os(name).filter(|value| !value.to_string_lossy().trim().is_empty());
+    if env::var_os(CLAUDE_ENV_FILE_ENV).is_some() {
+        return None;
+    }
+    non_empty(API_URL_ENV)?;
+    let path = PathBuf::from(non_empty("HOME")?).join(DEFAULT_OTEL_ENV_FILE);
+    let vars = env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)));
+    let contents = otel_env_file_contents(vars)?;
+    match write_private_atomically(&path, &contents) {
+        Ok(()) => Some(path),
+        Err(error) => {
+            eprintln!("claude otel env file: writing {}: {error}", path.display());
+            None
+        }
+    }
+}
+
+/// `export` lines for the OTLP exporter settings, or `None` when there are
+/// none. `OTEL_SERVICE_NAME` names the harness itself, so it stays out of the
+/// agent's shell.
+fn otel_env_file_contents(vars: impl IntoIterator<Item = (String, String)>) -> Option<String> {
+    let mut lines: Vec<String> = vars
+        .into_iter()
+        .filter(|(name, _)| {
+            name.starts_with("OTEL_")
+                && name != "OTEL_SERVICE_NAME"
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .map(|(name, value)| format!("export {name}={}\n", shell_quote(&value)))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort();
+    Some(lines.concat())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+fn write_private_atomically(path: &Path, contents: &str) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(".claude-otel-env.{}.tmp", Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&temp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -476,7 +622,9 @@ mod tests {
         anthropic::AnthropicStreamEvent,
     };
 
-    use super::{ClaudeCodeHarness, ClaudeEventNormalizer};
+    use super::{
+        ClaudeCodeHarness, ClaudeEventNormalizer, otel_env_file_contents, write_private_atomically,
+    };
 
     fn normalize(normalizer: &mut ClaudeEventNormalizer, event: Value) -> Vec<NormalizedEvent> {
         normalizer.normalize(serde_json::from_value(event).unwrap())
@@ -966,11 +1114,15 @@ mod tests {
 
     #[test]
     fn steer_stdin_uses_claude_streaming_user_message_shape() {
+        let mut normalizer = ClaudeEventNormalizer::default();
         let bytes = ClaudeCodeHarness
-            .stdin_for_steer(&[UserInput::Text {
-                text: "new guidance".to_string(),
-                text_elements: Vec::new(),
-            }])
+            .stdin_for_steer(
+                &mut normalizer,
+                &[UserInput::Text {
+                    text: "new guidance".to_string(),
+                    text_elements: Vec::new(),
+                }],
+            )
             .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
 
@@ -978,6 +1130,100 @@ mod tests {
         assert!(value.get("steer").is_none());
         assert_eq!(value["message"]["role"], "user");
         assert_eq!(value["message"]["content"][0]["text"], "new guidance");
+        let uuid = value["uuid"].as_str().expect("steer uuid");
+        assert!(normalizer.outstanding_steers.contains(uuid));
+    }
+
+    fn steer(normalizer: &mut ClaudeEventNormalizer) -> String {
+        let bytes = ClaudeCodeHarness
+            .stdin_for_steer(
+                normalizer,
+                &[UserInput::Text {
+                    text: "also this".to_string(),
+                    text_elements: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        value["uuid"].as_str().unwrap().to_string()
+    }
+
+    fn replay(uuid: &str) -> Value {
+        json!({
+            "type": "user",
+            "isReplay": true,
+            "uuid": uuid,
+            "message": {"role": "user", "content": [{"type": "text", "text": "also this"}]},
+        })
+    }
+
+    #[test]
+    fn steer_folded_into_a_tool_result_completes_on_the_result() {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        let uuid = steer(&mut normalizer);
+        // Claude Code folds the steer into the next tool result and echoes it.
+        assert!(normalize(&mut normalizer, replay(&uuid)).is_empty());
+        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+        normalize(
+            &mut normalizer,
+            json!({"type": "assistant", "message": {"id": "msg_2", "stop_reason": "end_turn", "content": [{"type": "text", "text": "did both"}]}}),
+        );
+        let events = normalize(
+            &mut normalizer,
+            json!({"type": "result", "subtype": "success", "result": "did both"}),
+        );
+        assert!(events.iter().any(NormalizedEvent::is_terminal));
+    }
+
+    #[test]
+    fn steer_answered_in_a_follow_up_holds_the_turn_until_its_result() {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        normalize(
+            &mut normalizer,
+            json!({"type": "stream_event", "event": {"type": "message_start", "message": {"id": "msg_1", "content": []}}}),
+        );
+        // The steer arrives while the final message generates: no tool result
+        // is left to carry it, so Claude Code answers it after this `result`.
+        let uuid = steer(&mut normalizer);
+        let events = normalize(
+            &mut normalizer,
+            json!({"type": "assistant", "message": {"id": "msg_1", "stop_reason": "end_turn", "content": [{"type": "text", "text": "first part"}]}}),
+        );
+        // The answer given before the follow-up still answers the user.
+        assert_eq!(
+            agent_texts(&events),
+            vec![(Some("end_turn".to_string()), "first part".to_string())]
+        );
+        let events = normalize(
+            &mut normalizer,
+            json!({"type": "result", "subtype": "success", "result": "first part"}),
+        );
+        assert!(!events.iter().any(NormalizedEvent::is_terminal));
+        assert!(matches!(normalizer.turn_hold(), TurnHold::Idle(_)));
+
+        assert!(normalize(&mut normalizer, replay(&uuid)).is_empty());
+        normalize(
+            &mut normalizer,
+            json!({"type": "stream_event", "event": {"type": "message_start", "message": {"id": "msg_2", "content": []}}}),
+        );
+        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
+        normalize(
+            &mut normalizer,
+            json!({"type": "assistant", "message": {"id": "msg_2", "stop_reason": "end_turn", "content": [{"type": "text", "text": "steered"}]}}),
+        );
+        let events = normalize(
+            &mut normalizer,
+            json!({"type": "result", "subtype": "success", "result": "steered"}),
+        );
+        assert!(events.iter().any(NormalizedEvent::is_terminal));
+    }
+
+    #[test]
+    fn replays_of_ordinary_prompts_produce_no_events() {
+        let mut normalizer = ClaudeEventNormalizer::default();
+        let events = normalize(&mut normalizer, replay("not-a-steer"));
+        assert!(events.is_empty());
+        assert_eq!(normalizer.turn_hold(), TurnHold::Released);
     }
 
     #[test]
@@ -1011,5 +1257,62 @@ mod tests {
                 json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": level}})
             );
         }
+    }
+
+    #[test]
+    fn otel_env_file_exports_otlp_settings_quoted() {
+        let vars = [
+            ("OTEL_SERVICE_NAME", "claude"),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "http://collector:8000/v1/traces",
+            ),
+            ("PATH", "/usr/bin"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer it's"),
+        ]
+        .map(|(name, value)| (name.to_owned(), value.to_owned()));
+        assert_eq!(
+            otel_env_file_contents(vars).as_deref(),
+            Some(
+                "export OTEL_EXPORTER_OTLP_HEADERS='authorization=Bearer it'\\''s'\n\
+                 export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT='http://collector:8000/v1/traces'\n"
+            )
+        );
+        assert_eq!(
+            otel_env_file_contents([("PATH".to_owned(), "/usr/bin".to_owned())]),
+            None
+        );
+    }
+
+    #[test]
+    fn otel_env_file_is_owner_only_and_sourceable() {
+        let dir =
+            std::env::temp_dir().join(format!("claude-otel-{}", uuid::Uuid::new_v4().simple()));
+        let path = dir.join("env.sh");
+        let contents = otel_env_file_contents([(
+            "OTEL_EXPORTER_OTLP_HEADERS".to_owned(),
+            "authorization=Bearer it's".to_owned(),
+        )])
+        .unwrap();
+        write_private_atomically(&path, &contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                ". '{}' && printf %s \"$OTEL_EXPORTER_OTLP_HEADERS\"",
+                path.display()
+            ))
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "authorization=Bearer it's"
+        );
     }
 }

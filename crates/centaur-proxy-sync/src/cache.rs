@@ -22,8 +22,10 @@ fn generation_fingerprint(proxy: &ProxyRecord, token_windows: TokenWindows) -> O
         &proxy.principal,
         &proxy.console_user_email,
         proxy.console_user_id,
+        proxy.console_user_admin,
+        &proxy.console_user_status,
+        proxy.slack_bot_home_team,
         &proxy.slack_history_channel_ids,
-        token_windows.api,
         token_windows.sandbox,
     ))
     .ok()?;
@@ -50,7 +52,7 @@ impl SyncCache {
     ) -> Option<String> {
         // Requester unions depend on OAuth-app eligibility that is intentionally
         // assembled live and is not covered by the principal cache version.
-        if proxy.requester_principal_id.is_some() {
+        if proxy.requester_principal_id.is_some() || proxy.has_owner_only_grant {
             return None;
         }
         let generation = generation_fingerprint(proxy, token_windows)?;
@@ -68,7 +70,7 @@ impl SyncCache {
         token_windows: TokenWindows,
         config_hash: String,
     ) {
-        if proxy.requester_principal_id.is_some() {
+        if proxy.requester_principal_id.is_some() || proxy.has_owner_only_grant {
             return;
         }
         let Some(generation) = generation_fingerprint(proxy, token_windows) else {
@@ -111,13 +113,16 @@ mod tests {
             principal: Some(json!({"id": 11, "labels": {}})),
             console_user_email: Some("user@example.com".to_owned()),
             console_user_id: Some(13),
+            console_user_admin: true,
+            console_user_status: Some("active".to_owned()),
+            slack_bot_home_team: true,
             slack_history_channel_ids: json!(["C12345678"]),
+            has_owner_only_grant: false,
         }
     }
 
     fn windows() -> TokenWindows {
         TokenWindows {
-            api: Some(1_700_000_000),
             sandbox: Some(1_699_920_000),
         }
     }
@@ -187,6 +192,19 @@ mod tests {
     }
 
     #[test]
+    fn owner_only_grants_bypass_the_cache() {
+        let cache = SyncCache::default();
+        let mut proxy = proxy();
+        proxy.has_owner_only_grant = true;
+        cache.store(&proxy, windows(), "sha256:current".to_owned());
+
+        assert_eq!(
+            cache.matching_hash(&proxy, windows(), "sha256:current"),
+            None
+        );
+    }
+
+    #[test]
     fn jwt_window_changes_invalidate_the_hash() {
         let cache = SyncCache::default();
         let proxy = proxy();
@@ -194,16 +212,7 @@ mod tests {
         cache.store(&proxy, windows, "sha256:current".to_owned());
 
         let next_window = TokenWindows {
-            api: windows.api.map(|window| window + 900),
-            ..windows
-        };
-        assert_eq!(
-            cache.matching_hash(&proxy, next_window, "sha256:current"),
-            None
-        );
-        let next_window = TokenWindows {
             sandbox: windows.sandbox.map(|window| window + 86_400),
-            ..windows
         };
         assert_eq!(
             cache.matching_hash(&proxy, next_window, "sha256:current"),

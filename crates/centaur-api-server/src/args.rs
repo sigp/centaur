@@ -13,8 +13,8 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use centaur_api_server::{
-    DiscoveredToolProxyFragment, SandboxRuntime, ToolDiscoveryConfig, discover_persona_registry,
-    discover_tool_proxy_fragment,
+    ConsoleSessionConfig, DiscoveredToolProxyFragment, SandboxRuntime, ToolDiscoveryConfig,
+    discover_persona_registry, discover_tool_proxy_fragment,
 };
 use centaur_iron_control::{
     IdentityInput, IronControlClient, IronControlError, PrincipalInput, RegisterError, RoleSpec,
@@ -37,7 +37,9 @@ use centaur_session_runtime::{
     SessionPrincipalAdmission, SessionSandboxCleanupConfig, WarmPoolTarget,
 };
 use centaur_session_sqlx::TextSearchBackend;
-use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
+use centaur_workflows::{
+    WorkflowDiscoveryClient, WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar,
+};
 use clap::{Args as ClapArgs, Parser, ValueEnum};
 use sqlx::{
     PgPool,
@@ -87,11 +89,20 @@ pub(crate) struct Args {
     session_principal_admission: SessionPrincipalAdmissionArg,
     #[command(flatten)]
     activity_summary: ActivitySummaryArgs,
+    #[command(flatten)]
+    console_session: ConsoleSessionArgs,
 }
 
 impl Args {
     pub(crate) async fn sandbox_runtime(&self) -> Result<SandboxRuntime, ServerError> {
         self.sandbox.runtime().await
+    }
+
+    /// The image Code Mode sandboxes run. Missing or blank falls back to
+    /// `centaur-codemode:latest`, like the session sandbox image.
+    pub(crate) fn codemode_image(&self) -> String {
+        clean_optional_value(self.sandbox.codemode_image.as_deref())
+            .unwrap_or_else(|| DEFAULT_CODEMODE_IMAGE.to_owned())
     }
 
     pub(crate) async fn iron_control_runtime(&self) -> Result<IronControlRuntime, ServerError> {
@@ -144,14 +155,60 @@ impl Args {
     pub(crate) async fn workflow_host_sandbox_runtime(
         &self,
         bootstrap_iron_control_principal: &str,
-    ) -> Result<Option<WorkflowHostSandboxRuntime>, ServerError> {
+    ) -> Result<WorkflowHostSandboxRuntime, ServerError> {
         self.sandbox
             .workflow_host_sandbox_runtime(bootstrap_iron_control_principal)
             .await
     }
 
+    /// The workflow discovery service (`workflow-host serve`). Discovery never
+    /// runs in this process, so a deployment without the service cannot start.
+    pub(crate) fn workflow_discovery_client(&self) -> Result<WorkflowDiscoveryClient, ServerError> {
+        let url = clean_optional_value(self.sandbox.workflow_discovery_url.as_deref()).ok_or_else(
+            || {
+                ServerError::UnsupportedConfig(
+                    "WORKFLOW_DISCOVERY_URL must point at the workflow discovery service"
+                        .to_owned(),
+                )
+            },
+        )?;
+        Ok(WorkflowDiscoveryClient::new(
+            &url,
+            &self.sandbox.agent_k8s_workflow_dirs(),
+            self.sandbox.discovery_env(),
+        ))
+    }
+
     pub(crate) fn activity_summary_config(&self) -> Option<ActivitySummaryConfig> {
         self.activity_summary.config()
+    }
+
+    pub(crate) fn console_session_config(
+        &self,
+    ) -> Result<Option<ConsoleSessionConfig>, ServerError> {
+        // Console booleans are strict: a typo is a startup error instead of an
+        // ActiveModel-style guess.
+        centaur_api_server::validate_boolean_settings().map_err(ServerError::UnsupportedConfig)?;
+        ConsoleSessionConfig::from_settings(
+            self.console_session.session_secret.as_deref(),
+            self.console_session.public_url.as_deref(),
+        )
+        .map_err(|error| ServerError::UnsupportedConfig(error.to_string()))
+    }
+
+    /// A writable Console pool for the ported Console handlers. The pool used
+    /// by the turn path stays read-only. Both come from the same URL.
+    pub(crate) fn console_write_db(&self) -> Option<PgPool> {
+        self.sandbox.iron_control.console_write_db().ok()
+    }
+
+    /// Select the in-process Console implementation for iron-control calls
+    /// when the Rust Console is enabled. Without it (a deployment where Rails
+    /// still owns the Console, and the external `centaur-perms` CLI) the HTTP
+    /// admin client stays in use. This is set once at startup from
+    /// `ConsoleSessionConfig`; the HTTP path can be deleted at cutover.
+    pub(crate) fn set_console_in_process(&mut self, enabled: bool) {
+        self.sandbox.iron_control.console_in_process = enabled;
     }
 
     pub(crate) fn shutdown_execution_drain_timeout(&self) -> Duration {
@@ -175,6 +232,21 @@ pub(crate) struct IronControlRuntime {
     pub(crate) warm_pool_bootstrap_principal: String,
     pub(crate) workflow_host_principal: String,
     pub(crate) workflow_principal_registrar: WorkflowPrincipalRegistrar,
+}
+
+#[derive(Debug, ClapArgs)]
+struct ConsoleSessionArgs {
+    /// Secret used to authenticate the Rust Console session cookie. Setting it
+    /// enables the Console API; it requires `CENTAUR_CONSOLE_PUBLIC_URL`.
+    #[arg(
+        long = "console-session-secret",
+        env = "CONSOLE_SESSION_SECRET",
+        hide_env_values = true
+    )]
+    session_secret: Option<String>,
+    /// Console's public origin, used to validate `Origin` on writes.
+    #[arg(long = "console-public-url", env = "CENTAUR_CONSOLE_PUBLIC_URL")]
+    public_url: Option<String>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -555,7 +627,8 @@ struct IronControlArgs {
     #[arg(long = "iron-control-api-key", env = "IRON_CONTROL_API_KEY")]
     api_key: Option<String>,
     /// Console's database. Principals and their effective config are read from
-    /// it directly instead of through the Console API.
+    /// it directly instead of through the Console API, and Console's scheduled
+    /// tasks are run from it.
     #[arg(
         long = "iron-control-database-url",
         env = "IRON_CONTROL_DATABASE_URL",
@@ -574,9 +647,20 @@ struct IronControlArgs {
         default_value_t = 5
     )]
     console_database_max_connections: u32,
-    /// The Console database pool shared by every client built from these args.
+    /// The read-only Console database pool shared by every client built from
+    /// these args.
     #[arg(skip)]
     console_db: OnceLock<PgPool>,
+    /// A writable Console pool for the ported Console handlers. `None` when the
+    /// database is not configured.
+    #[arg(skip)]
+    console_write_db: OnceLock<PgPool>,
+    /// Route iron-control calls through `centaur_console_db` instead of the
+    /// admin API. `Args` sets this when the Rust Console is enabled. The HTTP
+    /// client remains for deployments where Rails still owns the Console and
+    /// for the external `centaur-perms` CLI; delete it at cutover.
+    #[arg(skip)]
+    console_in_process: bool,
 }
 
 impl IronControlArgs {
@@ -594,6 +678,11 @@ impl IronControlArgs {
                     .to_owned(),
             )
         })?;
+        let client = if self.console_in_process {
+            client.with_console_write_db(self.console_write_db()?)
+        } else {
+            client
+        };
         Ok(client.with_console_db(self.console_db()?))
     }
 
@@ -614,6 +703,26 @@ impl IronControlArgs {
             .acquire_timeout(CONSOLE_DB_ACQUIRE_TIMEOUT)
             .connect_lazy_with(options);
         Ok(self.console_db.get_or_init(|| pool).clone())
+    }
+
+    /// The writable Console pool, from the same settings as the read-only one.
+    /// Call within a Tokio runtime.
+    fn console_write_db(&self) -> Result<PgPool, ServerError> {
+        if let Some(pool) = self.console_write_db.get() {
+            return Ok(pool.clone());
+        }
+        let url = non_empty(self.console_database_url.as_deref()).ok_or_else(|| {
+            ServerError::UnsupportedConfig(
+                "the Console database is required: set IRON_CONTROL_DATABASE_URL".to_owned(),
+            )
+        })?;
+        let options =
+            console_write_db_options(url, non_empty(self.console_database_name.as_deref()))?;
+        let pool = PgPoolOptions::new()
+            .max_connections(self.console_database_max_connections)
+            .acquire_timeout(CONSOLE_DB_ACQUIRE_TIMEOUT)
+            .connect_lazy_with(options);
+        Ok(self.console_write_db.get_or_init(|| pool).clone())
     }
 
     /// Required backend sync settings (admin client + proxy-sync URL).
@@ -640,8 +749,9 @@ impl IronControlArgs {
 /// sooner than sqlx's 30 second default.
 const CONSOLE_DB_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Connection options for Console's database. Sessions are read-only:
-/// Console owns every write to its schema.
+/// Connection options for Console's database. Sessions are read-only by
+/// default: Console owns its schema, and the scheduled-task scheduler writes
+/// its rows only in explicitly read-write transactions.
 fn console_db_options(
     url: &str,
     database_name: Option<&str>,
@@ -656,6 +766,23 @@ fn console_db_options(
         None => options,
     };
     Ok(options.options([("default_transaction_read_only", "on")]))
+}
+
+/// The writable counterpart of [`console_db_options`], for the Rust Console
+/// handlers. Same URL, no read-only transaction default.
+fn console_write_db_options(
+    url: &str,
+    database_name: Option<&str>,
+) -> Result<PgConnectOptions, ServerError> {
+    let options = PgConnectOptions::from_str(url).map_err(|_| {
+        ServerError::UnsupportedConfig(
+            "IRON_CONTROL_DATABASE_URL is not a valid PostgreSQL URL".to_owned(),
+        )
+    })?;
+    Ok(match database_name {
+        Some(name) => options.database(name),
+        None => options,
+    })
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
@@ -799,6 +926,10 @@ struct SandboxArgs {
         env = "SESSION_SANDBOX_IMAGE"
     )]
     agent_image: Option<String>,
+    /// Full image reference for MCP Code Mode sandboxes. Defaults to
+    /// `centaur-codemode:latest`.
+    #[arg(long = "codemode-image", env = "CENTAUR_CODEMODE_IMAGE")]
+    codemode_image: Option<String>,
     #[arg(
         long = "session-sandbox-image-pull-policy",
         alias = "kubernetes-agent-image-pull-policy",
@@ -1028,12 +1159,10 @@ struct SandboxArgs {
         action = clap::ArgAction::Set
     )]
     iron_control_sync_infra_secrets: bool,
-    #[arg(
-        long = "workflow-host-sandbox",
-        env = "WORKFLOW_HOST_SANDBOX",
-        default_value_t = true
-    )]
-    workflow_host_sandbox: bool,
+    /// Base URL of the workflow discovery service, which imports workflow
+    /// modules on api-rs's behalf.
+    #[arg(long = "workflow-discovery-url", env = "WORKFLOW_DISCOVERY_URL")]
+    workflow_discovery_url: Option<String>,
     #[arg(long = "workflow-host-image", env = "WORKFLOW_HOST_IMAGE")]
     workflow_host_image: Option<String>,
     #[arg(long = "workflow-host-command", env = "WORKFLOW_HOST_COMMAND")]
@@ -1131,23 +1260,16 @@ impl SandboxArgs {
                 "drained sandboxes with stale pod identity or agent security contexts before enabling reuse"
             );
         }
-        let artifact_backend = backend.clone();
-        Ok(
-            SandboxRuntime::backend_with_workload(backend, self.container_workload_mode()?)
-                .with_artifact_reader(move |id, path, max_bytes| {
-                    let backend = artifact_backend.clone();
-                    async move { backend.read_artifact(&id, &path, max_bytes).await }
-                }),
-        )
+        Ok(SandboxRuntime::backend_with_workload(
+            backend,
+            self.container_workload_mode()?,
+        ))
     }
 
     async fn workflow_host_sandbox_runtime(
         &self,
         bootstrap_iron_control_principal: &str,
-    ) -> Result<Option<WorkflowHostSandboxRuntime>, ServerError> {
-        if !self.workflow_host_sandbox {
-            return Ok(None);
-        }
+    ) -> Result<WorkflowHostSandboxRuntime, ServerError> {
         let spec = self.workflow_host_spec(bootstrap_iron_control_principal)?;
         let runtime = SandboxRuntime::backend(
             Arc::new(AgentSandboxBackend::new(
@@ -1156,7 +1278,7 @@ impl SandboxArgs {
             )),
             spec.clone(),
         );
-        Ok(Some(WorkflowHostSandboxRuntime::new(runtime, spec)))
+        Ok(WorkflowHostSandboxRuntime::new(runtime, spec))
     }
 
     fn workflow_host_spec(
@@ -1192,9 +1314,6 @@ impl SandboxArgs {
             env::var("WORKFLOW_HOST_DATABASE_URL").or_else(|_| env::var("DATABASE_URL"))
         {
             spec = spec.env("DATABASE_URL", value);
-        }
-        if env::var_os("PYTHON_WORKFLOW_HOST_PATH").is_some() {
-            spec = spec.env("PYTHON_WORKFLOW_HOST_PATH", WORKFLOW_HOST_PATH);
         }
         if let Ok(value) = env::var("PYTHON_WORKFLOW_HOST_PYTHON") {
             spec = spec.env("PYTHON_WORKFLOW_HOST_PYTHON", value);
@@ -1605,6 +1724,28 @@ impl SandboxArgs {
             .to_owned()
     }
 
+    /// The `SESSION_SANDBOX_PASSTHROUGH_ENV` values workflow-host sandboxes
+    /// get. Discovery receives the same values, so a module that reads config
+    /// at import (for example to enable a schedule) sees what runs see.
+    fn passthrough_env(&self) -> BTreeMap<String, String> {
+        self.passthrough_env_names()
+            .filter_map(|name| env::var(name).ok().map(|value| (name.to_owned(), value)))
+            .collect()
+    }
+
+    /// The env a discovery pass imports workflows with: the passthrough env,
+    /// plus the enablement policy so the host skips disabled modules before
+    /// importing them, as it does in api-rs's own filtering.
+    fn discovery_env(&self) -> BTreeMap<String, String> {
+        let mut discovery_env = self.passthrough_env();
+        for name in ["WORKFLOW_ENABLE_MODE", "WORKFLOW_ALLOWED_NAMES"] {
+            if let Some(value) = clean_optional_value(env::var(name).ok().as_deref()) {
+                discovery_env.insert(name.to_owned(), value);
+            }
+        }
+        discovery_env
+    }
+
     fn passthrough_env_names(&self) -> impl Iterator<Item = &str> {
         self.passthrough_env
             .iter()
@@ -1762,7 +1903,8 @@ fn should_retry_iron_control_register(error: &RegisterError) -> bool {
         | RegisterError::Control(IronControlError::SessionPrincipalNotPreapproved { .. }) => false,
         RegisterError::Control(IronControlError::Transport { .. }) => true,
         RegisterError::Control(IronControlError::Decode { .. })
-        | RegisterError::Control(IronControlError::NotFound { .. }) => false,
+        | RegisterError::Control(IronControlError::NotFound { .. })
+        | RegisterError::Control(IronControlError::InProcess { .. }) => false,
         RegisterError::Control(IronControlError::ConsoleDb(error)) => {
             matches!(error, centaur_console_db::Error::Database(_))
         }
@@ -2526,6 +2668,10 @@ impl IronProxyHarnessArgs {
         if let Some(fragment) = harness_auth_fragment("meta-ai", "api_key")? {
             fragments.push(fragment);
         }
+        // Pi's `google` provider (Gemini through the Generative Language API).
+        if let Some(fragment) = harness_auth_fragment("google", "api_key")? {
+            fragments.push(fragment);
+        }
         if let Ok(raw) = env::var("CODEX_CUSTOM_PROVIDERS") {
             fragments.extend(custom_provider_auth_fragments(&raw)?);
         }
@@ -2542,6 +2688,7 @@ impl IronProxyHarnessArgs {
 }
 
 const DEFAULT_SANDBOX_IMAGE: &str = "centaur-agent:latest";
+const DEFAULT_CODEMODE_IMAGE: &str = "centaur-codemode:latest";
 /// Where the sandbox image installs the Python workflow host.
 const WORKFLOW_HOST_PATH: &str = "/usr/local/bin/workflow-host";
 
@@ -2957,6 +3104,26 @@ mod tests {
         assert_eq!(config.api_key, "sk-mounted");
     }
 
+    #[test]
+    fn codemode_image_defaults_when_missing_or_blank() {
+        let base = [
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ];
+        for (flags, expected) in [
+            (vec![], "centaur-codemode:latest"),
+            (vec!["--codemode-image", "   "], "centaur-codemode:latest"),
+            (
+                vec!["--codemode-image", "registry.local/centaur-codemode:tag"],
+                "registry.local/centaur-codemode:tag",
+            ),
+        ] {
+            let args = Args::try_parse_from(base.into_iter().chain(flags)).unwrap();
+            assert_eq!(args.codemode_image(), expected);
+        }
+    }
+
     #[tokio::test]
     async fn session_sandbox_state_volume_requires_opt_in() {
         for flags in [
@@ -3120,6 +3287,41 @@ mod tests {
                 .control_plane_pod_labels
                 .get("app.kubernetes.io/component"),
             Some(&"console".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn iron_control_uses_in_process_only_when_the_rust_console_is_enabled() {
+        let base = [
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--iron-control-url",
+            "http://console.local:3000",
+            "--iron-control-proxy-sync-url",
+            "http://proxy-sync.local:8080",
+            "--iron-control-api-key",
+            "iak_test",
+            "--iron-control-database-url",
+            "postgres://console@localhost/console",
+        ];
+        let mut args = Args::try_parse_from(base).unwrap();
+        assert!(
+            !args
+                .sandbox
+                .iron_control
+                .required_client()
+                .unwrap()
+                .is_in_process()
+        );
+
+        args.set_console_in_process(true);
+        assert!(
+            args.sandbox
+                .iron_control
+                .required_client()
+                .unwrap()
+                .is_in_process()
         );
     }
 
@@ -3343,6 +3545,42 @@ mod tests {
                 && mount.read_only
                 && mount.kind == MountKind::NamedVolume("centaur-repo-cache".to_owned())
         }));
+    }
+
+    #[test]
+    fn discovery_gets_the_passthrough_env_and_enablement_policy() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            (
+                "SESSION_SANDBOX_PASSTHROUGH_ENV",
+                "ENABLE_FOO_WORKFLOW, UNSET_FLAG",
+            ),
+            ("ENABLE_FOO_WORKFLOW", "false"),
+            ("SLACK_BOT_TOKEN", "xoxb-real"),
+            ("WORKFLOW_ENABLE_MODE", "allowlist"),
+            ("WORKFLOW_ALLOWED_NAMES", "foo"),
+        ]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.sandbox.discovery_env(),
+            BTreeMap::from([
+                ("ENABLE_FOO_WORKFLOW".to_owned(), "false".to_owned()),
+                ("WORKFLOW_ALLOWED_NAMES".to_owned(), "foo".to_owned()),
+                ("WORKFLOW_ENABLE_MODE".to_owned(), "allowlist".to_owned()),
+            ])
+        );
+        let spec = args.sandbox.workflow_host_spec("prn_test").unwrap();
+        assert!(
+            spec.env
+                .iter()
+                .any(|env| env.name == "ENABLE_FOO_WORKFLOW" && env.value == "false")
+        );
     }
 
     #[test]

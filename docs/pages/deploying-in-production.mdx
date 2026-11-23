@@ -361,9 +361,10 @@ Codex, api-rs fails fast at startup if the broker credential is missing.
 
 ## 4. Configure Advanced Permissioning
 
-Set `console.publicUrl` and configure `console.ingress` if operators need to
-reach the Console outside the cluster. Sign in as the bootstrap admin, then
-open **System Settings** before creating user sessions:
+Set `console.publicUrl` to the origin operators and MCP clients reach — api-rs
+serves the Console, so it is required — and configure `console.ingress` if that
+origin is outside the cluster. Sign in as the bootstrap admin, then open
+**System Settings** before creating user sessions:
 
 - Keep `infra` as a default role if every admitted user may run an agent.
 - Clear default roles if even harness access must be explicitly approved.
@@ -582,14 +583,13 @@ The deployment uses these databases on the server:
 
 | Database | Used by | Connection |
 | --- | --- | --- |
-| Any name, for example `centaur` | api-rs, Slackbot, and ETL workflows | `DATABASE_URL`, including the database name. |
+| Any name, for example `centaur` | api-rs, Slackbot, workflows, and the company-context service | `DATABASE_URL`, including the database name. |
 | `iron_control_production`, plus `_cache`, `_queue`, and `_cable` variants | Console; api-rs and proxy-sync read `iron_control_production` | `IRON_CONTROL_DATABASE_URL` without a database name; the Console selects each database itself. The Console init container creates missing databases with the `DATABASE_URL` credentials. |
 
 Managed servers usually require TLS, so add `sslmode=require` to both URLs.
 `POSTGRES_PASSWORD` is not needed. Tools that declare `pg_dsn` secrets connect
 through iron-proxy with a DSN from your secret source; point those at the
-external server too. For `company_context`, that secret is
-`CENTAUR_POSTGRES_DSN`.
+external server too.
 
 Then set the chart values:
 
@@ -632,8 +632,9 @@ matching those ranges. Set `podSelector` before upgrading such a deployment.
 `pg_dsn` secrets for other in-cluster Postgres servers are no longer reachable.
 
 `externalDatabase.textSearch` selects how company-context keyword search is
-indexed. Set it only with `postgres.enabled: false`; the bundled Postgres always
-uses `paradedb`.
+indexed, both by api-rs and by the company-context service
+(`companyContext`). Set it only with `postgres.enabled: false`; the
+bundled Postgres always uses `paradedb`.
 
 - `postgres` (the default when unset) uses PostgreSQL's built-in full-text search and works on
   any server above.
@@ -697,7 +698,9 @@ Run one agent turn from inside the api-rs deployment:
 ```bash
 THREAD_KEY=cli:production-smoke-codex
 THREAD_PATH=$(jq -rn --arg v "$THREAD_KEY" '$v|@uri')
-CENTAUR_API_TOKEN=$(kubectl exec -n centaur-system deploy/centaur-centaur-console -- \
+# api-rs serves the Console; the Rails worker is the process that still boots
+# Rails, so run the runner there.
+CENTAUR_API_TOKEN=$(kubectl exec -n centaur-system deploy/centaur-centaur-console-worker -- \
   bin/rails runner 'print ApiServer::Jwt.encode_for_console_service')
 
 SESSION=$(kubectl exec -n centaur-system deploy/centaur-centaur-api-rs -- curl -s -X POST "http://localhost:8080/api/session/${THREAD_PATH}" \

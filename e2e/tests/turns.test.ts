@@ -1,11 +1,15 @@
 // How a turn ends, and what reaches it while it runs. Every outcome must leave
 // one visible reply: an answer, a failure the provider reported, or an answer
-// with no text. A mention during a turn steers it, carrying its sender's
-// identity, with a reaction on each follow-up until the turn answers, and the
+// with no text. A mention during a turn steers it on every harness, carrying
+// its sender's identity, with a reaction on each follow-up until the turn
+// answers it within the same reply, and the
 // turn shows its status again after Slack hides it for the follow-up; replies
-// without a mention neither steer nor stop it.
+// without a mention neither steer nor stop it. A mentioned stop ends the turn
+// silently: it posts no reply, not even an interruption notice.
 import { expect, test } from 'bun:test'
-import { USER_B, eventually, model, slack, turnTimeoutMs, type Channel } from '../lib'
+import { USER_B, eventually, model, releaseSandboxesAfterAll, slack, turnTimeoutMs, type Channel } from '../lib'
+
+releaseSandboxesAfterAll()
 
 const STEERING_REACTION = 'hourglass_flowing_sand'
 
@@ -40,21 +44,44 @@ test.concurrent('replies without a mention neither steer nor stop a running turn
   }
 }, 2 * turnTimeoutMs)
 
-test.concurrent('a mention during a turn steers it as its sender, marked until the answer', async () => {
-  const thread = await slack.mention('--codex Start a long task.', model.says('First part.', { delayMs: 5_000 }))
+test.concurrent('a mentioned stop ends the turn without posting a reply', async () => {
+  const thread = await slack.mention('--codex Work until stopped.', model.says('Never shown.', { delayMs: 60_000 }))
   await thread.inFlight()
-  const steer = model.says('Steered answer.')
-  const followUp = await thread.interject('Also handle this.', steer, { as: USER_B })
-  await waitForReaction(thread.channel, followUp, true)
-  const turn = await thread.nextTurn()
+  await thread.interject('stop')
+  const cancelled = await thread.nextCancelledExecution()
+  expect(cancelled.status).toBe('cancelled')
+  // The render that owned the turn clears the status once it is done.
+  await eventually('the stopped turn to clear its status', 60_000, async () =>
+    (await thread.status()) === '' ? true : undefined
+  )
+  expect(await thread.botReplies()).toEqual([])
 
-  // The turn answers before and after taking the follow-up.
-  expect(turn.reply).toContain('Steered answer.')
-  const [steered] = await model.requests(steer)
-  expect(steered?.userMessage).toContain('Also handle this.')
-  expect(steered?.userMessage).toContain(`Slack user ID: ${USER_B.id}`)
-  await waitForReaction(thread.channel, followUp, false)
-}, 2 * turnTimeoutMs)
+  // The next turn still answers once; a late interruption notice would show
+  // up as a second reply here.
+  const answer = model.says('Back to work.')
+  await thread.mention('Start again.', answer)
+  const turn = await thread.nextTurn()
+  expect(turn.reply).toBe('Back to work.')
+  expect((await thread.botReplies()).map(reply => reply.text)).toEqual(['Back to work.'])
+}, 3 * turnTimeoutMs)
+
+for (const harness of ['codex', 'claude'] as const) {
+  test.concurrent(`${harness}: a mention during a turn steers it as its sender, marked until the answer`, async () => {
+    const thread = await slack.mention(`--${harness} Start a long task.`, model.says('First part.', { delayMs: 5_000 }))
+    await thread.inFlight()
+    const steer = model.says('Steered answer.')
+    const followUp = await thread.interject('Also handle this.', steer, { as: USER_B })
+    await waitForReaction(thread.channel, followUp, true)
+    const turn = await thread.nextTurn()
+
+    // The turn answers before and after taking the follow-up.
+    expect(turn.reply).toContain('Steered answer.')
+    const [steered] = await model.requests(steer)
+    expect(steered?.userMessage).toContain('Also handle this.')
+    expect(steered?.userMessage).toContain(`Slack user ID: ${USER_B.id}`)
+    await waitForReaction(thread.channel, followUp, false)
+  }, 2 * turnTimeoutMs)
+}
 
 test.concurrent('a steered turn shows its status again after the follow-up hides it', async () => {
   const first = model.says('First part.', { delayMs: 20_000 })

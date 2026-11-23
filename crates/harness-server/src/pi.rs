@@ -27,11 +27,14 @@ use crate::{
 const TOOLS: &str = "read,bash,edit,write,codemode";
 /// Thinking level for turns without a per-turn override.
 const DEFAULT_THINKING_LEVEL: &str = "medium";
-/// Models Centaur supports on Pi, matching the Claude and GPT models the chat
-/// ingresses offer. Each needs its provider's `api_key` credential.
+/// Models Centaur supports on Pi: the Claude and GPT models the chat ingresses
+/// offer, plus Gemini models. Each needs its provider's `api_key` credential.
+/// Gemini models missing from Pi's bundled catalog are declared in the
+/// sandbox's `~/.pi/agent/models.json` (see `services/sandbox/entrypoint.sh`).
 const MODELS: &[(&str, &str)] = &[
     ("anthropic", "claude-fable-5"),
     ("anthropic", "claude-fable-5-1"),
+    ("anthropic", "claude-fable-5-2"),
     ("anthropic", "claude-haiku-4-5"),
     ("anthropic", "claude-haiku-5-5"),
     ("anthropic", "claude-opus-4-7"),
@@ -41,6 +44,26 @@ const MODELS: &[(&str, &str)] = &[
     ("anthropic", "claude-sonnet-4-6"),
     ("anthropic", "claude-sonnet-5"),
     ("anthropic", "claude-sonnet-5-5"),
+    ("google", "gemini-2.5-flash"),
+    ("google", "gemini-2.5-flash-lite"),
+    ("google", "gemini-2.5-pro"),
+    ("google", "gemini-3-flash-preview"),
+    ("google", "gemini-3.1-flash-lite"),
+    ("google", "gemini-3.1-flash-lite-preview"),
+    ("google", "gemini-3.1-pro-preview"),
+    ("google", "gemini-3.1-pro-preview-customtools"),
+    ("google", "gemini-3.5-flash"),
+    ("google", "gemini-3.5-flash-lite"),
+    ("google", "gemini-3.6-flash"),
+    ("google", "gemini-3.7-flash"),
+    ("google", "gemini-3.8-flash"),
+    ("google", "gemini-4-argon"),
+    ("google", "gemini-4-carbon"),
+    ("google", "gemini-4-hydrogen"),
+    ("google", "gemini-4-neon"),
+    ("google", "gemini-flash-latest"),
+    ("google", "gemini-flash-lite-latest"),
+    ("google", "gemini-pro-latest"),
     ("openai", "gpt-5.4"),
     ("openai", "gpt-5.4-mini"),
     ("openai", "gpt-5.4-nano"),
@@ -55,6 +78,8 @@ const MODELS: &[(&str, &str)] = &[
     ("openai", "gpt-6-sol"),
     ("openai", "gpt-6.1-sol"),
     ("openai", "gpt-6.1-terra"),
+    ("openai", "gpt-6.2-astra"),
+    ("openai", "gpt-6.2-sol"),
 ];
 const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -332,7 +357,17 @@ impl HarnessServer for PiHarness {
         command_line(json!({"type": "prompt", "message": message_text(input)}))
     }
 
-    fn stdin_for_steer(&self, input: &[UserInput]) -> Result<Vec<u8>> {
+    /// The steer is queued natively and answered before `agent_settled`,
+    /// which ends the turn.
+    fn steers_mid_turn(&self) -> bool {
+        true
+    }
+
+    fn stdin_for_steer(
+        &self,
+        _normalizer: &mut Self::EventNormalizer,
+        input: &[UserInput],
+    ) -> Result<Vec<u8>> {
         command_line(json!({"type": "steer", "message": message_text(input)}))
     }
 
@@ -376,12 +411,20 @@ mod tests {
         for model in [
             "anthropic/claude-sonnet-5",
             "anthropic/claude-fable-5-1",
+            "anthropic/claude-fable-5-2",
             "anthropic/claude-sonnet-5-5",
             "claude-haiku-5-5",
             "claude-sonnet-5",
             "openai/gpt-5.5",
             "openai/gpt-6.1-sol",
+            "openai/gpt-6.2-sol",
+            "gpt-6.2-astra",
             "gpt-6.1-terra",
+            "google/gemini-4-neon",
+            "gemini-4-neon",
+            "google/gemini-4-carbon",
+            "google/gemini-3.1-pro-preview",
+            "gemini-pro-latest",
         ] {
             assert_eq!(check_model(model), Ok(()), "{model}");
         }
@@ -390,6 +433,10 @@ mod tests {
             "openai/claude-sonnet-5",
             "openai/o3",
             "openai/gpt-5.5:high",
+            "openai/gemini-4-neon",
+            "google/gemini-4",
+            "google/gemini-2.5-flash-image",
+            "google/gemini-embedding-001",
         ] {
             assert!(check_model(model).is_err(), "{model}");
         }

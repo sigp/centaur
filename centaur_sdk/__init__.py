@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from centaur_sdk.tool_sdk import (
     ToolContext,
-    company_context_database_url,
     current_chat_destination,
     current_discord_thread,
     current_github_thread,
@@ -29,7 +28,6 @@ from centaur_sdk.tool_sdk import (
 
 __all__ = [
     "ToolContext",
-    "company_context_database_url",
     "current_chat_destination",
     "current_discord_thread",
     "current_github_thread",

@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     ApiError,
-    api_jwt::{bearer_token, verify_console_jwt},
+    console::sandbox::{SandboxJwtConfig, bearer_token, verify_sandbox_token},
     routes::{AppState, non_empty_env, positive_env_u64},
 };
 
@@ -419,6 +419,11 @@ async fn download_slack_file(
         .or_else(|| file.get("url_private"))
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::BadRequest("Slack file has no download URL".to_owned()))?;
+    if !is_slack_file_url(download_url) {
+        return Err(ApiError::BadRequest(
+            "Slack file is not hosted by Slack and cannot be downloaded".to_owned(),
+        ));
+    }
 
     let upstream = client
         .get(download_url)
@@ -468,6 +473,16 @@ async fn download_slack_file(
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
     Ok(response)
+}
+
+// Where Slack serves private file downloads. A file's URL comes from file
+// metadata, so it must not decide where the bot token goes. Only the first URL
+// needs checking: reqwest drops Authorization when a redirect leaves the host.
+const SLACK_FILE_ORIGINS: [&str; 2] = ["https://files.slack.com", "https://files.slack-gov.com"];
+
+fn is_slack_file_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .is_ok_and(|url| SLACK_FILE_ORIGINS.contains(&url.origin().ascii_serialization().as_str()))
 }
 
 async fn get_slack_files(
@@ -1739,8 +1754,22 @@ fn slack_rate_limit_retry_delay(retry_count: u32, retry_after: Option<u64>) -> D
 }
 
 fn authorize_slack_file_proxy(headers: &HeaderMap) -> Result<SlackFileProxyClaims, ApiError> {
-    let token = bearer_token(headers)?;
-    verify_console_jwt(token)
+    // The unified guard has already authenticated and live-checked the sandbox
+    // token; this only re-reads the Slack channel lists the handlers scope to.
+    let token = bearer_token(headers)
+        .ok_or_else(|| ApiError::Unauthorized("missing bearer token".to_owned()))?;
+    let config = SandboxJwtConfig::from_env().ok_or_else(|| {
+        ApiError::ServiceUnavailable("CENTAUR_JWT_SIGNING_SECRET is not configured".to_owned())
+    })?;
+    let claims = verify_sandbox_token(token, &config)
+        .ok_or_else(|| ApiError::Unauthorized("invalid JWT".to_owned()))?;
+    Ok(SlackFileProxyClaims {
+        slack: SlackProxyClaims {
+            upload_channels: claims.slack.upload_channels,
+            download_channels: claims.slack.download_channels,
+            history_channels: claims.slack.history_channels,
+        },
+    })
 }
 
 enum SlackChannelPermission {
@@ -2193,9 +2222,9 @@ mod tests {
         let token = test_jwt(
             b"secret",
             json!({
-                "iss": "centaur-console",
-                "sub": "user_123",
-                "aud": "centaur-api",
+                "iss": crate::auth::SANDBOX_TOKEN_ISSUER,
+                "sub": "prn_123",
+                "aud": crate::auth::SANDBOX_TOKEN_AUDIENCE,
                 "iat": 1_700_000_000i64,
                 "exp": 4_102_444_800i64,
                 "slack": {
@@ -2205,13 +2234,13 @@ mod tests {
                 }
             }),
         );
-        let claims = crate::api_jwt::verify_hs256_jwt::<SlackFileProxyClaims>(
-            &token,
-            b"secret",
-            "centaur-api",
-            "centaur-console",
+        let config = SandboxJwtConfig::new(
+            "secret",
+            crate::auth::SANDBOX_TOKEN_AUDIENCE,
+            crate::auth::SANDBOX_TOKEN_ISSUER,
         )
         .unwrap();
+        let claims = verify_sandbox_token(&token, &config).unwrap();
         assert_eq!(claims.slack.upload_channels, ["C123456789"]);
         assert_eq!(claims.slack.download_channels, ["C987654321"]);
         assert_eq!(claims.slack.history_channels, ["C111111111"]);
@@ -3211,9 +3240,9 @@ mod tests {
         let token = test_jwt(
             b"secret",
             json!({
-                "iss": "centaur-console",
-                "sub": "user_123",
-                "aud": "centaur-api",
+                "iss": crate::auth::SANDBOX_TOKEN_ISSUER,
+                "sub": "prn_123",
+                "aud": crate::auth::SANDBOX_TOKEN_AUDIENCE,
                 "iat": 1_700_000_000i64,
                 "exp": 4_102_444_800i64,
                 "slack": {
@@ -3239,9 +3268,9 @@ mod tests {
         let token = test_jwt(
             b"secret",
             json!({
-                "iss": "centaur-console",
-                "sub": "user_123",
-                "aud": "centaur-api",
+                "iss": crate::auth::SANDBOX_TOKEN_ISSUER,
+                "sub": "prn_123",
+                "aud": crate::auth::SANDBOX_TOKEN_AUDIENCE,
                 "iat": 1i64,
                 "exp": 1i64,
                 "slack": {
@@ -3297,7 +3326,7 @@ mod tests {
             json!({
                 "iss": "centaur-console",
                 "sub": "user_123",
-                "aud": ["other-api", "centaur-api"],
+                "aud": ["other-api", crate::auth::SANDBOX_TOKEN_AUDIENCE],
                 "iat": 1_700_000_000i64,
                 "exp": 4_102_444_800i64,
                 "slack": {
@@ -3306,13 +3335,13 @@ mod tests {
                 }
             }),
         );
-        let claims = crate::api_jwt::verify_hs256_jwt::<SlackFileProxyClaims>(
-            &token,
-            b"secret",
-            "centaur-api",
-            "centaur-console",
+        let config = SandboxJwtConfig::new(
+            "secret",
+            crate::auth::SANDBOX_TOKEN_AUDIENCE,
+            crate::auth::SANDBOX_TOKEN_ISSUER,
         )
         .unwrap();
+        let claims = verify_sandbox_token(&token, &config).unwrap();
         assert_eq!(claims.slack.upload_channels, ["C123456789"]);
         assert_eq!(claims.slack.download_channels, ["C123456789"]);
     }
@@ -3404,6 +3433,30 @@ mod tests {
             .unwrap_err(),
             ApiError::Unauthorized(_)
         ));
+    }
+
+    #[test]
+    fn only_slack_file_urls_get_the_bot_token() {
+        for url in [
+            "https://files.slack.com/files-pri/T1-F1/download/report.pdf",
+            "https://files.slack.com:443/files-pri/T1-F1/report.pdf",
+            "https://files.slack-gov.com/files-pri/T1-F1/download/report.pdf",
+        ] {
+            assert!(is_slack_file_url(url), "{url}");
+        }
+        for url in [
+            "https://example.com/files-pri/T1-F1/report.pdf",
+            "http://files.slack.com/files-pri/T1-F1/report.pdf",
+            "https://files.slack.com:8443/files-pri/T1-F1/report.pdf",
+            "https://files.slack.com.example.com/report.pdf",
+            "https://files.slack.com@example.com/report.pdf",
+            "https://slack.com/api/auth.test",
+            "https://other.files.slack.com/report.pdf",
+            "files.slack.com/report.pdf",
+            "",
+        ] {
+            assert!(!is_slack_file_url(url), "{url}");
+        }
     }
 
     #[test]
