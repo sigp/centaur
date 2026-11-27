@@ -537,12 +537,16 @@ impl AgentSandboxBackend {
     /// future shutdownPolicy). They are created before the Sandbox CR exists
     /// (the egress policies must precede the pod), so this runs as a separate
     /// patch once the CR is available.
+    ///
+    /// The pods get a controller reference. `kubectl drain` treats a pod with
+    /// no controller as unmanaged and refuses its node unless it is run with
+    /// `--force`, which deletes the pod for good.
     pub(crate) async fn adopt_iron_proxy_resources(
         &self,
         id: &SandboxId,
         sandbox: &crate::crd::Sandbox,
     ) -> SandboxResult<()> {
-        let Some(owner_reference) = sandbox_owner_reference(sandbox) else {
+        let Some((sandbox_name, sandbox_uid)) = sandbox_identity(sandbox) else {
             // Without a name or uid nothing can be bound, and the resources
             // stay cleanable by stop() only, so the gap must be visible.
             tracing::warn!(
@@ -552,9 +556,10 @@ impl AgentSandboxBackend {
             return Ok(());
         };
         let params = PatchParams::default();
-        let patch = Patch::Merge(json!({
-            "metadata": { "ownerReferences": [owner_reference] },
-        }));
+        let patch =
+            owner_references_patch(sandbox_owner_reference(sandbox_name, sandbox_uid, false));
+        let pod_patch =
+            owner_references_patch(sandbox_owner_reference(sandbox_name, sandbox_uid, true));
         let mut failures = Vec::new();
         let pods = self
             .pods()
@@ -568,7 +573,7 @@ impl AgentSandboxBackend {
             let Some(name) = pod.metadata.name else {
                 continue;
             };
-            if let Err(err) = self.pods().patch(&name, &params, &patch).await
+            if let Err(err) = self.pods().patch(&name, &params, &pod_patch).await
                 && !is_not_found(&err)
             {
                 failures.push(format!(
@@ -668,19 +673,30 @@ impl AgentSandboxBackend {
     /// reach them again. The sweep keys off the labels every proxy resource
     /// carries instead of an in-memory sandbox id. Returns how many of each
     /// class were deleted.
+    ///
+    /// The same pass gives the proxy pod of every live sandbox its controller
+    /// reference when it has none: pods created before they carried one, or
+    /// whose adoption failed, would otherwise make `kubectl drain` refuse
+    /// their node.
     pub(crate) async fn sweep_orphan_iron_proxy_resources(
         &self,
         grace: Duration,
     ) -> SandboxResult<BTreeMap<String, u32>> {
-        let live_sandboxes = self
+        let sandboxes = self
             .sandboxes()
             .list(&ListParams::default())
             .await
             .map_err(|err| map_kube_error("list sandboxes for orphan sweep", err))?
-            .items
+            .items;
+        let live_sandboxes = sandboxes
             .iter()
             .filter_map(|sandbox| sandbox.metadata.name.clone())
             .collect::<BTreeSet<String>>();
+        let sandbox_uids = sandboxes
+            .iter()
+            .filter_map(sandbox_identity)
+            .map(|(name, uid)| (name.to_owned(), uid.to_owned()))
+            .collect::<BTreeMap<String, String>>();
         let now = SystemTime::now();
         let mut reaped = BTreeMap::new();
         let proxy_selector = format!("{IRON_PROXY_LABEL}=true");
@@ -693,6 +709,7 @@ impl AgentSandboxBackend {
         for pod in pods.items {
             let metadata = &pod.metadata;
             if !is_orphan_proxy_resource(metadata, &live_sandboxes, now, grace) {
+                self.bind_unowned_proxy_pod(metadata, &sandbox_uids).await;
                 continue;
             }
             let name = metadata.name.clone().unwrap_or_default();
@@ -779,6 +796,37 @@ impl AgentSandboxBackend {
         }
         reaped.insert("network_policy".to_owned(), count);
         Ok(reaped)
+    }
+
+    /// Give a live sandbox's proxy pod the controller reference it lacks.
+    /// Best-effort: a failed patch is retried by the next sweep.
+    async fn bind_unowned_proxy_pod(
+        &self,
+        metadata: &ObjectMeta,
+        sandbox_uids: &BTreeMap<String, String>,
+    ) {
+        let Some((name, reference)) = unbound_proxy_pod_reference(metadata, sandbox_uids) else {
+            return;
+        };
+        match self
+            .pods()
+            .patch(
+                &name,
+                &PatchParams::default(),
+                &owner_references_patch(reference),
+            )
+            .await
+        {
+            Ok(_) => tracing::info!(name, "bound iron-proxy pod to its sandbox as controller"),
+            Err(err) if is_not_found(&err) => {}
+            Err(err) => {
+                tracing::warn!(
+                    name,
+                    error = %map_kube_error("bind iron-proxy pod", err),
+                    "failed to bind iron-proxy pod to its sandbox as controller"
+                );
+            }
+        }
     }
 
     pub(crate) async fn assign_proxy_principal(
@@ -2314,15 +2362,63 @@ fn is_orphan_proxy_resource(
         .is_ok_and(|age| age >= grace)
 }
 
-fn sandbox_owner_reference(sandbox: &crate::crd::Sandbox) -> Option<Value> {
-    let name = sandbox.metadata.name.as_ref()?;
-    let uid = sandbox.metadata.uid.as_ref()?;
-    Some(json!({
+/// The two fields an owner reference to a Sandbox needs.
+fn sandbox_identity(sandbox: &crate::crd::Sandbox) -> Option<(&str, &str)> {
+    Some((
+        sandbox.metadata.name.as_deref()?,
+        sandbox.metadata.uid.as_deref()?,
+    ))
+}
+
+/// An owner reference to a Sandbox. With `controller` set it names the Sandbox
+/// as the object's managing controller, which is what `kubectl drain` looks for
+/// before it evicts a pod. `blockOwnerDeletion` stays unset: with the
+/// OwnerReferencesPermissionEnforcement admission plugin on, it would require
+/// api-rs to hold `update` on `sandboxes/finalizers`.
+fn sandbox_owner_reference(name: &str, uid: &str, controller: bool) -> Value {
+    let mut reference = json!({
         "apiVersion": crate::crd::Sandbox::api_version(&()),
         "kind": crate::crd::Sandbox::kind(&()),
         "name": name,
         "uid": uid,
+    });
+    if controller {
+        reference["controller"] = Value::Bool(true);
+    }
+    reference
+}
+
+fn owner_references_patch(reference: Value) -> Patch<Value> {
+    Patch::Merge(json!({
+        "metadata": { "ownerReferences": [reference] },
     }))
+}
+
+/// The controller reference a live sandbox's proxy pod still needs, with the
+/// pod's name, or `None` when the pod is terminating, already has a controller,
+/// or belongs to no live sandbox.
+fn unbound_proxy_pod_reference(
+    metadata: &ObjectMeta,
+    sandbox_uids: &BTreeMap<String, String>,
+) -> Option<(String, Value)> {
+    if metadata.deletion_timestamp.is_some() {
+        return None;
+    }
+    let has_controller = metadata
+        .owner_references
+        .iter()
+        .flatten()
+        .any(|owner| owner.controller == Some(true));
+    if has_controller {
+        return None;
+    }
+    let name = metadata.name.as_deref()?;
+    let sandbox_id = metadata.labels.as_ref()?.get(SANDBOX_ID_LABEL)?;
+    let uid = sandbox_uids.get(sandbox_id)?;
+    Some((
+        name.to_owned(),
+        sandbox_owner_reference(sandbox_id, uid, true),
+    ))
 }
 
 fn object_meta(name: impl Into<String>, labels: BTreeMap<String, String>) -> ObjectMeta {
@@ -3867,5 +3963,100 @@ mod tests {
             now,
             Duration::from_secs(800),
         ));
+    }
+
+    fn sandbox_uids(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(name, uid)| ((*name).to_owned(), (*uid).to_owned()))
+            .collect()
+    }
+
+    fn owner_reference_from(
+        reference: Value,
+    ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+        serde_json::from_value(reference).expect("owner reference should deserialize")
+    }
+
+    #[test]
+    fn proxy_pod_reference_makes_the_sandbox_its_controller() {
+        let reference = sandbox_owner_reference("asbx-1", "uid-1", true);
+
+        // `kubectl drain` calls a pod managed when one of its references has
+        // `controller: true`.
+        let owner = owner_reference_from(reference);
+        assert_eq!(owner.controller, Some(true));
+        assert_eq!(owner.block_owner_deletion, None);
+        assert_eq!(owner.kind, "Sandbox");
+        assert_eq!(owner.name, "asbx-1");
+        assert_eq!(owner.uid, "uid-1");
+        assert!(owner.api_version.starts_with("agents.x-k8s.io/"));
+    }
+
+    #[test]
+    fn binds_a_legacy_proxy_pod_to_its_live_sandbox() {
+        // A pod from before proxy pods carried a controller: it points at the
+        // Sandbox but is no controller, so `kubectl drain` refuses it.
+        let mut metadata = meta_labeled(Some("asbx-1"), Some(Duration::from_secs(700)));
+        metadata.owner_references = Some(vec![owner_reference_from(sandbox_owner_reference(
+            "asbx-1", "uid-1", false,
+        ))]);
+
+        let (name, reference) =
+            unbound_proxy_pod_reference(&metadata, &sandbox_uids(&[("asbx-1", "uid-1")]))
+                .expect("a legacy proxy pod should be bound");
+
+        assert_eq!(name, "asbx-1-proxy");
+        assert_eq!(reference, sandbox_owner_reference("asbx-1", "uid-1", true));
+    }
+
+    #[test]
+    fn binds_a_proxy_pod_that_has_no_owner_at_all() {
+        let metadata = meta_labeled(Some("asbx-1"), Some(Duration::from_secs(700)));
+
+        assert!(
+            unbound_proxy_pod_reference(&metadata, &sandbox_uids(&[("asbx-1", "uid-1")])).is_some()
+        );
+    }
+
+    #[test]
+    fn leaves_a_proxy_pod_that_already_has_a_controller() {
+        let mut metadata = meta_labeled(Some("asbx-1"), Some(Duration::from_secs(700)));
+        metadata.owner_references = Some(vec![owner_reference_from(sandbox_owner_reference(
+            "asbx-1", "uid-1", true,
+        ))]);
+
+        assert!(
+            unbound_proxy_pod_reference(&metadata, &sandbox_uids(&[("asbx-1", "uid-1")])).is_none()
+        );
+    }
+
+    #[test]
+    fn leaves_a_terminating_proxy_pod_alone() {
+        let mut metadata = meta_labeled(Some("asbx-1"), Some(Duration::from_secs(700)));
+        metadata.deletion_timestamp = metadata.creation_timestamp.clone();
+
+        assert!(
+            unbound_proxy_pod_reference(&metadata, &sandbox_uids(&[("asbx-1", "uid-1")])).is_none()
+        );
+    }
+
+    #[test]
+    fn does_not_bind_a_proxy_pod_without_a_live_sandbox() {
+        let metadata = meta_labeled(Some("asbx-1"), Some(Duration::from_secs(700)));
+
+        assert!(
+            unbound_proxy_pod_reference(&metadata, &sandbox_uids(&[("asbx-2", "uid-2")])).is_none()
+        );
+        assert!(unbound_proxy_pod_reference(&metadata, &sandbox_uids(&[])).is_none());
+    }
+
+    #[test]
+    fn does_not_bind_a_pod_without_a_sandbox_label() {
+        let metadata = meta_labeled(None, Some(Duration::from_secs(700)));
+
+        assert!(
+            unbound_proxy_pod_reference(&metadata, &sandbox_uids(&[("asbx-1", "uid-1")])).is_none()
+        );
     }
 }
